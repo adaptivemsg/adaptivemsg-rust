@@ -5,7 +5,8 @@ type Task = tokio::task::JoinHandle<anyhow::Result<()>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let conn = adaptivemsg::transport::tcp::connect("127.0.0.1:5555").await?;
+    let client = adaptivemsg::Client::new();
+    let conn = client.connect("tcp://127.0.0.1:5555").await?;
 
     let stream_a = conn.new_stream();
     let stream_b = conn.new_stream();
