@@ -1,0 +1,27 @@
+[package]
+name = "adaptivemsg-hello"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+adaptivemsg = { path = "../.." }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "time"] }
+tracing-subscriber = "0.3"
+anyhow = "1.0"
+
+[[bin]]
+name = "tcp_server"
+path = "tcp_server.rs"
+
+[[bin]]
+name = "tcp_client"
+path = "tcp_client.rs"
+
+[[bin]]
+name = "uds_server"
+path = "uds_server.rs"
+
+[[bin]]
+name = "uds_client"
+path = "uds_client.rs"

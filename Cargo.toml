@@ -1,0 +1,28 @@
+[package]
+name = "adaptivemsg"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[features]
+default = ["tcp", "uds"]
+tcp = []
+uds = []
+quic = ["dep:quinn", "dep:rustls"]
+
+[dependencies]
+tokio = { version = "1.38", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.0", features = ["use-std"] }
+typetag = "0.2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+futures = "0.3"
+thiserror = "1.0"
+num_cpus = "1.16"
+
+quinn = { version = "0.11", optional = true }
+rustls = { version = "0.23", optional = true }
+
+[workspace]
+members = ["examples/hello"]
