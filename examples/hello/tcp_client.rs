@@ -1,6 +1,8 @@
 mod message;
 use message::{HelloReply, HelloRequest};
 
+type Task = tokio::task::JoinHandle<anyhow::Result<()>>;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let conn = adaptivemsg::transport::tcp::connect("127.0.0.1:5555").await?;
@@ -8,7 +10,7 @@ async fn main() -> anyhow::Result<()> {
     let stream_a = conn.new_stream();
     let stream_b = conn.new_stream();
 
-    let t_default: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+    let t_default: Task = tokio::spawn(async move {
         let reply: HelloReply = conn
             .send_recv(HelloRequest {
                 who: "John".into(),
@@ -19,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     });
 
-    let t1: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+    let t1: Task = tokio::spawn(async move {
         let reply: HelloReply = stream_a
             .send_recv(HelloRequest {
                 who: "Alice".into(),
@@ -30,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     });
 
-    let t2: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+    let t2: Task = tokio::spawn(async move {
         let reply: HelloReply = stream_b
             .send_recv(HelloRequest {
                 who: "Bob".into(),
@@ -41,9 +43,8 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     });
 
-    t_default.await??;
-    t1.await??;
-    t2.await??;
+    let join = |t: Task| async move { t.await?? };
+    tokio::try_join!(join(t_default), join(t1), join(t2))?;
 
     Ok(())
 }
