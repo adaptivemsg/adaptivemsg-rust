@@ -8,6 +8,8 @@ pub enum Error {
     Codec(#[from] postcard::Error),
     #[error("frame too large: {0}")]
     FrameTooLarge(usize),
+    #[error("connect timeout")]
+    ConnectTimeout,
     #[error("message type mismatch: expected {expected}, got {got}")]
     TypeMismatch { expected: &'static str, got: &'static str },
     #[error("connection closed")]

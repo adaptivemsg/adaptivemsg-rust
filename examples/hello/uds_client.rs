@@ -3,7 +3,8 @@ use message::{HelloReply, HelloRequest};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let conn = adaptivemsg::transport::uds::connect("/tmp/adaptivemsg.sock").await?;
+    let client = adaptivemsg::Client::new();
+    let conn = client.connect("uds://@adaptivemsg").await?;
 
     let reply: HelloReply = conn
         .send_recv(HelloRequest {

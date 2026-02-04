@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -5,12 +6,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 use tracing::{debug, warn};
 
 use crate::error::Error;
 use crate::message::Message;
-use crate::registry::{Handler, Registry, RequestCtx};
+use crate::registry::{Handler, Registry, StreamContext};
 use crate::wire::{Envelope, Meta};
 use crate::worker::{WorkerConfig, WorkerPool};
 
@@ -38,6 +39,8 @@ struct StreamInner {
     conn: Arc<ConnectionInner>,
     rx: AsyncMutex<mpsc::Receiver<Envelope>>,
     tx: mpsc::Sender<Envelope>,
+    context: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
+    on_close: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct ConnectionInner {
@@ -49,6 +52,7 @@ struct ConnectionInner {
     closed: AtomicBool,
     reader_task: Mutex<Option<JoinHandle<()>>>,
     writer_task: Mutex<Option<JoinHandle<()>>>,
+    closed_notify: Notify,
 }
 
 impl Connection {
@@ -81,7 +85,7 @@ impl Connection {
             let cfg = worker_cfg.unwrap_or_default();
             Some(WorkerPool::new(cfg, |item: DispatchItem| -> BoxFuture<'static, ()> {
                 Box::pin(async move {
-                    let ctx = RequestCtx {
+                    let ctx = StreamContext {
                         stream: item.stream.clone(),
                         meta: item.meta.clone(),
                     };
@@ -107,6 +111,7 @@ impl Connection {
             closed: AtomicBool::new(false),
             reader_task: Mutex::new(None),
             writer_task: Mutex::new(None),
+            closed_notify: Notify::new(),
         });
 
         let writer_task = spawn_writer(inner.clone(), writer, outbound_rx);
@@ -122,6 +127,8 @@ impl Connection {
                     conn: inner.clone(),
                     rx: AsyncMutex::new(rx),
                     tx,
+                    context: Mutex::new(None),
+                    on_close: Mutex::new(None),
                 }),
             };
             inner.streams.lock().unwrap().insert(0, stream.clone());
@@ -142,12 +149,27 @@ impl Connection {
 
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Relaxed);
+        self.inner.closed_notify.notify_waiters();
         if let Some(task) = self.inner.reader_task.lock().unwrap().take() {
             task.abort();
         }
         if let Some(task) = self.inner.writer_task.lock().unwrap().take() {
             task.abort();
         }
+    }
+
+    pub fn close_all_streams(&self) {
+        let streams: Vec<Stream> = self.inner.streams.lock().unwrap().values().cloned().collect();
+        for stream in streams {
+            stream.close();
+        }
+    }
+
+    pub async fn wait_closed(&self) {
+        if self.inner.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        self.inner.closed_notify.notified().await;
     }
 
     pub async fn send<M: Message>(&self, msg: M) -> Result<(), Error> {
@@ -183,6 +205,8 @@ impl Connection {
                 conn: self.inner.clone(),
                 rx: AsyncMutex::new(rx),
                 tx,
+                context: Mutex::new(None),
+                on_close: Mutex::new(None),
             }),
         };
         self.inner.streams.lock().unwrap().insert(stream_id, stream.clone());
@@ -202,7 +226,36 @@ impl Stream {
     }
 
     pub fn close(&self) {
+        if let Some(cb) = self.inner.on_close.lock().unwrap().take() {
+            cb();
+        }
         self.inner.conn.streams.lock().unwrap().remove(&self.inner.id);
+    }
+
+    pub fn set_context<T>(&self, ctx: Arc<T>)
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        *self.inner.context.lock().unwrap() = Some(ctx);
+    }
+
+    pub fn get_context<T>(&self) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.inner
+            .context
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|ctx| Arc::clone(ctx).downcast::<T>().ok())
+    }
+
+    pub fn set_on_close<F>(&self, f: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self.inner.on_close.lock().unwrap() = Some(Arc::new(f));
     }
 
     pub async fn send<M: Message>(&self, msg: M) -> Result<(), Error> {
@@ -295,6 +348,8 @@ where
                             conn: inner.clone(),
                             rx: AsyncMutex::new(rx),
                             tx,
+                            context: Mutex::new(None),
+                            on_close: Mutex::new(None),
                         }),
                     };
                     inner.streams.lock().unwrap().insert(env.stream_id, stream.clone());

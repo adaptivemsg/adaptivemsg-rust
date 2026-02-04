@@ -22,7 +22,7 @@ Minimal message-oriented library over multiplexed streams with an autoscaled wor
 ```rust
 use std::sync::Arc;
 
-use adaptivemsg::{Handler, Message, Registry, RequestCtx};
+use adaptivemsg::{Handler, Message, Registry, StreamContext};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
@@ -37,25 +37,18 @@ struct HelloReply {
 }
 
 #[typetag::serde]
-impl Message for HelloRequest {
-    fn type_name(&self) -> &'static str { "hello.request" }
-}
+impl Message for HelloRequest {}
 
 #[typetag::serde]
-impl Message for HelloReply {
-    fn type_name(&self) -> &'static str { "hello.reply" }
-}
+impl Message for HelloReply {}
 
-struct HelloHandler;
-impl Handler for HelloHandler {
+impl KnownMessage for HelloRequest {
     fn handle(
-        &self,
-        msg: Box<dyn Message>,
-        _ctx: RequestCtx,
+        self: Box<Self>,
+        _ctx: StreamContext,
     ) -> BoxFuture<'static, Result<Option<Box<dyn Message>>, adaptivemsg::Error>> {
         Box::pin(async move {
-            let req = msg.as_any().downcast_ref::<HelloRequest>().unwrap();
-            let reply = HelloReply { answer: format!("hi, {}", req.who) };
+            let reply = HelloReply { answer: format!("hi, {}", self.who) };
             Ok(Some(Box::new(reply)))
         })
     }
@@ -63,7 +56,7 @@ impl Handler for HelloHandler {
 
 fn registry() -> Registry {
     let mut reg = Registry::new();
-    reg.register("hello.request", Arc::new(HelloHandler));
+    reg.register_known::<HelloRequest>();
     reg
 }
 ```
@@ -77,9 +70,13 @@ use adaptivemsg::transport::tcp;
 let reg = registry();
 let listener = tcp::listen("0.0.0.0:5555").await?;
 let conn = tcp::accept(&listener, Some(reg), None).await?;
-let stream = conn.accept_stream().await.unwrap();
 
 // client
 let conn = tcp::connect("127.0.0.1:5555").await?;
+let reply: HelloReply = conn.send_recv(HelloRequest { who: "alice".into() }).await?;
+
+// client (via Client helper with transport prefixes)
+let client = adaptivemsg::Client::new();
+let conn = client.connect("tcp://127.0.0.1:5555").await?;
 let reply: HelloReply = conn.send_recv(HelloRequest { who: "alice".into() }).await?;
 ```

@@ -1,23 +1,20 @@
 use std::any::Any;
 
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+
+use crate::error::Error;
+use crate::registry::StreamContext;
 
 #[typetag::serde(tag = "type")]
 pub trait Message: Any + Send + Sync + 'static {
-    fn type_name(&self) -> &'static str;
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
     }
 }
 
-pub trait MessageExt {
-    fn downcast_ref<T: Any>(&self) -> Option<&T>;
-}
-
-impl MessageExt for dyn Message {
-    fn downcast_ref<T: Any>(&self) -> Option<&T> {
-        self.as_any().downcast_ref::<T>()
-    }
+pub trait KnownMessage: Message {
+    fn handle(self: Box<Self>, ctx: StreamContext) -> BoxFuture<'static, Result<Option<Box<dyn Message>>, Error>>;
 }
 
 // Helper to force serde to see trait object implementations.
