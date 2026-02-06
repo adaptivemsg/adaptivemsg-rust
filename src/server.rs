@@ -19,15 +19,20 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(registry: Registry) -> Self {
+    pub fn new() -> Self {
         Self {
-            registry,
+            registry: Registry::from_inventory(),
             worker_cfg: WorkerConfig::default(),
             on_connect: None,
             on_disconnect: None,
             on_new_stream: None,
             on_stream_close: None,
         }
+    }
+
+    pub fn with_registry(mut self, registry: Registry) -> Self {
+        self.registry = registry;
+        self
     }
 
     pub fn with_worker_config(mut self, cfg: WorkerConfig) -> Self {

@@ -1,12 +1,29 @@
-mod message;
-use message::{HelloReply, HelloRequest};
+use adaptivemsg_hello_server::message::{HelloReply, HelloRequest};
+use clap::Parser;
 
 type Task = tokio::task::JoinHandle<anyhow::Result<()>>;
 
+#[derive(Parser)]
+#[command(
+    name = "adaptivemsg-hello-client",
+    about = "Hello client example for adaptivemsg"
+)]
+struct Args {
+    /// Server address (examples: tcp://127.0.0.1:5555, uds://@adaptivemsg-hello, uds:///tmp/adaptivemsg-hello.sock)
+    #[arg(
+        short,
+        long,
+        default_value = "tcp://127.0.0.1:5555",
+        help = "Use tcp://HOST:PORT for TCP, uds://@adaptivemsg-* for abstract UDS, or uds:///tmp/adaptivemsg-*.sock for a filesystem socket"
+    )]
+    addr: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
     let client = adaptivemsg::Client::new();
-    let conn = client.connect("tcp://127.0.0.1:5555").await?;
+    let conn = client.connect(&args.addr).await?;
 
     let stream_a = conn.new_stream();
     let stream_b = conn.new_stream();

@@ -22,7 +22,7 @@ Minimal message-oriented library over multiplexed streams with an autoscaled wor
 ```rust
 use std::sync::Arc;
 
-use adaptivemsg::{Handler, Message, Registry, StreamContext};
+use adaptivemsg::{Handler, Message, MessageHandler, Registry, StreamContext};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
@@ -36,13 +36,14 @@ struct HelloReply {
     answer: String,
 }
 
-#[typetag::serde]
+#[adaptivemsg::message]
 impl Message for HelloRequest {}
 
-#[typetag::serde]
+#[adaptivemsg::message]
 impl Message for HelloReply {}
 
-impl KnownMessage for HelloRequest {
+#[adaptivemsg::message_handler]
+impl MessageHandler for HelloRequest {
     fn handle(
         self: Box<Self>,
         _ctx: StreamContext,

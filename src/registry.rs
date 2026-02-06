@@ -4,7 +4,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 
 use crate::error::Error;
-use crate::message::{KnownMessage, Message};
+use crate::message::{Message, MessageHandler};
 use crate::stream::Stream;
 use crate::wire::Meta;
 
@@ -27,9 +27,23 @@ pub struct Registry {
     handlers: Arc<HashMap<&'static str, Arc<dyn Handler>>>,
 }
 
+pub struct KnownEntry {
+    pub register: fn(&mut Registry),
+}
+
+inventory::collect!(KnownEntry);
+
 impl Registry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_inventory() -> Self {
+        let mut reg = Registry::new();
+        for entry in inventory::iter::<KnownEntry> {
+            (entry.register)(&mut reg);
+        }
+        reg
     }
 
     pub fn register(&mut self, type_name: &'static str, handler: Arc<dyn Handler>) {
@@ -40,7 +54,7 @@ impl Registry {
 
     pub fn register_known<T>(&mut self)
     where
-        T: KnownMessage + Message + 'static,
+        T: MessageHandler + Message + 'static,
     {
         let type_name = std::any::type_name::<T>();
         let handler: Arc<dyn Handler> = Arc::new(KnownHandler::<T>::default());
@@ -62,7 +76,7 @@ impl<T> Default for KnownHandler<T> {
 
 impl<T> Handler for KnownHandler<T>
 where
-    T: KnownMessage + Message + 'static,
+    T: MessageHandler + Message + 'static,
 {
     fn handle(
         &self,

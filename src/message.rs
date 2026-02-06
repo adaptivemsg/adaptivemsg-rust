@@ -13,7 +13,7 @@ pub trait Message: Any + Send + Sync + 'static {
     }
 }
 
-pub trait KnownMessage: Message {
+pub trait MessageHandler: Message {
     fn handle(self: Box<Self>, ctx: StreamContext) -> BoxFuture<'static, Result<Option<Box<dyn Message>>, Error>>;
 }
 

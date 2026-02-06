@@ -1,28 +1,22 @@
 [package]
-name = "adaptivemsg-hello"
+name = "adaptivemsg-hello-server"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-adaptivemsg = { path = "../.." }
+adaptivemsg = { path = "../../.." }
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber = "0.3"
 anyhow = "1.0"
 typetag = "0.2"
+inventory = "0.3"
+clap = { version = "4.5", features = ["derive"] }
 
 [[bin]]
-name = "tcp_server"
-path = "tcp_server.rs"
+name = "server"
+path = "server.rs"
 
-[[bin]]
-name = "tcp_client"
-path = "tcp_client.rs"
-
-[[bin]]
-name = "uds_server"
-path = "uds_server.rs"
-
-[[bin]]
-name = "uds_client"
-path = "uds_client.rs"
+[lib]
+name = "adaptivemsg_hello_server"
+path = "lib.rs"
