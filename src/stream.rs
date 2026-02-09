@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use crate::error::Error;
 use crate::message::Message;
-use crate::registry::{Handler, Registry, StreamContext};
+use crate::registry::{Handler, Registry, ContextStream};
 use crate::wire::{Envelope, Meta};
 use crate::worker::{WorkerConfig, WorkerPool};
 
@@ -85,17 +85,32 @@ impl Connection {
             let cfg = worker_cfg.unwrap_or_default();
             Some(WorkerPool::new(cfg, |item: DispatchItem| -> BoxFuture<'static, ()> {
                 Box::pin(async move {
-                    let ctx = StreamContext {
+                    let ctxstream = ContextStream {
                         stream: item.stream.clone(),
                         meta: item.meta.clone(),
                     };
-                    match item.handler.handle(item.msg, ctx).await {
+                    match item.handler.handle(item.msg, ctxstream).await {
                         Ok(Some(reply)) => {
                             let _ = item.stream.send_boxed(reply, Meta::default()).await;
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            let _ = item
+                                .stream
+                                .send_boxed(Box::new(crate::message::OkReply), Meta::default())
+                                .await;
+                        }
                         Err(err) => {
                             warn!("handler error: {err}");
+                            let _ = item
+                                .stream
+                                .send_boxed(
+                                    Box::new(crate::message::ErrorReply {
+                                        code: "handler_error".to_string(),
+                                        message: err.to_string(),
+                                    }),
+                                    Meta::default(),
+                                )
+                                .await;
                         }
                     }
                 })
@@ -296,7 +311,20 @@ impl Stream {
         msg: TReq,
     ) -> Result<TResp, Error> {
         self.send(msg).await?;
-        self.recv::<TResp>().await
+        let env = self.recv_raw().await?;
+        if let Ok(err) = env.msg.downcast::<crate::message::ErrorReply>() {
+            return Err(Error::Remote {
+                code: err.code,
+                message: err.message,
+            });
+        }
+        let expected = std::any::type_name::<TResp>();
+        let got = env.msg.type_name();
+        let boxed_any: Box<dyn std::any::Any> = env.msg;
+        match boxed_any.downcast::<TResp>() {
+            Ok(val) => Ok(*val),
+            Err(_) => Err(Error::TypeMismatch { expected, got }),
+        }
     }
 
     pub async fn recv_raw(&self) -> Result<Envelope, Error> {

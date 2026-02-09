@@ -1,25 +1,27 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
+use async_trait::async_trait;
+use anyhow::anyhow;
 
-use crate::error::Error;
+use crate::error::Result;
 use crate::message::{Message, MessageHandler};
 use crate::stream::Stream;
 use crate::wire::Meta;
 
 #[derive(Clone)]
-pub struct StreamContext {
+pub struct ContextStream {
     pub stream: Stream,
     pub meta: Meta,
 }
 
+#[async_trait]
 pub trait Handler: Send + Sync + 'static {
-    fn handle(
+    async fn handle(
         &self,
         msg: Box<dyn Message>,
-        ctx: StreamContext,
-    ) -> BoxFuture<'static, Result<Option<Box<dyn Message>>, Error>>;
+        ctxstream: ContextStream,
+    ) -> Result<Option<Box<dyn Message>>>;
 }
 
 #[derive(Default, Clone)]
@@ -74,23 +76,22 @@ impl<T> Default for KnownHandler<T> {
     }
 }
 
+#[async_trait]
 impl<T> Handler for KnownHandler<T>
 where
     T: MessageHandler + Message + 'static,
 {
-    fn handle(
+    async fn handle(
         &self,
         msg: Box<dyn Message>,
-        ctx: StreamContext,
-    ) -> BoxFuture<'static, Result<Option<Box<dyn Message>>, Error>> {
-        Box::pin(async move {
-            let expected = std::any::type_name::<T>();
-            let got = msg.type_name();
-            let boxed_any: Box<dyn std::any::Any> = msg;
-            match boxed_any.downcast::<T>() {
-                Ok(val) => val.handle(ctx).await,
-                Err(_) => Err(Error::TypeMismatch { expected, got }),
-            }
-        })
+        ctxstream: ContextStream,
+    ) -> Result<Option<Box<dyn Message>>> {
+        let expected = std::any::type_name::<T>();
+        let got = msg.type_name();
+        let boxed_any: Box<dyn std::any::Any> = msg;
+        match boxed_any.downcast::<T>() {
+            Ok(val) => val.handle(ctxstream).await,
+            Err(_) => Err(anyhow!("message type mismatch: expected {expected}, got {got}")),
+        }
     }
 }

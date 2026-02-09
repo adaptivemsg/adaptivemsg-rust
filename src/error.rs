@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+pub type Result<T> = std::result::Result<T, anyhow::Error>;
+
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("io error: {0}")]
@@ -14,4 +17,6 @@ pub enum Error {
     TypeMismatch { expected: &'static str, got: &'static str },
     #[error("connection closed")]
     Closed,
+    #[error("remote error: {code}: {message}")]
+    Remote { code: String, message: String },
 }

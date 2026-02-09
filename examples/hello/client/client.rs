@@ -54,15 +54,21 @@ async fn main() -> anyhow::Result<()> {
         let reply: HelloReply = stream_b
             .send_recv(HelloRequest {
                 who: "Bob".into(),
-                question: "who are you".into(),
+                question: "error please".into(),
             })
             .await?;
         println!("stream B: {}", reply.answer);
         Ok(())
     });
 
-    let join = |t: Task| async move { t.await?? };
-    tokio::try_join!(join(t_default), join(t1), join(t2))?;
+    let join = |t: Task| async move { t.await? };
+    let (r0, r1, r2) = tokio::join!(join(t_default), join(t1), join(t2));
+    for result in [r0, r1, r2] {
+        if let Err(err) = result {
+            println!("task error: {err}");
+            return Err(err);
+        }
+    }
 
     Ok(())
 }

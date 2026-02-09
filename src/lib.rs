@@ -9,14 +9,15 @@ pub mod worker;
 
 pub mod transport;
 
-pub use crate::error::Error;
+pub use crate::error::{Error, Result};
 pub use crate::client::{Client, Transport};
 pub use crate::server::{ConnContext, Server};
-pub use crate::message::{Message, MessageHandler};
-pub use crate::registry::{Handler, KnownEntry, Registry, StreamContext};
+pub use crate::message::{ErrorReply, Message, MessageHandler, OkReply};
+pub use crate::registry::{Handler, KnownEntry, Registry, ContextStream};
 pub use crate::stream::{Connection, Stream};
 pub use crate::wire::{Envelope, Meta, Priority, TraceCtx};
 pub use crate::worker::{WorkerConfig, WorkerPool};
+pub use async_trait::async_trait;
 pub use adaptivemsg_macros::message_handler;
 pub use adaptivemsg_macros::message;
 

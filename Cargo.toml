@@ -21,6 +21,8 @@ futures = "0.3"
 thiserror = "1.0"
 num_cpus = "1.16"
 inventory = "0.3"
+async-trait = "0.1"
+anyhow = "1.0"
 adaptivemsg-macros = { path = "../adaptivemsg-macros" }
 
 quinn = { version = "0.11", optional = true }
