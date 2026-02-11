@@ -15,7 +15,7 @@ pub struct HelloReply {
 impl MessageHandler for HelloRequest {
     async fn handle(
         self: Box<Self>,
-        _ctxstream: ContextStream,
+        _stream: ContextStream,
     ) -> Result<Option<Box<dyn Message>>> {
         let question = self.question.to_lowercase();
         if question.contains("error") {

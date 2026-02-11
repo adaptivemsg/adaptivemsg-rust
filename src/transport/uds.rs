@@ -11,7 +11,8 @@ use crate::worker::WorkerConfig;
 pub async fn connect(path: &str) -> Result<Connection, Error> {
     let path = to_uds_path(path)?;
     let stream = UnixStream::connect(path).await?;
-    Ok(Connection::new(stream, None, None))
+    let peer_addr = stream.peer_addr().ok().map(|addr| format!("{addr:?}"));
+    Ok(Connection::new_with_peer_addr(stream, peer_addr, None, None))
 }
 
 pub async fn listen(path: &str) -> Result<UnixListener, Error> {
@@ -25,7 +26,8 @@ pub async fn accept(
     worker_cfg: Option<WorkerConfig>,
 ) -> Result<Connection, Error> {
     let (stream, _) = listener.accept().await?;
-    Ok(Connection::new(stream, registry, worker_cfg))
+    let peer_addr = stream.peer_addr().ok().map(|addr| format!("{addr:?}"));
+    Ok(Connection::new_with_peer_addr(stream, peer_addr, registry, worker_cfg))
 }
 
 fn to_uds_path(path: &str) -> Result<PathBuf, Error> {

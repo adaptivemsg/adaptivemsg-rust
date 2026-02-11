@@ -21,12 +21,33 @@ impl Message for OkReply {}
 
 #[derive(Serialize, Deserialize)]
 pub struct ErrorReply {
-    pub code: String,
-    pub message: String,
+    code: String,
+    message: String,
 }
 
 #[typetag::serde]
 impl Message for ErrorReply {}
+
+impl ErrorReply {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn into_parts(self) -> (String, String) {
+        (self.code, self.message)
+    }
+}
 
 #[async_trait]
 pub trait MessageHandler: Message {

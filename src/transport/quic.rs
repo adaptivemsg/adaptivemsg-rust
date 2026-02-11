@@ -10,8 +10,9 @@ use crate::worker::WorkerConfig;
 pub async fn connect(endpoint: &Endpoint, addr: &str, server_name: &str) -> Result<Connection, Error> {
     let addr = addr.parse().map_err(to_io_err)?;
     let conn = endpoint.connect(addr, server_name).map_err(to_io_err)?.await.map_err(to_io_err)?;
+    let peer_addr = Some(conn.remote_address().to_string());
     let (send, recv) = conn.open_bi().await.map_err(to_io_err)?;
-    Ok(Connection::from_split(recv, send, None, None))
+    Ok(Connection::from_split(recv, send, peer_addr, None, None))
 }
 
 pub async fn accept(
@@ -23,8 +24,9 @@ pub async fn accept(
         io::Error::new(io::ErrorKind::UnexpectedEof, "no incoming connection")
     })?;
     let conn = incoming.await.map_err(to_io_err)?;
+    let peer_addr = Some(conn.remote_address().to_string());
     let (send, recv) = conn.accept_bi().await.map_err(to_io_err)?;
-    Ok(Connection::from_split(recv, send, registry, worker_cfg))
+    Ok(Connection::from_split(recv, send, peer_addr, registry, worker_cfg))
 }
 
 fn to_io_err<E: std::error::Error>(err: E) -> io::Error {

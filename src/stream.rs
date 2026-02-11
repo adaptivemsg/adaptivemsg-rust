@@ -2,6 +2,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -14,6 +15,9 @@ use crate::message::Message;
 use crate::registry::{Handler, Registry, ContextStream};
 use crate::wire::{Envelope, Meta};
 use crate::worker::{WorkerConfig, WorkerPool};
+
+const STREAM_QUEUE_SIZE: usize = 1024;
+const NEW_STREAM_QUEUE_SIZE: usize = 128;
 
 struct DispatchItem {
     msg: Box<dyn Message>,
@@ -40,15 +44,19 @@ struct StreamInner {
     rx: AsyncMutex<mpsc::Receiver<Envelope>>,
     tx: mpsc::Sender<Envelope>,
     context: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
-    on_close: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    recv_timeout: Mutex<Option<Duration>>,
 }
 
+static CONN_SEQ: AtomicU64 = AtomicU64::new(0);
+
 struct ConnectionInner {
+    id: u64,
     outbound: mpsc::Sender<Envelope>,
     streams: Mutex<HashMap<u64, Stream>>,
     new_stream_tx: mpsc::Sender<Stream>,
     registry: Option<Registry>,
     worker: Option<WorkerPool<DispatchItem>>,
+    peer_addr: Option<String>,
     closed: AtomicBool,
     reader_task: Mutex<Option<JoinHandle<()>>>,
     writer_task: Mutex<Option<JoinHandle<()>>>,
@@ -64,13 +72,26 @@ impl Connection {
     where
         RW: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        Self::new_with_peer_addr(io, None, registry, worker_cfg)
+    }
+
+    pub fn new_with_peer_addr<RW>(
+        io: RW,
+        peer_addr: Option<String>,
+        registry: Option<Registry>,
+        worker_cfg: Option<WorkerConfig>,
+    ) -> Self
+    where
+        RW: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (read_half, write_half) = tokio::io::split(io);
-        Self::from_split(read_half, write_half, registry, worker_cfg)
+        Self::from_split(read_half, write_half, peer_addr, registry, worker_cfg)
     }
 
     pub fn from_split<R, W>(
         reader: R,
         writer: W,
+        peer_addr: Option<String>,
         registry: Option<Registry>,
         worker_cfg: Option<WorkerConfig>,
     ) -> Self
@@ -78,17 +99,14 @@ impl Connection {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (outbound_tx, outbound_rx) = mpsc::channel::<Envelope>(1024);
-        let (new_stream_tx, new_stream_rx) = mpsc::channel::<Stream>(128);
+        let (outbound_tx, outbound_rx) = mpsc::channel::<Envelope>(STREAM_QUEUE_SIZE);
+        let (new_stream_tx, new_stream_rx) = mpsc::channel::<Stream>(NEW_STREAM_QUEUE_SIZE);
 
         let worker = registry.as_ref().and_then(|_| {
             let cfg = worker_cfg.unwrap_or_default();
             Some(WorkerPool::new(cfg, |item: DispatchItem| -> BoxFuture<'static, ()> {
                 Box::pin(async move {
-                    let ctxstream = ContextStream {
-                        stream: item.stream.clone(),
-                        meta: item.meta.clone(),
-                    };
+                    let ctxstream = ContextStream::new(item.stream.clone(), item.meta.clone());
                     match item.handler.handle(item.msg, ctxstream).await {
                         Ok(Some(reply)) => {
                             let _ = item.stream.send_boxed(reply, Meta::default()).await;
@@ -104,10 +122,10 @@ impl Connection {
                             let _ = item
                                 .stream
                                 .send_boxed(
-                                    Box::new(crate::message::ErrorReply {
-                                        code: "handler_error".to_string(),
-                                        message: err.to_string(),
-                                    }),
+                                    Box::new(crate::message::ErrorReply::new(
+                                        "handler_error",
+                                        err.to_string(),
+                                    )),
                                     Meta::default(),
                                 )
                                 .await;
@@ -118,11 +136,13 @@ impl Connection {
         });
 
         let inner = Arc::new(ConnectionInner {
+            id: CONN_SEQ.fetch_add(1, Ordering::Relaxed) + 1,
             outbound: outbound_tx,
             streams: Mutex::new(HashMap::new()),
             new_stream_tx,
             registry,
             worker,
+            peer_addr,
             closed: AtomicBool::new(false),
             reader_task: Mutex::new(None),
             writer_task: Mutex::new(None),
@@ -135,7 +155,7 @@ impl Connection {
         *inner.reader_task.lock().unwrap() = Some(reader_task);
 
         let default_stream = {
-            let (tx, rx) = mpsc::channel::<Envelope>(1024);
+            let (tx, rx) = mpsc::channel::<Envelope>(STREAM_QUEUE_SIZE);
             let stream = Stream {
                 inner: Arc::new(StreamInner {
                     id: 0,
@@ -143,7 +163,7 @@ impl Connection {
                     rx: AsyncMutex::new(rx),
                     tx,
                     context: Mutex::new(None),
-                    on_close: Mutex::new(None),
+                    recv_timeout: Mutex::new(None),
                 }),
             };
             inner.streams.lock().unwrap().insert(0, stream.clone());
@@ -160,6 +180,14 @@ impl Connection {
 
     pub fn stream(&self) -> Stream {
         self.default_stream.clone()
+    }
+
+    pub fn id(&self) -> u64 {
+        self.inner.id
+    }
+
+    pub fn peer_addr(&self) -> Option<String> {
+        self.inner.peer_addr.clone()
     }
 
     pub fn close(&self) {
@@ -213,7 +241,7 @@ impl Connection {
     }
 
     fn make_stream(&self, stream_id: u64) -> Stream {
-        let (tx, rx) = mpsc::channel::<Envelope>(1024);
+        let (tx, rx) = mpsc::channel::<Envelope>(STREAM_QUEUE_SIZE);
         let stream = Stream {
             inner: Arc::new(StreamInner {
                 id: stream_id,
@@ -221,7 +249,7 @@ impl Connection {
                 rx: AsyncMutex::new(rx),
                 tx,
                 context: Mutex::new(None),
-                on_close: Mutex::new(None),
+                recv_timeout: Mutex::new(None),
             }),
         };
         self.inner.streams.lock().unwrap().insert(stream_id, stream.clone());
@@ -241,9 +269,6 @@ impl Stream {
     }
 
     pub fn close(&self) {
-        if let Some(cb) = self.inner.on_close.lock().unwrap().take() {
-            cb();
-        }
         self.inner.conn.streams.lock().unwrap().remove(&self.inner.id);
     }
 
@@ -266,11 +291,13 @@ impl Stream {
             .and_then(|ctx| Arc::clone(ctx).downcast::<T>().ok())
     }
 
-    pub fn set_on_close<F>(&self, f: F)
-    where
-        F: Fn() + Send + Sync + 'static,
-    {
-        *self.inner.on_close.lock().unwrap() = Some(Arc::new(f));
+    pub fn set_recv_timeout(&self, timeout: Duration) {
+        let mut guard = self.inner.recv_timeout.lock().unwrap();
+        if timeout.is_zero() {
+            *guard = None;
+        } else {
+            *guard = Some(timeout);
+        }
     }
 
     pub async fn send<M: Message>(&self, msg: M) -> Result<(), Error> {
@@ -282,11 +309,7 @@ impl Stream {
     }
 
     pub async fn send_boxed(&self, msg: Box<dyn Message>, meta: Meta) -> Result<(), Error> {
-        let env = Envelope {
-            stream_id: self.inner.id,
-            meta,
-            msg,
-        };
+        let env = Envelope::new(self.inner.id, meta, msg);
         self.inner
             .conn
             .outbound
@@ -298,8 +321,8 @@ impl Stream {
     pub async fn recv<T: Message + 'static>(&self) -> Result<T, Error> {
         let env = self.recv_raw().await?;
         let expected = std::any::type_name::<T>();
-        let got = env.msg.type_name();
-        let boxed_any: Box<dyn std::any::Any> = env.msg;
+        let got = env.msg().type_name();
+        let boxed_any: Box<dyn std::any::Any> = env.into_msg();
         match boxed_any.downcast::<T>() {
             Ok(val) => Ok(*val),
             Err(_) => Err(Error::TypeMismatch { expected, got }),
@@ -312,15 +335,16 @@ impl Stream {
     ) -> Result<TResp, Error> {
         self.send(msg).await?;
         let env = self.recv_raw().await?;
-        if let Ok(err) = env.msg.downcast::<crate::message::ErrorReply>() {
-            return Err(Error::Remote {
-                code: err.code,
-                message: err.message,
-            });
-        }
+        let got = env.msg().type_name();
+        let boxed_any: Box<dyn std::any::Any> = env.into_msg();
+        let boxed_any = match boxed_any.downcast::<crate::message::ErrorReply>() {
+            Ok(err) => {
+                let (code, message) = err.into_parts();
+                return Err(Error::Remote { code, message });
+            }
+            Err(boxed_any) => boxed_any,
+        };
         let expected = std::any::type_name::<TResp>();
-        let got = env.msg.type_name();
-        let boxed_any: Box<dyn std::any::Any> = env.msg;
         match boxed_any.downcast::<TResp>() {
             Ok(val) => Ok(*val),
             Err(_) => Err(Error::TypeMismatch { expected, got }),
@@ -328,8 +352,17 @@ impl Stream {
     }
 
     pub async fn recv_raw(&self) -> Result<Envelope, Error> {
+        let timeout = *self.inner.recv_timeout.lock().unwrap();
         let mut rx = self.inner.rx.lock().await;
-        rx.recv().await.ok_or(Error::Closed)
+        if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, rx.recv()).await {
+                Ok(Some(env)) => Ok(env),
+                Ok(None) => Err(Error::Closed),
+                Err(_) => Err(Error::RecvTimeout),
+            }
+        } else {
+            rx.recv().await.ok_or(Error::Closed)
+        }
     }
 }
 
@@ -366,37 +399,40 @@ where
                 }
             };
 
-            let stream = match inner.streams.lock().unwrap().get(&env.stream_id).cloned() {
+            let stream_id = env.stream_id();
+            let stream = match inner.streams.lock().unwrap().get(&stream_id).cloned() {
                 Some(existing) => existing,
                 None => {
-                    let (tx, rx) = mpsc::channel::<Envelope>(1024);
+                    let (tx, rx) = mpsc::channel::<Envelope>(STREAM_QUEUE_SIZE);
                     let stream = Stream {
                         inner: Arc::new(StreamInner {
-                            id: env.stream_id,
+                            id: stream_id,
                             conn: inner.clone(),
                             rx: AsyncMutex::new(rx),
                             tx,
                             context: Mutex::new(None),
-                            on_close: Mutex::new(None),
+                            recv_timeout: Mutex::new(None),
                         }),
                     };
-                    inner.streams.lock().unwrap().insert(env.stream_id, stream.clone());
+                    inner.streams.lock().unwrap().insert(stream_id, stream.clone());
                     let _ = inner.new_stream_tx.send(stream.clone()).await;
                     stream
                 }
             };
 
             if let Some(registry) = inner.registry.as_ref() {
-                let type_name = env.msg.type_name();
+                let type_name = env.msg().type_name();
                 if let Some(handler) = registry.handler(type_name) {
                     if let Some(worker) = inner.worker.as_ref() {
+                        let (_stream_id, meta, msg) = env.into_parts();
+                        let priority = meta.priority();
                         let item = DispatchItem {
-                            msg: env.msg,
+                            msg,
                             handler,
                             stream: stream.clone(),
-                            meta: env.meta,
+                            meta,
                         };
-                        worker.enqueue(item, env.meta.priority).await;
+                        worker.enqueue(item, priority).await;
                         continue;
                     }
                 }

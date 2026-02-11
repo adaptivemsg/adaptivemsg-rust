@@ -10,9 +10,9 @@ use crate::wire::Priority;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    pub resident_workers: usize,
-    pub qsize_per_core: usize,
-    pub q_weight: usize,
+    resident_workers: usize,
+    qsize_per_core: usize,
+    q_weight: usize,
 }
 
 impl Default for WorkerConfig {
@@ -22,6 +22,35 @@ impl Default for WorkerConfig {
             qsize_per_core: 128,
             q_weight: 8,
         }
+    }
+}
+
+impl WorkerConfig {
+    pub fn resident_workers(&self) -> usize {
+        self.resident_workers
+    }
+
+    pub fn qsize_per_core(&self) -> usize {
+        self.qsize_per_core
+    }
+
+    pub fn q_weight(&self) -> usize {
+        self.q_weight
+    }
+
+    pub fn with_resident_workers(mut self, resident_workers: usize) -> Self {
+        self.resident_workers = resident_workers;
+        self
+    }
+
+    pub fn with_qsize_per_core(mut self, qsize_per_core: usize) -> Self {
+        self.qsize_per_core = qsize_per_core;
+        self
+    }
+
+    pub fn with_q_weight(mut self, q_weight: usize) -> Self {
+        self.q_weight = q_weight;
+        self
     }
 }
 

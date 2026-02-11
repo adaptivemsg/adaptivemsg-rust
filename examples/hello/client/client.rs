@@ -1,5 +1,6 @@
 use adaptivemsg_hello_server::message::{HelloReply, HelloRequest};
 use clap::Parser;
+use tracing::{info, warn};
 
 type Task = tokio::task::JoinHandle<anyhow::Result<()>>;
 
@@ -21,6 +22,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
     let client = adaptivemsg::Client::new();
     let conn = client.connect(&args.addr).await?;
@@ -35,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
                 question: "who are you".into(),
             })
             .await?;
-        println!("default stream: {}", reply.answer);
+        info!("default stream: {}", reply.answer);
         Ok(())
     });
 
@@ -46,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
                 question: "how are you".into(),
             })
             .await?;
-        println!("stream A: {}", reply.answer);
+        info!("stream A: {}", reply.answer);
         Ok(())
     });
 
@@ -57,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
                 question: "error please".into(),
             })
             .await?;
-        println!("stream B: {}", reply.answer);
+        info!("stream B: {}", reply.answer);
         Ok(())
     });
 
@@ -65,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     let (r0, r1, r2) = tokio::join!(join(t_default), join(t1), join(t2));
     for result in [r0, r1, r2] {
         if let Err(err) = result {
-            println!("task error: {err}");
+            warn!("task error: {err}");
             return Err(err);
         }
     }

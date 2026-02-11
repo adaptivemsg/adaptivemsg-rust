@@ -1,0 +1,15 @@
+[package]
+name = "adaptivemsg-echo-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+adaptivemsg = { path = "../../.." }
+adaptivemsg-echo-server = { path = "../server" }
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "time"] }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+
+[[bin]]
+name = "client"
+path = "client.rs"

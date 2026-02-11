@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -11,8 +12,41 @@ use crate::wire::Meta;
 
 #[derive(Clone)]
 pub struct ContextStream {
-    pub stream: Stream,
-    pub meta: Meta,
+    stream: Stream,
+    meta: Meta,
+}
+
+impl ContextStream {
+    pub fn new(stream: Stream, meta: Meta) -> Self {
+        Self { stream, meta }
+    }
+
+    pub fn get_context<T>(&self) -> Option<Arc<T>>
+    where
+        T: std::any::Any + Send + Sync + 'static,
+    {
+        self.stream.get_context::<T>()
+    }
+
+    pub fn id(&self) -> u64 {
+        self.stream.id()
+    }
+
+    pub fn stream(&self) -> Stream {
+        self.stream.clone()
+    }
+
+    pub fn meta(&self) -> &Meta {
+        &self.meta
+    }
+}
+
+impl Deref for ContextStream {
+    type Target = Stream;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stream
+    }
 }
 
 #[async_trait]
@@ -30,10 +64,20 @@ pub struct Registry {
 }
 
 pub struct KnownEntry {
-    pub register: fn(&mut Registry),
+    register: fn(&mut Registry),
 }
 
 inventory::collect!(KnownEntry);
+
+impl KnownEntry {
+    pub fn new(register: fn(&mut Registry)) -> Self {
+        Self { register }
+    }
+
+    pub fn register(&self, reg: &mut Registry) {
+        (self.register)(reg);
+    }
+}
 
 impl Registry {
     pub fn new() -> Self {
@@ -43,7 +87,7 @@ impl Registry {
     pub fn from_inventory() -> Self {
         let mut reg = Registry::new();
         for entry in inventory::iter::<KnownEntry> {
-            (entry.register)(&mut reg);
+            entry.register(&mut reg);
         }
         reg
     }

@@ -21,6 +21,8 @@ Minimal message-oriented library over multiplexed streams with an autoscaled wor
 
 ## Minimal usage
 
+`ContextStream` derefs to `Stream`, so you can call stream methods directly (for example, `stream.id()`).
+
 ```rust
 use adaptivemsg::{ContextStream, Message, MessageHandler, Registry, Result};
 
@@ -38,7 +40,7 @@ struct HelloReply {
 impl MessageHandler for HelloRequest {
     async fn handle(
         self: Box<Self>,
-        _ctxstream: ContextStream,
+        _stream: ContextStream,
     ) -> Result<Option<Box<dyn Message>>> {
         let reply = HelloReply { answer: format!("hi, {}", self.who) };
         Ok(Some(Box::new(reply)))

@@ -2,7 +2,6 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
 
-
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("io error: {0}")]
@@ -13,6 +12,8 @@ pub enum Error {
     FrameTooLarge(usize),
     #[error("connect timeout")]
     ConnectTimeout,
+    #[error("recv timeout")]
+    RecvTimeout,
     #[error("message type mismatch: expected {expected}, got {got}")]
     TypeMismatch { expected: &'static str, got: &'static str },
     #[error("connection closed")]
