@@ -12,6 +12,7 @@ use adaptivemsg_echo_server::message::{
     WhoElseReply,
 };
 use clap::Parser;
+use futures::future::try_join_all;
 use tracing::info;
 
 #[derive(Parser)]
@@ -148,15 +149,11 @@ async fn concurrent_demo(addr: &str) -> anyhow::Result<()> {
                 }));
             }
 
-            for task in stream_tasks {
-                task.await??;
-            }
+            try_join_all(stream_tasks).await??;
             Ok(())
         }));
     }
 
-    for task in client_tasks {
-        task.await??;
-    }
+    try_join_all(client_tasks).await??;
     Ok(())
 }

@@ -54,7 +54,7 @@ pub trait Handler: Send + Sync + 'static {
     async fn handle(
         &self,
         msg: Box<dyn Message>,
-        ctxstream: ContextStream,
+        stream: ContextStream,
     ) -> Result<Option<Box<dyn Message>>>;
 }
 
@@ -128,13 +128,13 @@ where
     async fn handle(
         &self,
         msg: Box<dyn Message>,
-        ctxstream: ContextStream,
+        stream: ContextStream,
     ) -> Result<Option<Box<dyn Message>>> {
         let expected = std::any::type_name::<T>();
         let got = msg.type_name();
         let boxed_any: Box<dyn std::any::Any> = msg;
         match boxed_any.downcast::<T>() {
-            Ok(val) => val.handle(ctxstream).await,
+            Ok(val) => val.handle(stream).await,
             Err(_) => Err(anyhow!("message type mismatch: expected {expected}, got {got}")),
         }
     }

@@ -56,7 +56,7 @@ pub trait MessageHandler: Message {
     /// The error type is `anyhow::Error` via `adaptivemsg::Result`.
     async fn handle(
         self: Box<Self>,
-        ctxstream: ContextStream,
+        stream: ContextStream,
     ) -> Result<Option<Box<dyn Message>>>;
 }
 

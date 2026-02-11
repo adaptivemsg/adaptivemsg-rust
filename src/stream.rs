@@ -106,8 +106,8 @@ impl Connection {
             let cfg = worker_cfg.unwrap_or_default();
             Some(WorkerPool::new(cfg, |item: DispatchItem| -> BoxFuture<'static, ()> {
                 Box::pin(async move {
-                    let ctxstream = ContextStream::new(item.stream.clone(), item.meta.clone());
-                    match item.handler.handle(item.msg, ctxstream).await {
+                    let stream = ContextStream::new(item.stream.clone(), item.meta.clone());
+                    match item.handler.handle(item.msg, stream).await {
                         Ok(Some(reply)) => {
                             let _ = item.stream.send_boxed(reply, Meta::default()).await;
                         }
