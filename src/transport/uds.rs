@@ -5,14 +5,13 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::error::Error;
 use crate::registry::Registry;
-use crate::stream::Connection;
-use crate::worker::WorkerConfig;
+use crate::stream::{Conn, Connection as ConnectionInner};
 
-pub async fn connect(path: &str) -> Result<Connection, Error> {
+pub async fn connect(path: &str) -> Result<Conn, Error> {
     let path = to_uds_path(path)?;
     let stream = UnixStream::connect(path).await?;
     let peer_addr = stream.peer_addr().ok().map(|addr| format!("{addr:?}"));
-    Ok(Connection::new_with_peer_addr(stream, peer_addr, None, None))
+    Ok(ConnectionInner::new(stream, peer_addr, None, None, None).start())
 }
 
 pub async fn listen(path: &str) -> Result<UnixListener, Error> {
@@ -20,14 +19,23 @@ pub async fn listen(path: &str) -> Result<UnixListener, Error> {
     Ok(UnixListener::bind(path)?)
 }
 
+pub(crate) async fn accept_stream<L>(
+    listener: L,
+) -> Result<(UnixStream, Option<String>), Error>
+where
+    L: std::ops::Deref<Target = UnixListener>,
+{
+    let (stream, _) = listener.accept().await?;
+    let peer_addr = stream.peer_addr().ok().map(|addr| format!("{addr:?}"));
+    Ok((stream, peer_addr))
+}
+
 pub async fn accept(
     listener: &UnixListener,
     registry: Option<Registry>,
-    worker_cfg: Option<WorkerConfig>,
-) -> Result<Connection, Error> {
-    let (stream, _) = listener.accept().await?;
-    let peer_addr = stream.peer_addr().ok().map(|addr| format!("{addr:?}"));
-    Ok(Connection::new_with_peer_addr(stream, peer_addr, registry, worker_cfg))
+) -> Result<Conn, Error> {
+    let (stream, peer_addr) = accept_stream(listener).await?;
+    Ok(ConnectionInner::new(stream, peer_addr, registry, None, None).start())
 }
 
 fn to_uds_path(path: &str) -> Result<PathBuf, Error> {

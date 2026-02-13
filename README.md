@@ -1,6 +1,6 @@
 # adaptivemsg
 
-Minimal message-oriented library over multiplexed streams with an autoscaled worker pool.
+Minimal message-oriented library over multiplexed streams with async handlers per stream.
 
 - Transport: TCP / QUIC
 - Framing: length-prefixed
@@ -62,7 +62,7 @@ use adaptivemsg::transport::tcp;
 // server
 let reg = registry();
 let listener = tcp::listen("0.0.0.0:5555").await?;
-let conn = tcp::accept(&listener, Some(reg), None).await?;
+let conn = tcp::accept(&listener, Some(reg)).await?;
 
 // client
 let conn = tcp::connect("127.0.0.1:5555").await?;

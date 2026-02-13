@@ -45,7 +45,6 @@ impl Envelope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
-    priority: Priority,
     trace: Option<TraceCtx>,
     version: u16,
 }
@@ -53,7 +52,6 @@ pub struct Meta {
 impl Default for Meta {
     fn default() -> Self {
         Self {
-            priority: Priority::Normal,
             trace: None,
             version: 1,
         }
@@ -61,14 +59,6 @@ impl Default for Meta {
 }
 
 impl Meta {
-    pub fn priority(&self) -> Priority {
-        self.priority
-    }
-
-    pub fn set_priority(&mut self, priority: Priority) {
-        self.priority = priority;
-    }
-
     pub fn trace(&self) -> Option<&TraceCtx> {
         self.trace.as_ref()
     }
@@ -84,13 +74,6 @@ impl Meta {
     pub fn set_version(&mut self, version: u16) {
         self.version = version;
     }
-}
-
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
-pub enum Priority {
-    High,
-    Normal,
-    Low,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
