@@ -10,6 +10,10 @@ pub enum Error {
     Codec(#[from] postcard::Error),
     #[error("frame too large: {0}")]
     FrameTooLarge(usize),
+    #[error("stream id mismatch: {a} != {b}")]
+    StreamIdMismatch { a: u16, b: u16 },
+    #[error("unsupported frame version: {major}.{minor}")]
+    UnsupportedFrameVersion { major: u8, minor: u8 },
     #[error("connect timeout")]
     ConnectTimeout,
     #[error("recv timeout")]

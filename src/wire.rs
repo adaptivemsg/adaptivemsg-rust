@@ -4,22 +4,16 @@ use crate::message::Message;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
-    stream_id: u64,
     meta: Meta,
     msg: Box<dyn Message>,
 }
 
 impl Envelope {
-    pub fn new(stream_id: u64, meta: Meta, msg: Box<dyn Message>) -> Self {
+    pub fn new(meta: Meta, msg: Box<dyn Message>) -> Self {
         Self {
-            stream_id,
             meta,
             msg,
         }
-    }
-
-    pub fn stream_id(&self) -> u64 {
-        self.stream_id
     }
 
     pub fn meta(&self) -> &Meta {
@@ -38,8 +32,8 @@ impl Envelope {
         self.msg
     }
 
-    pub fn into_parts(self) -> (u64, Meta, Box<dyn Message>) {
-        (self.stream_id, self.meta, self.msg)
+    pub fn into_parts(self) -> (Meta, Box<dyn Message>) {
+        (self.meta, self.msg)
     }
 }
 

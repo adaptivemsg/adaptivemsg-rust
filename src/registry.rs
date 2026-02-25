@@ -28,7 +28,7 @@ impl ContextStream {
         self.stream.get_context::<T>()
     }
 
-    pub fn id(&self) -> u64 {
+    pub fn id(&self) -> u16 {
         self.stream.id()
     }
 

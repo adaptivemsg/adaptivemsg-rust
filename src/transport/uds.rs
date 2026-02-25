@@ -5,13 +5,13 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::error::Error;
 use crate::registry::Registry;
-use crate::stream::{Conn, Connection as ConnectionInner};
+use crate::stream::{client as stream_client, server as stream_server, Connection};
 
-pub async fn connect(path: &str) -> Result<Conn, Error> {
+pub async fn connect(path: &str) -> Result<Connection, Error> {
     let path = to_uds_path(path)?;
     let stream = UnixStream::connect(path).await?;
     let peer_addr = stream.peer_addr().ok().map(|addr| format!("{addr:?}"));
-    Ok(ConnectionInner::new(stream, peer_addr, None, None, None).start())
+    Ok(stream_client::new(stream, peer_addr))
 }
 
 pub async fn listen(path: &str) -> Result<UnixListener, Error> {
@@ -33,9 +33,16 @@ where
 pub async fn accept(
     listener: &UnixListener,
     registry: Option<Registry>,
-) -> Result<Conn, Error> {
+) -> Result<Connection, Error> {
     let (stream, peer_addr) = accept_stream(listener).await?;
-    Ok(ConnectionInner::new(stream, peer_addr, registry, None, None).start())
+    Ok(stream_server::new_connection(
+        stream,
+        peer_addr,
+        registry,
+        None,
+        None,
+    )
+    .start())
 }
 
 fn to_uds_path(path: &str) -> Result<PathBuf, Error> {

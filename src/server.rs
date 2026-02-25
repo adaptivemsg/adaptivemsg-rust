@@ -5,12 +5,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::Error;
 use crate::registry::Registry;
-use crate::stream::{Conn, Connection as ConnectionInner, Stream};
+use crate::stream::{server as stream_server, Connection, Stream};
 
 pub struct Server {
     registry: Registry,
-    on_connect: Option<Arc<dyn Fn(Conn) + Send + Sync>>,
-    on_disconnect: Option<Arc<dyn Fn(Conn) + Send + Sync>>,
+    on_connect: Option<Arc<dyn Fn(Connection) + Send + Sync>>,
+    on_disconnect: Option<Arc<dyn Fn(Connection) + Send + Sync>>,
     on_new_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
     on_close_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
 }
@@ -33,7 +33,7 @@ impl Server {
 
     pub fn on_connect<F>(mut self, f: F) -> Self
     where
-        F: Fn(Conn) + Send + Sync + 'static,
+        F: Fn(Connection) + Send + Sync + 'static,
     {
         self.on_connect = Some(Arc::new(f));
         self
@@ -41,7 +41,7 @@ impl Server {
 
     pub fn on_disconnect<F>(mut self, f: F) -> Self
     where
-        F: Fn(Conn) + Send + Sync + 'static,
+        F: Fn(Connection) + Send + Sync + 'static,
     {
         self.on_disconnect = Some(Arc::new(f));
         self
@@ -110,7 +110,7 @@ impl Server {
             let server = server.clone();
 
             tokio::spawn(async move {
-                let conn = ConnectionInner::new(
+                let conn = stream_server::new_connection(
                     socket,
                     peer_addr,
                     Some(server.registry.clone()),

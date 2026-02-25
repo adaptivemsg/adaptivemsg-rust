@@ -4,7 +4,7 @@ use tokio::time::timeout;
 use tracing::debug;
 
 use crate::error::Error;
-use crate::stream::Conn;
+use crate::stream::Connection;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Transport {
@@ -42,7 +42,7 @@ impl Client {
         self
     }
 
-    pub async fn connect(&self, addr: &str) -> Result<Conn, Error> {
+    pub async fn connect(&self, addr: &str) -> Result<Connection, Error> {
         debug!("client connect: {}", addr);
         let (transport, target) = detect_transport(self.transport, addr);
         let fut = async {
