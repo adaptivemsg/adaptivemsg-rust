@@ -1,17 +1,23 @@
-use std::io;
 use std::path::PathBuf;
 
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::error::Error;
 use crate::registry::Registry;
-use crate::stream::{client as stream_client, server as stream_server, Connection};
+use crate::stream::{client as stream_client, server as stream_server, Connection, ConnectionInner};
 
 pub async fn connect(path: &str) -> Result<Connection, Error> {
     let path = to_uds_path(path)?;
     let stream = UnixStream::connect(path).await?;
     let peer_addr = stream.peer_addr().ok().map(|addr| format!("{addr:?}"));
-    Ok(stream_client::new(stream, peer_addr))
+    Ok(ConnectionInner::new_pending(
+        stream,
+        peer_addr,
+        stream_client::dispatch(),
+        None,
+        None,
+    )
+    .start())
 }
 
 pub async fn listen(path: &str) -> Result<UnixListener, Error> {
@@ -35,10 +41,10 @@ pub async fn accept(
     registry: Option<Registry>,
 ) -> Result<Connection, Error> {
     let (stream, peer_addr) = accept_stream(listener).await?;
-    Ok(stream_server::new_connection(
+    Ok(ConnectionInner::new_pending(
         stream,
         peer_addr,
-        registry,
+        stream_server::dispatch(registry),
         None,
         None,
     )
@@ -71,8 +77,8 @@ fn abstract_uds(name: &str) -> Result<PathBuf, Error> {
 
 #[cfg(not(target_os = "linux"))]
 fn abstract_uds(_name: &str) -> Result<PathBuf, Error> {
-    Err(Error::Io(io::Error::new(
-        io::ErrorKind::Unsupported,
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
         "abstract UDS is only supported on linux",
     )))
 }

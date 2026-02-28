@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use adaptivemsg::{ContextStream, Message, MessageHandler, Result};
+use adaptivemsg::{Message, MessageHandler, Result, Stream};
 use anyhow::anyhow;
 use tokio::sync::mpsc;
 
@@ -23,7 +23,7 @@ pub struct MessageReply {
 impl MessageHandler for MessageRequest {
     async fn handle(
         mut self: Box<Self>,
-        stream: ContextStream,
+        stream: Stream,
     ) -> Result<Option<Box<dyn Message>>> {
         let mgr = stream
             .get_context::<StatMgr>()
@@ -54,7 +54,7 @@ pub struct WhoElseEvent {
 impl MessageHandler for SubWhoElseEvent {
     async fn handle(
         self: Box<Self>,
-        stream: ContextStream,
+        stream: Stream,
     ) -> Result<Option<Box<dyn Message>>> {
         let mgr = stream
             .get_context::<StatMgr>()
@@ -87,7 +87,7 @@ pub struct WhoElseReply {
 impl MessageHandler for WhoElse {
     async fn handle(
         self: Box<Self>,
-        stream: ContextStream,
+        stream: Stream,
     ) -> Result<Option<Box<dyn Message>>> {
         let mgr = stream
             .get_context::<StatMgr>()
@@ -108,7 +108,7 @@ pub struct MessageTimeout {
 impl MessageHandler for MessageTimeout {
     async fn handle(
         self: Box<Self>,
-        _stream: ContextStream,
+        _stream: Stream,
     ) -> Result<Option<Box<dyn Message>>> {
         tokio::time::sleep(Duration::from_secs(self.secs)).await;
         Ok(None)

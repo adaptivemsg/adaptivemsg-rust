@@ -1,4 +1,4 @@
-use adaptivemsg::{ContextStream, Message, MessageHandler, Result};
+use adaptivemsg::{Message, MessageHandler, Result, Stream};
 
 #[adaptivemsg::message]
 pub struct HelloRequest {
@@ -15,7 +15,7 @@ pub struct HelloReply {
 impl MessageHandler for HelloRequest {
     async fn handle(
         self: Box<Self>,
-        _stream: ContextStream,
+        _stream: Stream,
     ) -> Result<Option<Box<dyn Message>>> {
         let question = self.question.to_lowercase();
         if question.contains("error") {

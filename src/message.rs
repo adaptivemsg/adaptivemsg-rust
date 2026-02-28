@@ -1,15 +1,28 @@
-use std::any::Any;
+use std::any::{Any, TypeId};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::registry::ContextStream;
+use crate::stream::Stream;
 
 #[typetag::serde(tag = "type")]
 pub trait Message: Any + Send + Sync + 'static {
     fn type_name(&self) -> &'static str {
         std::any::type_name::<Self>()
+    }
+}
+
+impl dyn Message {
+    pub fn downcast<T: Message>(
+        self: Box<Self>,
+    ) -> std::result::Result<Box<T>, Box<dyn Message>> {
+        if self.type_id() == TypeId::of::<T>() {
+            let raw = Box::into_raw(self);
+            // Safety: the type_id check ensures the cast target matches the concrete type.
+            return Ok(unsafe { Box::from_raw(raw as *mut T) });
+        }
+        Err(self)
     }
 }
 
@@ -56,7 +69,7 @@ pub trait MessageHandler: Message {
     /// The error type is `anyhow::Error` via `adaptivemsg::Result`.
     async fn handle(
         self: Box<Self>,
-        stream: ContextStream,
+        stream: Stream,
     ) -> Result<Option<Box<dyn Message>>>;
 }
 

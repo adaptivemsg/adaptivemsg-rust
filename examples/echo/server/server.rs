@@ -33,9 +33,10 @@ async fn main() -> anyhow::Result<()> {
             move |conn| {
                 let addr = conn
                     .peer_addr()
-                    .unwrap_or_else(|| format!("client-{}", conn.id()));
+                    .unwrap_or_else(|| "client-unknown".to_string());
                 mgr.on_connect(&addr);
                 info!("connect: {}", addr);
+                Ok(())
             }
         })
         .on_disconnect({
@@ -43,9 +44,10 @@ async fn main() -> anyhow::Result<()> {
             move |conn| {
                 let addr = conn
                     .peer_addr()
-                    .unwrap_or_else(|| format!("client-{}", conn.id()));
+                    .unwrap_or_else(|| "client-unknown".to_string());
                 mgr.on_disconnect(&addr);
                 info!("disconnect: {}", addr);
+                Ok(())
             }
         })
         .on_new_stream({

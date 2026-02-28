@@ -2,18 +2,18 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{debug, warn};
 
 use crate::error::Error;
 use crate::message::Message;
-use crate::wire::{Envelope, Meta};
+use serde::{Deserialize, Serialize};
 
 const STREAM_QUEUE_SIZE: usize = 1024;
 
@@ -33,41 +33,84 @@ pub(crate) type DispatchFn = Arc<dyn Fn(Stream, Envelope) -> DispatchFuture + Se
 
 #[doc(hidden)]
 pub struct ConnectionInner {
-    id: u64,
-    outbound_sender: mpsc::Sender<OutboundFrame>,
+    outbound_tx: mpsc::Sender<OutboundFrame>,
     streams: Mutex<HashMap<StreamId, Stream>>,
     peer_addr: Option<String>,
     on_new_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
     on_close_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
     dispatch: DispatchFn,
     closed: AtomicBool,
-    reader_task: Mutex<Option<JoinHandle<()>>>,
-    writer_task: Mutex<Option<JoinHandle<()>>>,
+    reader_abort: OnceLock<AbortHandle>,
+    writer_abort: OnceLock<AbortHandle>,
     closed_notify: Notify,
     next_stream_id: AtomicU16,
+    default_stream: OnceLock<Stream>,
 }
 
 pub type Connection = Arc<ConnectionInner>;
 
-pub(crate) type ConnectionParts<R, W> = (Connection, R, W, mpsc::Receiver<OutboundFrame>);
+pub(crate) struct PendingConnection<R, W> {
+    connection: Connection,
+    reader: R,
+    writer: W,
+    outbound_rx: mpsc::Receiver<OutboundFrame>,
+}
+
+impl<R, W> PendingConnection<R, W>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    pub(crate) fn connection(&self) -> Connection {
+        self.connection.clone()
+    }
+
+    pub(crate) fn start(self) -> Connection {
+        self.connection
+            .start(self.reader, self.writer, self.outbound_rx)
+    }
+}
 
 pub type Stream = Arc<StreamInner>;
 
 type InboundFrame = (StreamId, Vec<u8>);
 type OutboundFrame = (StreamId, Envelope);
 
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Envelope {
+    meta: Meta,
+    msg: Box<dyn Message>,
+}
+
+impl Envelope {
+    pub(crate) fn new(meta: Meta, msg: Box<dyn Message>) -> Self {
+        Self { meta, msg }
+    }
+
+    pub(crate) fn msg(&self) -> &dyn Message {
+        self.msg.as_ref()
+    }
+
+    pub(crate) fn into_msg(self) -> Box<dyn Message> {
+        self.msg
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(default)]
+pub(crate) struct Meta {}
+
 #[doc(hidden)]
 pub struct StreamInner {
     id: StreamId,
     connection: Connection,
-    inbox_receiver: AsyncMutex<mpsc::Receiver<Envelope>>,
-    inbox_sender: mpsc::Sender<Envelope>,
-    incoming_bytes_sender: mpsc::Sender<Vec<u8>>,
+    inbox_rx: AsyncMutex<mpsc::Receiver<Box<dyn Message>>>,
+    inbox_tx: mpsc::Sender<Box<dyn Message>>,
+    incoming_tx: mpsc::Sender<Vec<u8>>,
     context: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
     recv_timeout: Mutex<Option<Duration>>,
 }
-
-static CONN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl ConnectionInner {
     fn mark_closed(&self) {
@@ -75,37 +118,48 @@ impl ConnectionInner {
         self.closed_notify.notify_waiters();
     }
 
-    pub(crate) fn new_with_dispatch<RW>(
+    pub(crate) fn new_pending<RW>(
         io: RW,
         peer_addr: Option<String>,
         dispatch: DispatchFn,
         on_new_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
         on_close_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
-    ) -> ConnectionParts<ReadHalf<RW>, WriteHalf<RW>>
+    ) -> PendingConnection<ReadHalf<RW>, WriteHalf<RW>>
     where
         RW: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (read_half, write_half) = tokio::io::split(io);
-        let (connection, outbound_receiver) =
+        let (connection, outbound_rx) =
             Self::new_unstarted(peer_addr, dispatch, on_new_stream, on_close_stream);
-        (connection, read_half, write_half, outbound_receiver)
+        PendingConnection {
+            connection,
+            reader: read_half,
+            writer: write_half,
+            outbound_rx,
+        }
     }
 
-    pub(crate) fn from_split_with_dispatch<R, W>(
+    #[cfg(feature = "quic")]
+    pub(crate) fn new_pending_from_split<R, W>(
         reader: R,
         writer: W,
         peer_addr: Option<String>,
         dispatch: DispatchFn,
         on_new_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
         on_close_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
-    ) -> ConnectionParts<R, W>
+    ) -> PendingConnection<R, W>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (connection, outbound_receiver) =
+        let (connection, outbound_rx) =
             Self::new_unstarted(peer_addr, dispatch, on_new_stream, on_close_stream);
-        (connection, reader, writer, outbound_receiver)
+        PendingConnection {
+            connection,
+            reader,
+            writer,
+            outbound_rx,
+        }
     }
 
     fn new_unstarted(
@@ -114,44 +168,37 @@ impl ConnectionInner {
         on_new_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
         on_close_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
     ) -> (Connection, mpsc::Receiver<OutboundFrame>) {
-        let (outbound_sender, outbound_receiver) =
-            mpsc::channel::<OutboundFrame>(STREAM_QUEUE_SIZE);
+        let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(STREAM_QUEUE_SIZE);
 
         let connection: Connection = Arc::new(ConnectionInner {
-            id: CONN_SEQ.fetch_add(1, Ordering::Relaxed) + 1,
-            outbound_sender,
+            outbound_tx,
             streams: Mutex::new(HashMap::new()),
             peer_addr,
             on_new_stream,
             on_close_stream,
             dispatch,
             closed: AtomicBool::new(false),
-            reader_task: Mutex::new(None),
-            writer_task: Mutex::new(None),
+            reader_abort: OnceLock::new(),
+            writer_abort: OnceLock::new(),
             closed_notify: Notify::new(),
             next_stream_id: AtomicU16::new(1),
+            default_stream: OnceLock::new(),
         });
 
-        let _ = connection.create_stream(DEFAULT_STREAM_ID);
-
-        (connection, outbound_receiver)
-    }
-
-    pub fn id(&self) -> u64 {
-        self.id
+        (connection, outbound_rx)
     }
 
     pub fn peer_addr(&self) -> Option<String> {
         self.peer_addr.clone()
     }
 
-    pub fn close(&self) {
+    pub(crate) fn close(&self) {
         self.mark_closed();
-        if let Some(task) = self.reader_task.lock().unwrap().take() {
-            task.abort();
+        if let Some(handle) = self.reader_abort.get() {
+            handle.abort();
         }
-        if let Some(task) = self.writer_task.lock().unwrap().take() {
-            task.abort();
+        if let Some(handle) = self.writer_abort.get() {
+            handle.abort();
         }
     }
 
@@ -167,10 +214,6 @@ impl ConnectionInner {
             return;
         }
         self.closed_notify.notified().await;
-    }
-
-    fn default_stream(self: &Arc<Self>) -> Stream {
-        self.select_stream(DEFAULT_STREAM_ID)
     }
 
     pub fn set_recv_timeout(self: &Arc<Self>, timeout: Duration) {
@@ -194,23 +237,24 @@ impl ConnectionInner {
 
     pub fn new_stream(self: &Arc<Self>) -> Stream {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
-        self.create_stream(stream_id)
+        self.get_stream(stream_id)
     }
 
     pub(crate) fn start<R, W>(
         self: &Connection,
         reader: R,
         writer: W,
-        outbound_receiver: mpsc::Receiver<OutboundFrame>,
+        outbound_rx: mpsc::Receiver<OutboundFrame>,
     ) -> Connection
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let writer_task = self.spawn_writer(writer, outbound_receiver);
+        let writer_task = self.spawn_writer(writer, outbound_rx);
+        let _ = self.writer_abort.set(writer_task.abort_handle());
+
         let reader_task = self.spawn_reader(reader);
-        *self.writer_task.lock().unwrap() = Some(writer_task);
-        *self.reader_task.lock().unwrap() = Some(reader_task);
+        let _ = self.reader_abort.set(reader_task.abort_handle());
 
         self.clone()
     }
@@ -271,44 +315,35 @@ impl StreamInner {
     }
 
     pub async fn send<M: Message>(self: &Arc<Self>, msg: M) -> Result<(), Error> {
-        self.send_boxed(Box::new(msg), Meta::default()).await
+        self.send_boxed(Box::new(msg)).await
     }
 
-    pub async fn send_with_meta<M: Message>(
-        self: &Arc<Self>,
-        msg: M,
-        meta: Meta,
-    ) -> Result<(), Error> {
-        self.send_boxed(Box::new(msg), meta).await
-    }
-
-    pub async fn send_boxed(
+    pub(crate) async fn send_boxed(
         self: &Arc<Self>,
         msg: Box<dyn Message>,
-        meta: Meta,
     ) -> Result<(), Error> {
-        let env = Envelope::new(meta, msg);
+        let env = Envelope::new(Meta::default(), msg);
         let frame: OutboundFrame = (self.id, env);
         self.connection
-            .outbound_sender
+            .outbound_tx
             .send(frame)
             .await
             .map_err(|_| Error::Closed)
     }
 
-    pub(crate) async fn push_env(self: &Arc<Self>, env: Envelope) -> Result<(), Error> {
-        self.inbox_sender
-            .send(env)
+    pub(crate) async fn inbox_q(self: &Arc<Self>, msg: Box<dyn Message>) -> Result<(), Error> {
+        // Enqueue for recv()/send_recv() on this stream.
+        self.inbox_tx
+            .send(msg)
             .await
             .map_err(|_| Error::Closed)
     }
 
     pub async fn recv<T: Message + 'static>(self: &Arc<Self>) -> Result<T, Error> {
-        let env = self.recv_raw().await?;
+        let msg = self.recv_msg().await?;
         let expected = std::any::type_name::<T>();
-        let got = env.msg().type_name();
-        let boxed_any: Box<dyn std::any::Any> = env.into_msg();
-        match boxed_any.downcast::<T>() {
+        let got = msg.type_name();
+        match msg.downcast::<T>() {
             Ok(val) => Ok(*val),
             Err(_) => Err(Error::TypeMismatch { expected, got }),
         }
@@ -319,29 +354,28 @@ impl StreamInner {
         msg: TReq,
     ) -> Result<TResp, Error> {
         self.send(msg).await?;
-        let env = self.recv_raw().await?;
-        let got = env.msg().type_name();
-        let boxed_any: Box<dyn std::any::Any> = env.into_msg();
-        let boxed_any = match boxed_any.downcast::<crate::message::ErrorReply>() {
+        let msg = self.recv_msg().await?;
+        let got = msg.type_name();
+        let msg = match msg.downcast::<crate::message::ErrorReply>() {
             Ok(err) => {
                 let (code, message) = err.into_parts();
                 return Err(Error::Remote { code, message });
             }
-            Err(boxed_any) => boxed_any,
+            Err(msg) => msg,
         };
         let expected = std::any::type_name::<TResp>();
-        match boxed_any.downcast::<TResp>() {
+        match msg.downcast::<TResp>() {
             Ok(val) => Ok(*val),
             Err(_) => Err(Error::TypeMismatch { expected, got }),
         }
     }
 
-    pub async fn recv_raw(self: &Arc<Self>) -> Result<Envelope, Error> {
+    async fn recv_msg(self: &Arc<Self>) -> Result<Box<dyn Message>, Error> {
         let timeout = *self.recv_timeout.lock().unwrap();
-        let mut inbox = self.inbox_receiver.lock().await;
+        let mut inbox = self.inbox_rx.lock().await;
         if let Some(timeout) = timeout {
             match tokio::time::timeout(timeout, inbox.recv()).await {
-                Ok(Some(env)) => Ok(env),
+                Ok(Some(msg)) => Ok(msg),
                 Ok(None) => Err(Error::Closed),
                 Err(_) => Err(Error::RecvTimeout),
             }
@@ -352,16 +386,16 @@ impl StreamInner {
 }
 
 impl ConnectionInner {
-    fn create_stream(self: &Connection, stream_id: StreamId) -> Stream {
-        let (inbox_sender, inbox_receiver) = mpsc::channel::<Envelope>(STREAM_QUEUE_SIZE);
-        let (incoming_bytes_sender, incoming_bytes_receiver) =
+    fn make_stream(self: &Connection, stream_id: StreamId) -> Stream {
+        let (inbox_tx, inbox_rx) = mpsc::channel::<Box<dyn Message>>(STREAM_QUEUE_SIZE);
+        let (incoming_tx, incoming_rx) =
             mpsc::channel::<Vec<u8>>(STREAM_QUEUE_SIZE);
         let stream: Stream = Arc::new(StreamInner {
             id: stream_id,
             connection: self.clone(),
-            inbox_receiver: AsyncMutex::new(inbox_receiver),
-            inbox_sender,
-            incoming_bytes_sender,
+            inbox_rx: AsyncMutex::new(inbox_rx),
+            inbox_tx,
+            incoming_tx,
             context: Mutex::new(None),
             recv_timeout: Mutex::new(None),
         });
@@ -369,57 +403,58 @@ impl ConnectionInner {
             .lock()
             .unwrap()
             .insert(stream_id, stream.clone());
-        self.spawn_stream_task(stream.clone(), incoming_bytes_receiver);
-        stream
-    }
-
-    fn spawn_stream_task(
-        self: &Connection,
-        stream: Stream,
-        mut incoming_bytes_receiver: mpsc::Receiver<Vec<u8>>,
-    ) {
         let dispatch = self.dispatch.clone();
+        let stream_task = stream.clone();
         let _ = tokio::spawn(async move {
-            while let Some(payload) = incoming_bytes_receiver.recv().await {
+            let mut incoming_rx = incoming_rx;
+            while let Some(payload) = incoming_rx.recv().await {
                 let env = match postcard::from_bytes::<Envelope>(&payload) {
                     Ok(env) => env,
                     Err(err) => {
                         warn!("decode failed: {err}");
-                        stream.connection.mark_closed();
+                        stream_task.connection.mark_closed();
                         break;
                     }
                 };
 
-                dispatch(stream.clone(), env).await;
+                dispatch(stream_task.clone(), env).await;
             }
         });
+        if let Some(ref f) = self.on_new_stream {
+            f(&stream);
+        }
+        stream
     }
 
-    fn select_stream(self: &Connection, stream_id: StreamId) -> Stream {
+    fn default_stream(self: &Connection) -> Stream {
+        self.get_stream(DEFAULT_STREAM_ID)
+    }
+
+    fn get_stream(self: &Connection, stream_id: StreamId) -> Stream {
+        if stream_id == DEFAULT_STREAM_ID {
+            return self
+                .default_stream
+                .get_or_init(|| self.make_stream(DEFAULT_STREAM_ID))
+                .clone();
+        }
         if let Some(stream) = self.streams.lock().unwrap().get(&stream_id).cloned() {
             return stream;
         }
 
-        let stream = self.create_stream(stream_id);
-        if stream_id != DEFAULT_STREAM_ID {
-            if let Some(ref f) = self.on_new_stream {
-                f(&stream);
-            }
-        }
-        stream
+        self.make_stream(stream_id)
     }
 
     fn spawn_writer<W>(
         self: &Connection,
         mut writer: W,
-        mut outbound_receiver: mpsc::Receiver<OutboundFrame>,
+        mut outbound_rx: mpsc::Receiver<OutboundFrame>,
     ) -> JoinHandle<()>
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let connection = self.clone();
         tokio::spawn(async move {
-            while let Some((stream_id, env)) = outbound_receiver.recv().await {
+            while let Some((stream_id, env)) = outbound_rx.recv().await {
                 if let Err(err) = Self::write_envelope(&mut writer, stream_id, &env).await {
                     warn!("write failed: {err}");
                     connection.mark_closed();
@@ -445,27 +480,10 @@ impl ConnectionInner {
                     }
                 };
 
-                let stream = connection.select_stream(stream_id);
-                let _ = stream.incoming_bytes_sender.send(payload).await;
+                let stream = connection.get_stream(stream_id);
+                let _ = stream.incoming_tx.send(payload).await;
             }
         })
-    }
-
-    fn encode_stream_id(stream_id: StreamId) -> u32 {
-        let part_a = stream_id;
-        let part_b = stream_id ^ STREAM_ID_XOR;
-        ((part_a as u32) << 16) | (part_b as u32)
-    }
-
-    fn decode_stream_id(raw: u32) -> Result<StreamId, Error> {
-        let part_a = (raw >> 16) as u16;
-        let part_b = (raw & 0xFFFF) as u16;
-        let id_a = part_a;
-        let id_b = part_b ^ STREAM_ID_XOR;
-        if id_a != id_b {
-            return Err(Error::StreamIdMismatch { a: id_a, b: id_b });
-        }
-        Ok(id_a)
     }
 
     // Frame layout (big endian for multi-byte fields):
@@ -489,7 +507,7 @@ impl ConnectionInner {
         let raw_stream_id = if stream_id == DEFAULT_STREAM_ID {
             DEFAULT_STREAM_ID_ENCODED
         } else {
-            Self::encode_stream_id(stream_id)
+            ((stream_id as u32) << 16) | ((stream_id ^ STREAM_ID_XOR) as u32)
         };
 
         header[0] = FRAME_VERSION_MAJOR_V1;
@@ -510,7 +528,13 @@ impl ConnectionInner {
         let stream_id = if raw_stream_id == DEFAULT_STREAM_ID_ENCODED {
             DEFAULT_STREAM_ID
         } else {
-            Self::decode_stream_id(raw_stream_id)?
+            let part_a = (raw_stream_id >> 16) as u16;
+            let part_b = (raw_stream_id & 0xFFFF) as u16;
+            let id_b = part_b ^ STREAM_ID_XOR;
+            if part_a != id_b {
+                return Err(Error::StreamIdMismatch { a: part_a, b: id_b });
+            }
+            part_a
         };
         let len = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
         Ok((stream_id, len))

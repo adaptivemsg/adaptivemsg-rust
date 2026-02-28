@@ -5,12 +5,13 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::Error;
 use crate::registry::Registry;
-use crate::stream::{server as stream_server, Connection, Stream};
+use crate::stream::{server as stream_server, Connection, ConnectionInner, Stream};
+use tracing::warn;
 
 pub struct Server {
     registry: Registry,
-    on_connect: Option<Arc<dyn Fn(Connection) + Send + Sync>>,
-    on_disconnect: Option<Arc<dyn Fn(Connection) + Send + Sync>>,
+    on_connect: Option<Arc<dyn Fn(Connection) -> Result<(), Error> + Send + Sync>>,
+    on_disconnect: Option<Arc<dyn Fn(Connection) -> Result<(), Error> + Send + Sync>>,
     on_new_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
     on_close_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
 }
@@ -26,14 +27,9 @@ impl Server {
         }
     }
 
-    pub fn with_registry(mut self, registry: Registry) -> Self {
-        self.registry = registry;
-        self
-    }
-
     pub fn on_connect<F>(mut self, f: F) -> Self
     where
-        F: Fn(Connection) + Send + Sync + 'static,
+        F: Fn(Connection) -> Result<(), Error> + Send + Sync + 'static,
     {
         self.on_connect = Some(Arc::new(f));
         self
@@ -41,7 +37,7 @@ impl Server {
 
     pub fn on_disconnect<F>(mut self, f: F) -> Self
     where
-        F: Fn(Connection) + Send + Sync + 'static,
+        F: Fn(Connection) -> Result<(), Error> + Send + Sync + 'static,
     {
         self.on_disconnect = Some(Arc::new(f));
         self
@@ -107,27 +103,35 @@ impl Server {
 
         loop {
             let (socket, peer_addr) = accept().await?;
+            let peer_label = peer_addr
+                .clone()
+                .unwrap_or_else(|| "client-unknown".to_string());
             let server = server.clone();
 
             tokio::spawn(async move {
-                let conn = stream_server::new_connection(
+                let pending = ConnectionInner::new_pending(
                     socket,
                     peer_addr,
-                    Some(server.registry.clone()),
+                    stream_server::dispatch(Some(server.registry.clone())),
                     server.on_new_stream.clone(),
                     server.on_close_stream.clone(),
                 );
                 if let Some(ref f) = server.on_connect {
-                    f(conn.connection());
+                    if let Err(err) = f(pending.connection()) {
+                        warn!("on_connect failed for {peer_label}: {err}");
+                        pending.connection().close();
+                        return;
+                    }
                 }
-
-                let conn = conn.start();
+                let conn = pending.start();
                 conn.wait_closed().await;
 
                 conn.close_all_streams();
 
                 if let Some(ref f) = server.on_disconnect {
-                    f(conn);
+                    if let Err(err) = f(conn) {
+                        warn!("on_disconnect failed for {peer_label}: {err}");
+                    }
                 }
             });
         }
