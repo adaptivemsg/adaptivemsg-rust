@@ -13,6 +13,7 @@ pub async fn connect(addr: &str) -> Result<Connection, Error> {
         stream_client::dispatch(),
         None,
         None,
+        None,
     )
     .start())
 }
@@ -35,11 +36,13 @@ pub async fn accept(
     listener: &TcpListener,
     registry: Option<Registry>,
 ) -> Result<Connection, Error> {
+    let handler_registry = registry.clone();
     let (stream, peer_addr) = accept_stream(listener).await?;
     Ok(ConnectionInner::new_pending(
         stream,
         peer_addr,
         stream_server::dispatch(registry),
+        handler_registry,
         None,
         None,
     )

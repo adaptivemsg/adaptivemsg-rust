@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use adaptivemsg::{Message, MessageHandler, Result, Stream};
+use adaptivemsg::{HandlerStream, Message, MessageHandler, Result};
 use anyhow::anyhow;
 use tokio::sync::mpsc;
 
@@ -21,10 +21,7 @@ pub struct MessageReply {
 
 #[adaptivemsg::message_handler]
 impl MessageHandler for MessageRequest {
-    async fn handle(
-        mut self: Box<Self>,
-        stream: Stream,
-    ) -> Result<Option<Box<dyn Message>>> {
+    async fn handle(mut self: Box<Self>, stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
         let mgr = stream
             .get_context::<StatMgr>()
             .ok_or_else(|| anyhow!("missing StatMgr context"))?;
@@ -52,17 +49,13 @@ pub struct WhoElseEvent {
 
 #[adaptivemsg::message_handler]
 impl MessageHandler for SubWhoElseEvent {
-    async fn handle(
-        self: Box<Self>,
-        stream: Stream,
-    ) -> Result<Option<Box<dyn Message>>> {
+    async fn handle(self: Box<Self>, stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
         let mgr = stream
             .get_context::<StatMgr>()
             .ok_or_else(|| anyhow!("missing StatMgr context"))?;
         let (tx, mut rx) = mpsc::channel::<String>(8);
         let sub_id = mgr.add_subscriber(tx);
-        let stream = stream.clone();
-        tokio::spawn(async move {
+        stream.new_task(|stream| async move {
             while let Some(addr) = rx.recv().await {
                 let msg = WhoElseEvent { addr };
                 if stream.send(msg).await.is_err() {
@@ -85,10 +78,7 @@ pub struct WhoElseReply {
 
 #[adaptivemsg::message_handler]
 impl MessageHandler for WhoElse {
-    async fn handle(
-        self: Box<Self>,
-        stream: Stream,
-    ) -> Result<Option<Box<dyn Message>>> {
+    async fn handle(self: Box<Self>, stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
         let mgr = stream
             .get_context::<StatMgr>()
             .ok_or_else(|| anyhow!("missing StatMgr context"))?;
@@ -106,10 +96,7 @@ pub struct MessageTimeout {
 
 #[adaptivemsg::message_handler]
 impl MessageHandler for MessageTimeout {
-    async fn handle(
-        self: Box<Self>,
-        _stream: Stream,
-    ) -> Result<Option<Box<dyn Message>>> {
+    async fn handle(self: Box<Self>, _stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
         tokio::time::sleep(Duration::from_secs(self.secs)).await;
         Ok(None)
     }

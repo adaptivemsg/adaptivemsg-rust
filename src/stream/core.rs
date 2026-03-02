@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 
 use crate::error::Error;
 use crate::message::Message;
+use crate::registry::Registry;
 use serde::{Deserialize, Serialize};
 
 const STREAM_QUEUE_SIZE: usize = 1024;
@@ -36,8 +37,9 @@ pub struct ConnectionInner {
     outbound_tx: mpsc::Sender<OutboundFrame>,
     streams: Mutex<HashMap<StreamId, Stream>>,
     peer_addr: Option<String>,
-    on_new_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
+    on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
     on_close_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
+    handler_registry: Option<Registry>,
     dispatch: DispatchFn,
     closed: AtomicBool,
     reader_abort: OnceLock<AbortHandle>,
@@ -73,6 +75,11 @@ where
 
 pub type Stream = Arc<StreamInner>;
 
+#[derive(Clone)]
+pub struct HandlerStream {
+    stream: Stream,
+}
+
 type InboundFrame = (StreamId, Vec<u8>);
 type OutboundFrame = (StreamId, Envelope);
 
@@ -105,11 +112,17 @@ pub(crate) struct Meta {}
 pub struct StreamInner {
     id: StreamId,
     connection: Connection,
+    server_state: Option<Arc<ServerStreamState>>,
     inbox_rx: AsyncMutex<mpsc::Receiver<Box<dyn Message>>>,
     inbox_tx: mpsc::Sender<Box<dyn Message>>,
     incoming_tx: mpsc::Sender<Vec<u8>>,
     context: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
     recv_timeout: Mutex<Option<Duration>>,
+}
+
+struct ServerStreamState {
+    handler_rx: AsyncMutex<mpsc::Receiver<Box<dyn Message>>>,
+    handler_tx: mpsc::Sender<Box<dyn Message>>,
 }
 
 impl ConnectionInner {
@@ -122,15 +135,21 @@ impl ConnectionInner {
         io: RW,
         peer_addr: Option<String>,
         dispatch: DispatchFn,
-        on_new_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
+        handler_registry: Option<Registry>,
+        on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
         on_close_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
     ) -> PendingConnection<ReadHalf<RW>, WriteHalf<RW>>
     where
         RW: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (read_half, write_half) = tokio::io::split(io);
-        let (connection, outbound_rx) =
-            Self::new_unstarted(peer_addr, dispatch, on_new_stream, on_close_stream);
+        let (connection, outbound_rx) = Self::new_unstarted(
+            peer_addr,
+            dispatch,
+            handler_registry,
+            on_new_stream,
+            on_close_stream,
+        );
         PendingConnection {
             connection,
             reader: read_half,
@@ -145,15 +164,21 @@ impl ConnectionInner {
         writer: W,
         peer_addr: Option<String>,
         dispatch: DispatchFn,
-        on_new_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
+        handler_registry: Option<Registry>,
+        on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
         on_close_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
     ) -> PendingConnection<R, W>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (connection, outbound_rx) =
-            Self::new_unstarted(peer_addr, dispatch, on_new_stream, on_close_stream);
+        let (connection, outbound_rx) = Self::new_unstarted(
+            peer_addr,
+            dispatch,
+            handler_registry,
+            on_new_stream,
+            on_close_stream,
+        );
         PendingConnection {
             connection,
             reader,
@@ -165,7 +190,8 @@ impl ConnectionInner {
     fn new_unstarted(
         peer_addr: Option<String>,
         dispatch: DispatchFn,
-        on_new_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
+        handler_registry: Option<Registry>,
+        on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
         on_close_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
     ) -> (Connection, mpsc::Receiver<OutboundFrame>) {
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(STREAM_QUEUE_SIZE);
@@ -176,6 +202,7 @@ impl ConnectionInner {
             peer_addr,
             on_new_stream,
             on_close_stream,
+            handler_registry,
             dispatch,
             closed: AtomicBool::new(false),
             reader_abort: OnceLock::new(),
@@ -203,8 +230,9 @@ impl ConnectionInner {
     }
 
     pub(crate) fn close_all_streams(&self) {
-        let streams: Vec<Stream> = self.streams.lock().unwrap().values().cloned().collect();
-        for stream in streams {
+        let handles: Vec<Stream> =
+            self.streams.lock().unwrap().values().cloned().collect();
+        for stream in handles {
             stream.close();
         }
     }
@@ -216,8 +244,8 @@ impl ConnectionInner {
         self.closed_notify.notified().await;
     }
 
-    pub fn set_recv_timeout(self: &Arc<Self>, timeout: Duration) {
-        self.default_stream().set_recv_timeout(timeout);
+    fn default_stream(self: &Connection) -> Stream {
+        self.get_stream(DEFAULT_STREAM_ID)
     }
 
     pub async fn send<M: Message>(self: &Arc<Self>, msg: M) -> Result<(), Error> {
@@ -237,7 +265,7 @@ impl ConnectionInner {
 
     pub fn new_stream(self: &Arc<Self>) -> Stream {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
-        self.get_stream(stream_id)
+        self.make_stream(stream_id)
     }
 
     pub(crate) fn start<R, W>(
@@ -267,7 +295,7 @@ impl Drop for ConnectionInner {
 }
 
 impl StreamInner {
-    pub fn id(self: &Arc<Self>) -> u16 {
+    pub fn id(&self) -> u16 {
         self.id
     }
 
@@ -287,14 +315,14 @@ impl StreamInner {
         }
     }
 
-    pub fn set_context<T>(self: &Arc<Self>, ctx: Arc<T>)
+    pub fn set_context<T>(&self, ctx: Arc<T>)
     where
         T: Any + Send + Sync + 'static,
     {
         *self.context.lock().unwrap() = Some(ctx);
     }
 
-    pub fn get_context<T>(self: &Arc<Self>) -> Option<Arc<T>>
+    pub fn get_context<T>(&self) -> Option<Arc<T>>
     where
         T: Any + Send + Sync + 'static,
     {
@@ -305,7 +333,7 @@ impl StreamInner {
             .and_then(|ctx| Arc::clone(ctx).downcast::<T>().ok())
     }
 
-    pub fn set_recv_timeout(self: &Arc<Self>, timeout: Duration) {
+    pub fn set_recv_timeout(&self, timeout: Duration) {
         let mut guard = self.recv_timeout.lock().unwrap();
         if timeout.is_zero() {
             *guard = None;
@@ -314,14 +342,11 @@ impl StreamInner {
         }
     }
 
-    pub async fn send<M: Message>(self: &Arc<Self>, msg: M) -> Result<(), Error> {
+    pub async fn send<M: Message>(&self, msg: M) -> Result<(), Error> {
         self.send_boxed(Box::new(msg)).await
     }
 
-    pub(crate) async fn send_boxed(
-        self: &Arc<Self>,
-        msg: Box<dyn Message>,
-    ) -> Result<(), Error> {
+    pub(crate) async fn send_boxed(&self, msg: Box<dyn Message>) -> Result<(), Error> {
         let env = Envelope::new(Meta::default(), msg);
         let frame: OutboundFrame = (self.id, env);
         self.connection
@@ -331,7 +356,7 @@ impl StreamInner {
             .map_err(|_| Error::Closed)
     }
 
-    pub(crate) async fn inbox_q(self: &Arc<Self>, msg: Box<dyn Message>) -> Result<(), Error> {
+    pub(crate) async fn inbox_q(&self, msg: Box<dyn Message>) -> Result<(), Error> {
         // Enqueue for recv()/send_recv() on this stream.
         self.inbox_tx
             .send(msg)
@@ -339,7 +364,14 @@ impl StreamInner {
             .map_err(|_| Error::Closed)
     }
 
-    pub async fn recv<T: Message + 'static>(self: &Arc<Self>) -> Result<T, Error> {
+    pub(crate) async fn handler_q(&self, msg: Box<dyn Message>) -> Result<(), Error> {
+        match self.server_state.as_ref() {
+            Some(state) => state.handler_tx.send(msg).await.map_err(|_| Error::Closed),
+            None => Err(Error::Closed),
+        }
+    }
+
+    pub async fn recv<T: Message + 'static>(&self) -> Result<T, Error> {
         let msg = self.recv_msg().await?;
         let expected = std::any::type_name::<T>();
         let got = msg.type_name();
@@ -349,8 +381,18 @@ impl StreamInner {
         }
     }
 
+    pub(crate) async fn recv_handler_boxed(&self) -> Result<Box<dyn Message>, Error> {
+        match self.server_state.as_ref() {
+            Some(state) => {
+                let mut handler_rx = state.handler_rx.lock().await;
+                handler_rx.recv().await.ok_or(Error::Closed)
+            }
+            None => Err(Error::Closed),
+        }
+    }
+
     pub async fn send_recv<TReq: Message, TResp: Message + 'static>(
-        self: &Arc<Self>,
+        &self,
         msg: TReq,
     ) -> Result<TResp, Error> {
         self.send(msg).await?;
@@ -370,7 +412,7 @@ impl StreamInner {
         }
     }
 
-    async fn recv_msg(self: &Arc<Self>) -> Result<Box<dyn Message>, Error> {
+    async fn recv_msg(&self) -> Result<Box<dyn Message>, Error> {
         let timeout = *self.recv_timeout.lock().unwrap();
         let mut inbox = self.inbox_rx.lock().await;
         if let Some(timeout) = timeout {
@@ -385,14 +427,93 @@ impl StreamInner {
     }
 }
 
+impl HandlerStream {
+    pub(crate) fn new(stream: Stream) -> Self {
+        Self { stream }
+    }
+
+    pub fn id(&self) -> u16 {
+        self.stream.id()
+    }
+
+    pub fn get_context<T>(&self) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.stream.get_context::<T>()
+    }
+
+    pub fn new_task<F, Fut>(&self, f: F)
+    where
+        F: FnOnce(Stream) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let stream = self.stream.clone();
+        tokio::spawn(async move {
+            f(stream).await;
+        });
+    }
+}
+
 impl ConnectionInner {
+    fn spawn_handler_task(self: &Connection, stream: Stream) {
+        let Some(registry) = self.handler_registry.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            loop {
+                let msg = match stream.recv_handler_boxed().await {
+                    Ok(msg) => msg,
+                    Err(Error::Closed) => break,
+                    Err(err) => {
+                        warn!("handler recv error: {err}");
+                        break;
+                    }
+                };
+                let type_name = msg.type_name();
+                let Some(handler) = registry.handler(type_name) else {
+                    warn!("no handler for message type: {type_name}");
+                    continue;
+                };
+                match handler.handle(msg, HandlerStream::new(stream.clone())).await {
+                    Ok(Some(reply)) => {
+                        let _ = stream.send_boxed(reply).await;
+                    }
+                    Ok(None) => {
+                        let _ = stream
+                            .send_boxed(Box::new(crate::message::OkReply))
+                            .await;
+                    }
+                    Err(err) => {
+                        warn!("handler error: {err}");
+                        let _ = stream
+                            .send_boxed(
+                                Box::new(crate::message::ErrorReply::new(
+                                    "handler_error",
+                                    err.to_string(),
+                                )),
+                            )
+                            .await;
+                    }
+                }
+            }
+        });
+    }
+
     fn make_stream(self: &Connection, stream_id: StreamId) -> Stream {
         let (inbox_tx, inbox_rx) = mpsc::channel::<Box<dyn Message>>(STREAM_QUEUE_SIZE);
-        let (incoming_tx, incoming_rx) =
-            mpsc::channel::<Vec<u8>>(STREAM_QUEUE_SIZE);
-        let stream: Stream = Arc::new(StreamInner {
+        let (incoming_tx, mut incoming_rx) = mpsc::channel::<Vec<u8>>(STREAM_QUEUE_SIZE);
+        let server_state = self.handler_registry.as_ref().map(|_| {
+            let (handler_tx, handler_rx) = mpsc::channel::<Box<dyn Message>>(STREAM_QUEUE_SIZE);
+            Arc::new(ServerStreamState {
+                handler_rx: AsyncMutex::new(handler_rx),
+                handler_tx,
+            })
+        });
+        let stream = Arc::new(StreamInner {
             id: stream_id,
             connection: self.clone(),
+            server_state,
             inbox_rx: AsyncMutex::new(inbox_rx),
             inbox_tx,
             incoming_tx,
@@ -403,45 +524,51 @@ impl ConnectionInner {
             .lock()
             .unwrap()
             .insert(stream_id, stream.clone());
+        if stream_id == DEFAULT_STREAM_ID {
+            let _ = self.default_stream.set(stream.clone());
+        }
+        self.spawn_handler_task(stream.clone());
         let dispatch = self.dispatch.clone();
-        let stream_task = stream.clone();
-        let _ = tokio::spawn(async move {
-            let mut incoming_rx = incoming_rx;
-            while let Some(payload) = incoming_rx.recv().await {
-                let env = match postcard::from_bytes::<Envelope>(&payload) {
-                    Ok(env) => env,
-                    Err(err) => {
-                        warn!("decode failed: {err}");
-                        stream_task.connection.mark_closed();
-                        break;
-                    }
-                };
+        let _ = tokio::spawn({
+            let stream = stream.clone();
+            async move {
+                while let Some(payload) = incoming_rx.recv().await {
+                    let env = match postcard::from_bytes::<Envelope>(&payload) {
+                        Ok(env) => env,
+                        Err(err) => {
+                            warn!("decode failed: {err}");
+                            stream.connection.mark_closed();
+                            break;
+                        }
+                    };
 
-                dispatch(stream_task.clone(), env).await;
+                    dispatch(stream.clone(), env).await;
+                }
             }
         });
-        if let Some(ref f) = self.on_new_stream {
-            f(&stream);
-        }
         stream
-    }
-
-    fn default_stream(self: &Connection) -> Stream {
-        self.get_stream(DEFAULT_STREAM_ID)
     }
 
     fn get_stream(self: &Connection, stream_id: StreamId) -> Stream {
         if stream_id == DEFAULT_STREAM_ID {
-            return self
-                .default_stream
-                .get_or_init(|| self.make_stream(DEFAULT_STREAM_ID))
-                .clone();
+            if let Some(handle) = self.default_stream.get() {
+                return handle.clone();
+            }
+            let stream = self.make_stream(DEFAULT_STREAM_ID);
+            if let Some(ref f) = self.on_new_stream {
+                f(stream.clone());
+            }
+            return stream;
         }
         if let Some(stream) = self.streams.lock().unwrap().get(&stream_id).cloned() {
             return stream;
         }
 
-        self.make_stream(stream_id)
+        let stream = self.make_stream(stream_id);
+        if let Some(ref f) = self.on_new_stream {
+            f(stream.clone());
+        }
+        stream
     }
 
     fn spawn_writer<W>(

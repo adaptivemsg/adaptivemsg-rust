@@ -22,6 +22,7 @@ pub async fn connect(
         stream_client::dispatch(),
         None,
         None,
+        None,
     )
     .start())
 }
@@ -30,6 +31,7 @@ pub async fn accept(
     endpoint: &Endpoint,
     registry: Option<Registry>,
 ) -> Result<Connection, Error> {
+    let handler_registry = registry.clone();
     let incoming = endpoint.accept().await.ok_or_else(|| {
         io::Error::new(io::ErrorKind::UnexpectedEof, "no incoming connection")
     })?;
@@ -41,6 +43,7 @@ pub async fn accept(
         send,
         peer_addr,
         stream_server::dispatch(registry),
+        handler_registry,
         None,
         None,
     )

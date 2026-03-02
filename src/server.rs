@@ -12,7 +12,7 @@ pub struct Server {
     registry: Registry,
     on_connect: Option<Arc<dyn Fn(Connection) -> Result<(), Error> + Send + Sync>>,
     on_disconnect: Option<Arc<dyn Fn(Connection) -> Result<(), Error> + Send + Sync>>,
-    on_new_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
+    on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
     on_close_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
 }
 
@@ -45,7 +45,7 @@ impl Server {
 
     pub fn on_new_stream<F>(mut self, f: F) -> Self
     where
-        F: Fn(&Stream) + Send + Sync + 'static,
+        F: Fn(Stream) + Send + Sync + 'static,
     {
         self.on_new_stream = Some(Arc::new(f));
         self
@@ -113,6 +113,7 @@ impl Server {
                     socket,
                     peer_addr,
                     stream_server::dispatch(Some(server.registry.clone())),
+                    Some(server.registry.clone()),
                     server.on_new_stream.clone(),
                     server.on_close_stream.clone(),
                 );

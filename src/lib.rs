@@ -12,7 +12,7 @@ pub use crate::client::{Client, Transport};
 pub use crate::server::Server;
 pub use crate::message::{ErrorReply, Message, MessageHandler, OkReply};
 pub use crate::registry::{Handler, KnownEntry, Registry};
-pub use crate::stream::{Connection, Stream};
+pub use crate::stream::{Connection, HandlerStream, Stream};
 pub use async_trait::async_trait;
 pub use adaptivemsg_macros::message_handler;
 pub use adaptivemsg_macros::message;
