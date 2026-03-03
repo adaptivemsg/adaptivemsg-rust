@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::error::Error;
-use crate::registry::Registry;
-use crate::stream::{client as stream_client, server as stream_server, Connection, ConnectionInner};
+use crate::stream::{client as stream_client, Connection, ConnectionInner};
 
 pub async fn connect(path: &str) -> Result<Connection, Error> {
     let path = to_uds_path(path)?;
@@ -35,23 +34,6 @@ where
     let (stream, _) = listener.accept().await?;
     let peer_addr = stream.peer_addr().ok().map(|addr| format!("{addr:?}"));
     Ok((stream, peer_addr))
-}
-
-pub async fn accept(
-    listener: &UnixListener,
-    registry: Option<Registry>,
-) -> Result<Connection, Error> {
-    let handler_registry = registry.clone();
-    let (stream, peer_addr) = accept_stream(listener).await?;
-    Ok(ConnectionInner::new_pending(
-        stream,
-        peer_addr,
-        stream_server::dispatch(registry),
-        handler_registry,
-        None,
-        None,
-    )
-    .start())
 }
 
 fn to_uds_path(path: &str) -> Result<PathBuf, Error> {

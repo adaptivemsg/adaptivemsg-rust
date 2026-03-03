@@ -1,5 +1,6 @@
 # adaptivemsg
 
+Typed Rust messages with server-side handler routing over multiplexed streams (no IDL).
 Minimal async message library over multiplexed streams, with optional server-side handlers.
 
 - Transport: TCP / UDS / QUIC (feature)
@@ -19,22 +20,25 @@ Minimal async message library over multiplexed streams, with optional server-sid
 - **Unknown message**: delivered to the stream's recv queue.
 - **Stream**: logical channel over a single connection (stream_id).
 
+Tip: for brevity in local code, you can alias the crate, e.g. `use adaptivemsg as am;`.
+
 ## Minimal usage
 
 ```rust
-use adaptivemsg::{HandlerStream, Message, MessageHandler, Registry, Result};
+use adaptivemsg as am;
+use am::{HandlerStream, Message, MessageHandler, Result};
 
-#[adaptivemsg::message]
+#[am::message]
 struct HelloRequest {
     who: String,
 }
 
-#[adaptivemsg::message]
+#[am::message]
 struct HelloReply {
     answer: String,
 }
 
-#[adaptivemsg::message_handler]
+#[am::message_handler]
 impl MessageHandler for HelloRequest {
     async fn handle(self: Box<Self>, _stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
         let reply = HelloReply {
@@ -44,29 +48,18 @@ impl MessageHandler for HelloRequest {
     }
 }
 
-fn registry() -> Registry {
-    let mut reg = Registry::new();
-    reg.register::<HelloRequest>();
-    reg
-}
 ```
 
 ## TCP server/client sketch
 
 ```rust
-use adaptivemsg::transport::tcp;
+use adaptivemsg as am;
 
 // server
-let reg = registry();
-let listener = tcp::listen("0.0.0.0:5555").await?;
-let conn = tcp::accept(&listener, Some(reg)).await?;
+am::Server::new().serve("tcp://0.0.0.0:5555").await?;
 
 // client
-let conn = tcp::connect("127.0.0.1:5555").await?;
-let reply: HelloReply = conn.send_recv(HelloRequest { who: "alice".into() }).await?;
-
-// client (via Client helper with transport prefixes)
-let client = adaptivemsg::Client::new();
+let client = am::Client::new();
 let conn = client.connect("tcp://127.0.0.1:5555").await?;
 let reply: HelloReply = conn.send_recv(HelloRequest { who: "alice".into() }).await?;
 ```

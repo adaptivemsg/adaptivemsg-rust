@@ -14,7 +14,7 @@ pub trait Message: Any + Send + Sync + 'static {
 }
 
 impl dyn Message {
-    pub fn downcast<T: Message>(
+    pub(crate) fn downcast<T: Message>(
         self: Box<Self>,
     ) -> std::result::Result<Box<T>, Box<dyn Message>> {
         if self.type_name() == std::any::type_name::<T>() {

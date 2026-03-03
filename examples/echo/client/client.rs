@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use adaptivemsg::OkReply;
+use adaptivemsg as am;
+use am::OkReply;
 use adaptivemsg_echo_server::message::{
     MessageReply,
     MessageRequest,
@@ -38,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
-    let client = adaptivemsg::Client::new();
+    let client = am::Client::new();
     let conn = client.connect(&args.addr).await?;
 
     match args.cmd.as_str() {
@@ -59,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn timeout_demo(conn: &adaptivemsg::Connection) -> anyhow::Result<()> {
+async fn timeout_demo(conn: &am::Connection) -> anyhow::Result<()> {
     let stream = conn.new_stream();
 
     info!("No timeout by default");
@@ -88,7 +89,7 @@ async fn timeout_demo(conn: &adaptivemsg::Connection) -> anyhow::Result<()> {
 }
 
 async fn whoelse_subscribe_demo(
-    conn: &adaptivemsg::Connection,
+    conn: &am::Connection,
 ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
     let event_stream = conn.new_stream();
     let _: OkReply = event_stream.send_recv(SubWhoElseEvent {}).await?;
@@ -107,7 +108,7 @@ async fn whoelse_subscribe_demo(
     Ok(event_task)
 }
 
-async fn whoelse_query_demo(conn: &adaptivemsg::Connection) -> anyhow::Result<()> {
+async fn whoelse_query_demo(conn: &am::Connection) -> anyhow::Result<()> {
     for _ in 0..100 {
         let rep: WhoElseReply = conn.send_recv(WhoElse {}).await?;
         info!("clients: {}", rep.clients);
@@ -116,7 +117,7 @@ async fn whoelse_query_demo(conn: &adaptivemsg::Connection) -> anyhow::Result<()
     Ok(())
 }
 
-async fn echo_demo(conn: &adaptivemsg::Connection, addr: &str) -> anyhow::Result<()> {
+async fn echo_demo(conn: &am::Connection, addr: &str) -> anyhow::Result<()> {
     let msg = "ni hao".to_string();
     let mut num = 0;
 
@@ -138,7 +139,7 @@ async fn concurrent_demo(addr: &str) -> anyhow::Result<()> {
     for _ in 0..6 {
         let addr = addr.to_string();
         client_tasks.push(tokio::spawn(async move {
-            let client = adaptivemsg::Client::new();
+            let client = am::Client::new();
             let conn = client.connect(&addr).await?;
 
             let mut stream_tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();

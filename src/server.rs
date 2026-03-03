@@ -74,7 +74,7 @@ impl Server {
         self.serve_tcp(addr).await
     }
 
-    pub async fn serve_tcp(self, addr: &str) -> Result<(), Error> {
+    async fn serve_tcp(self, addr: &str) -> Result<(), Error> {
         let listener = Arc::new(crate::transport::tcp::listen(addr).await?);
         self.serve_with_accept(move || {
             let listener = listener.clone();
@@ -84,7 +84,7 @@ impl Server {
     }
 
     #[cfg(feature = "uds")]
-    pub async fn serve_uds(self, path: &str) -> Result<(), Error> {
+    async fn serve_uds(self, path: &str) -> Result<(), Error> {
         let listener = Arc::new(crate::transport::uds::listen(path).await?);
         self.serve_with_accept(move || {
             let listener = listener.clone();

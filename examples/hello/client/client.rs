@@ -1,4 +1,5 @@
 use adaptivemsg_hello_server::message::{HelloReply, HelloRequest};
+use adaptivemsg as am;
 use clap::Parser;
 use tracing::{info, warn};
 
@@ -24,7 +25,7 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    let client = adaptivemsg::Client::new();
+    let client = am::Client::new();
     let conn = client.connect(&args.addr).await?;
 
     let stream_a = conn.new_stream();

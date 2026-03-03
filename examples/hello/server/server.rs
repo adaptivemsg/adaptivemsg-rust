@@ -1,4 +1,5 @@
 use adaptivemsg_hello_server as _;
+use adaptivemsg as am;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -21,6 +22,6 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    adaptivemsg::Server::new().serve(&args.addr).await?;
+    am::Server::new().serve(&args.addr).await?;
     Ok(())
 }

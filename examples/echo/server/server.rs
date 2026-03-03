@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use adaptivemsg_echo_server::state::{StatMgr, StreamContext};
+use adaptivemsg as am;
 use clap::Parser;
 use tracing::info;
 
@@ -27,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mgr = Arc::new(StatMgr::new());
 
-    let server = adaptivemsg::Server::new()
+    let server = am::Server::new()
         .on_connect({
             let mgr = mgr.clone();
             move |conn| {

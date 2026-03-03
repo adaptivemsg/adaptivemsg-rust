@@ -1,8 +1,7 @@
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::Error;
-use crate::registry::Registry;
-use crate::stream::{client as stream_client, server as stream_server, Connection, ConnectionInner};
+use crate::stream::{client as stream_client, Connection, ConnectionInner};
 
 pub async fn connect(addr: &str) -> Result<Connection, Error> {
     let stream = TcpStream::connect(addr).await?;
@@ -30,21 +29,4 @@ where
 {
     let (stream, peer_addr) = listener.accept().await?;
     Ok((stream, Some(peer_addr.to_string())))
-}
-
-pub async fn accept(
-    listener: &TcpListener,
-    registry: Option<Registry>,
-) -> Result<Connection, Error> {
-    let handler_registry = registry.clone();
-    let (stream, peer_addr) = accept_stream(listener).await?;
-    Ok(ConnectionInner::new_pending(
-        stream,
-        peer_addr,
-        stream_server::dispatch(registry),
-        handler_registry,
-        None,
-        None,
-    )
-    .start())
 }

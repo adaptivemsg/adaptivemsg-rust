@@ -1,31 +1,35 @@
-pub mod error;
-pub mod client;
-pub mod server;
-pub mod message;
-pub mod registry;
-pub mod stream;
-
-pub mod transport;
+mod error;
+mod client;
+mod server;
+mod message;
+mod registry;
+mod stream;
+mod transport;
 
 pub use crate::error::{Error, Result};
-pub use crate::client::{Client, Transport};
+pub use crate::client::Client;
 pub use crate::server::Server;
 pub use crate::message::{ErrorReply, Message, MessageHandler, OkReply};
-pub use crate::registry::{Handler, KnownEntry, Registry};
 pub use crate::stream::{Connection, HandlerStream, Stream};
+#[doc(hidden)]
 pub use async_trait::async_trait;
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::registry::{KnownEntry, Registry};
+}
 pub use adaptivemsg_macros::message_handler;
 pub use adaptivemsg_macros::message;
 
+#[doc(hidden)]
 #[macro_export]
 macro_rules! submit_message_handler {
     ($t:ty) => {
         const _: () = {
-            fn register(reg: &mut $crate::Registry) {
+            fn register(reg: &mut $crate::__private::Registry) {
                 reg.register::<$t>();
             }
             inventory::submit! {
-                $crate::KnownEntry::new(register)
+                $crate::__private::KnownEntry::new(register)
             }
         };
     };

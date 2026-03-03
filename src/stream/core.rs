@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -29,6 +29,16 @@ const DEFAULT_STREAM_ID_ENCODED: u32 =
 const FRAME_VERSION_MAJOR_V1: u8 = 1;
 const FRAME_VERSION_MINOR_V1: u8 = 0;
 const FRAME_HEADER_LEN_V1: usize = 12;
+const RECV_TIMEOUT_NONE: u64 = 0;
+
+fn timeout_to_nanos(timeout: Duration) -> u64 {
+    let nanos = timeout.as_nanos();
+    if nanos > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        nanos as u64
+    }
+}
 
 pub(crate) type DispatchFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub(crate) type DispatchFn = Arc<dyn Fn(Stream, Envelope) -> DispatchFuture + Send + Sync>;
@@ -118,7 +128,7 @@ pub struct StreamInner {
     inbox_tx: mpsc::Sender<Box<dyn Message>>,
     incoming_tx: mpsc::Sender<Vec<u8>>,
     context: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
-    recv_timeout: Mutex<Option<Duration>>,
+    recv_timeout_nanos: AtomicU64,
 }
 
 struct ServerStreamState {
@@ -130,6 +140,16 @@ impl ConnectionInner {
     fn mark_closed(&self) {
         self.closed.store(true, Ordering::Relaxed);
         self.closed_notify.notify_waiters();
+    }
+
+    fn remove_stream(&self, stream_id: StreamId) -> Option<Stream> {
+        self.streams.lock().unwrap().remove(&stream_id)
+    }
+
+    fn notify_close(&self, stream: &Stream) {
+        if let Some(ref f) = self.on_close_stream {
+            f(stream);
+        }
     }
 
     pub(crate) fn new_pending<RW>(
@@ -231,10 +251,9 @@ impl ConnectionInner {
     }
 
     pub(crate) fn close_all_streams(&self) {
-        let handles: Vec<Stream> =
-            self.streams.lock().unwrap().values().cloned().collect();
-        for stream in handles {
-            stream.close();
+        let streams = std::mem::take(&mut *self.streams.lock().unwrap());
+        for stream in streams.values() {
+            self.notify_close(stream);
         }
     }
 
@@ -301,18 +320,8 @@ impl StreamInner {
     }
 
     pub fn close(self: &Arc<Self>) {
-        let on_close = self.connection.on_close_stream.clone();
-        let removed = self
-            .connection
-            .streams
-            .lock()
-            .unwrap()
-            .remove(&self.id)
-            .is_some();
-        if removed {
-            if let Some(ref f) = on_close {
-                f(self);
-            }
+        if let Some(stream) = self.connection.remove_stream(self.id) {
+            self.connection.notify_close(&stream);
         }
     }
 
@@ -335,12 +344,12 @@ impl StreamInner {
     }
 
     pub fn set_recv_timeout(&self, timeout: Duration) {
-        let mut guard = self.recv_timeout.lock().unwrap();
-        if timeout.is_zero() {
-            *guard = None;
+        let nanos = if timeout.is_zero() {
+            RECV_TIMEOUT_NONE
         } else {
-            *guard = Some(timeout);
-        }
+            timeout_to_nanos(timeout)
+        };
+        self.recv_timeout_nanos.store(nanos, Ordering::Relaxed);
     }
 
     pub async fn send<M: Message>(&self, msg: M) -> Result<(), Error> {
@@ -414,16 +423,17 @@ impl StreamInner {
     }
 
     async fn recv_msg(&self) -> Result<Box<dyn Message>, Error> {
-        let timeout = *self.recv_timeout.lock().unwrap();
+        let timeout_nanos = self.recv_timeout_nanos.load(Ordering::Relaxed);
         let mut inbox = self.inbox_rx.lock().await;
-        if let Some(timeout) = timeout {
+        if timeout_nanos == RECV_TIMEOUT_NONE {
+            inbox.recv().await.ok_or(Error::Closed)
+        } else {
+            let timeout = Duration::from_nanos(timeout_nanos);
             match tokio::time::timeout(timeout, inbox.recv()).await {
                 Ok(Some(msg)) => Ok(msg),
                 Ok(None) => Err(Error::Closed),
                 Err(_) => Err(Error::RecvTimeout),
             }
-        } else {
-            inbox.recv().await.ok_or(Error::Closed)
         }
     }
 }
@@ -449,10 +459,7 @@ impl HandlerStream {
         F: FnOnce(Stream) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let stream = self.stream.clone();
-        tokio::spawn(async move {
-            f(stream).await;
-        });
+        tokio::spawn(f(self.stream.clone()));
     }
 }
 
@@ -519,7 +526,7 @@ impl ConnectionInner {
             inbox_tx,
             incoming_tx,
             context: Mutex::new(None),
-            recv_timeout: Mutex::new(None),
+            recv_timeout_nanos: AtomicU64::new(RECV_TIMEOUT_NONE),
         });
         self.streams
             .lock()

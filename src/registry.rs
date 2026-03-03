@@ -7,7 +7,7 @@ use crate::message::{Message, MessageHandler};
 use crate::stream::HandlerStream;
 
 #[async_trait]
-pub trait Handler: Send + Sync + 'static {
+pub(crate) trait Handler: Send + Sync + 'static {
     async fn handle(
         &self,
         msg: Box<dyn Message>,
@@ -20,6 +20,7 @@ pub struct Registry {
     handlers: Arc<HashMap<&'static str, Arc<dyn Handler>>>,
 }
 
+#[doc(hidden)]
 pub struct KnownEntry {
     register: fn(&mut Registry),
 }
@@ -31,7 +32,7 @@ impl KnownEntry {
         Self { register }
     }
 
-    pub fn register(&self, reg: &mut Registry) {
+    pub(crate) fn register(&self, reg: &mut Registry) {
         (self.register)(reg);
     }
 }
@@ -58,7 +59,7 @@ impl Registry {
         Arc::make_mut(&mut self.handlers).insert(type_name, handler);
     }
 
-    pub fn handler(&self, type_name: &str) -> Option<Arc<dyn Handler>> {
+    pub(crate) fn handler(&self, type_name: &str) -> Option<Arc<dyn Handler>> {
         self.handlers.get(type_name).cloned()
     }
 }

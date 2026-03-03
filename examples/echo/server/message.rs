@@ -1,25 +1,26 @@
 use std::time::Duration;
 
-use adaptivemsg::{HandlerStream, Message, MessageHandler, Result};
+use adaptivemsg as am;
+use am::{HandlerStream, Message, MessageHandler, Result};
 use anyhow::anyhow;
 use tokio::sync::mpsc;
 
 use crate::state::StreamContext;
 
-#[adaptivemsg::message]
+#[am::message]
 pub struct MessageRequest {
     pub msg: String,
     pub num: i32,
 }
 
-#[adaptivemsg::message]
+#[am::message]
 pub struct MessageReply {
     pub msg: String,
     pub num: i32,
     pub signature: String,
 }
 
-#[adaptivemsg::message_handler]
+#[am::message_handler]
 impl MessageHandler for MessageRequest {
     async fn handle(mut self: Box<Self>, stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
         let ctx = stream
@@ -40,15 +41,15 @@ impl MessageHandler for MessageRequest {
     }
 }
 
-#[adaptivemsg::message]
+#[am::message]
 pub struct SubWhoElseEvent {}
 
-#[adaptivemsg::message]
+#[am::message]
 pub struct WhoElseEvent {
     pub addr: String,
 }
 
-#[adaptivemsg::message_handler]
+#[am::message_handler]
 impl MessageHandler for SubWhoElseEvent {
     async fn handle(self: Box<Self>, stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
         let ctx = stream
@@ -71,15 +72,15 @@ impl MessageHandler for SubWhoElseEvent {
     }
 }
 
-#[adaptivemsg::message]
+#[am::message]
 pub struct WhoElse {}
 
-#[adaptivemsg::message]
+#[am::message]
 pub struct WhoElseReply {
     pub clients: String,
 }
 
-#[adaptivemsg::message_handler]
+#[am::message_handler]
 impl MessageHandler for WhoElse {
     async fn handle(self: Box<Self>, stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
         let ctx = stream
@@ -93,12 +94,12 @@ impl MessageHandler for WhoElse {
     }
 }
 
-#[adaptivemsg::message]
+#[am::message]
 pub struct MessageTimeout {
     pub secs: u64,
 }
 
-#[adaptivemsg::message_handler]
+#[am::message_handler]
 impl MessageHandler for MessageTimeout {
     async fn handle(self: Box<Self>, _stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
         tokio::time::sleep(Duration::from_secs(self.secs)).await;
