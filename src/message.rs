@@ -1,4 +1,4 @@
-use std::any::{Any, TypeId};
+use std::any::Any;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -17,9 +17,9 @@ impl dyn Message {
     pub fn downcast<T: Message>(
         self: Box<Self>,
     ) -> std::result::Result<Box<T>, Box<dyn Message>> {
-        if self.type_id() == TypeId::of::<T>() {
+        if self.type_name() == std::any::type_name::<T>() {
             let raw = Box::into_raw(self);
-            // Safety: the type_id check ensures the cast target matches the concrete type.
+            // Safety: the type_name check ensures the cast target matches the concrete type.
             return Ok(unsafe { Box::from_raw(raw as *mut T) });
         }
         Err(self)

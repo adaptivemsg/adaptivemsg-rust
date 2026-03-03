@@ -12,6 +12,32 @@ pub struct StatMgr {
     sub_seq: AtomicU64,
 }
 
+pub struct StreamContext {
+    mgr: Arc<StatMgr>,
+    subscriber: Mutex<Option<u64>>,
+}
+
+impl StreamContext {
+    pub fn new(mgr: Arc<StatMgr>) -> Self {
+        Self {
+            mgr,
+            subscriber: Mutex::new(None),
+        }
+    }
+
+    pub fn mgr(&self) -> Arc<StatMgr> {
+        Arc::clone(&self.mgr)
+    }
+
+    pub fn set_subscriber(&self, id: u64) {
+        *self.subscriber.lock().unwrap() = Some(id);
+    }
+
+    pub fn take_subscriber(&self) -> Option<u64> {
+        self.subscriber.lock().unwrap().take()
+    }
+}
+
 impl StatMgr {
     pub fn new() -> Self {
         Self {

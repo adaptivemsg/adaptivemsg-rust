@@ -20,10 +20,13 @@ pub use adaptivemsg_macros::message;
 #[macro_export]
 macro_rules! submit_message_handler {
     ($t:ty) => {
-        inventory::submit! {
-            $crate::KnownEntry::new(|reg: &mut $crate::Registry| {
+        const _: () = {
+            fn register(reg: &mut $crate::Registry) {
                 reg.register::<$t>();
-            })
-        }
+            }
+            inventory::submit! {
+                $crate::KnownEntry::new(register)
+            }
+        };
     };
 }

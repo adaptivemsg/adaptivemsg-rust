@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use tracing::warn;
-
 use crate::registry::Registry;
 use crate::stream::core::{DispatchFn, Stream};
 use crate::stream::Envelope;

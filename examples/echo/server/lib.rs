@@ -1,2 +1,2 @@
 pub mod message;
-mod state;
+pub mod state;

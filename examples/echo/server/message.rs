@@ -4,7 +4,7 @@ use adaptivemsg::{HandlerStream, Message, MessageHandler, Result};
 use anyhow::anyhow;
 use tokio::sync::mpsc;
 
-use crate::state::StatMgr;
+use crate::state::StreamContext;
 
 #[adaptivemsg::message]
 pub struct MessageRequest {
@@ -22,9 +22,10 @@ pub struct MessageReply {
 #[adaptivemsg::message_handler]
 impl MessageHandler for MessageRequest {
     async fn handle(mut self: Box<Self>, stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
-        let mgr = stream
-            .get_context::<StatMgr>()
-            .ok_or_else(|| anyhow!("missing StatMgr context"))?;
+        let ctx = stream
+            .get_context::<StreamContext>()
+            .ok_or_else(|| anyhow!("missing StreamContext"))?;
+        let mgr = ctx.mgr();
         mgr.inc_counter();
         self.msg.push('!');
         self.num += 1;
@@ -50,12 +51,14 @@ pub struct WhoElseEvent {
 #[adaptivemsg::message_handler]
 impl MessageHandler for SubWhoElseEvent {
     async fn handle(self: Box<Self>, stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
-        let mgr = stream
-            .get_context::<StatMgr>()
-            .ok_or_else(|| anyhow!("missing StatMgr context"))?;
+        let ctx = stream
+            .get_context::<StreamContext>()
+            .ok_or_else(|| anyhow!("missing StreamContext"))?;
+        let mgr = ctx.mgr();
         let (tx, mut rx) = mpsc::channel::<String>(8);
         let sub_id = mgr.add_subscriber(tx);
-        stream.new_task(|stream| async move {
+        ctx.set_subscriber(sub_id);
+        stream.new_task(move |stream| async move {
             while let Some(addr) = rx.recv().await {
                 let msg = WhoElseEvent { addr };
                 if stream.send(msg).await.is_err() {
@@ -79,9 +82,10 @@ pub struct WhoElseReply {
 #[adaptivemsg::message_handler]
 impl MessageHandler for WhoElse {
     async fn handle(self: Box<Self>, stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
-        let mgr = stream
-            .get_context::<StatMgr>()
-            .ok_or_else(|| anyhow!("missing StatMgr context"))?;
+        let ctx = stream
+            .get_context::<StreamContext>()
+            .ok_or_else(|| anyhow!("missing StreamContext"))?;
+        let mgr = ctx.mgr();
         let reply = WhoElseReply {
             clients: mgr.list_clients(),
         };

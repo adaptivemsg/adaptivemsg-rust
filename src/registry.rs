@@ -27,7 +27,7 @@ pub struct KnownEntry {
 inventory::collect!(KnownEntry);
 
 impl KnownEntry {
-    pub fn new(register: fn(&mut Registry)) -> Self {
+    pub const fn new(register: fn(&mut Registry)) -> Self {
         Self { register }
     }
 

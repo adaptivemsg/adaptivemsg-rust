@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -583,7 +584,19 @@ impl ConnectionInner {
         tokio::spawn(async move {
             while let Some((stream_id, env)) = outbound_rx.recv().await {
                 if let Err(err) = Self::write_envelope(&mut writer, stream_id, &env).await {
-                    warn!("write failed: {err}");
+                    match err {
+                        Error::Io(ref io)
+                            if matches!(
+                                io.kind(),
+                                ErrorKind::BrokenPipe
+                                    | ErrorKind::ConnectionReset
+                                    | ErrorKind::ConnectionAborted
+                            ) =>
+                        {
+                            debug!("writer closed: {err}");
+                        }
+                        _ => warn!("write failed: {err}"),
+                    }
                     connection.mark_closed();
                     break;
                 }

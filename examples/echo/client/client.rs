@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use adaptivemsg::OkReply;
@@ -13,7 +12,7 @@ use adaptivemsg_echo_server::message::{
 };
 use clap::Parser;
 use futures::future::try_join_all;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(
@@ -29,7 +28,7 @@ struct Args {
         help = "Use tcp://HOST:PORT for TCP, uds://@adaptivemsg-* for abstract UDS, or uds:///tmp/adaptivemsg-*.sock for a filesystem socket"
     )]
     addr: String,
-    /// Demo command: echo (default), timeout, or whoelse
+    /// Demo command: echo (default), timeout, whoelse (query), or whoelse_sub (subscribe)
     #[arg(default_value = "echo")]
     cmd: String,
 }
@@ -44,7 +43,16 @@ async fn main() -> anyhow::Result<()> {
 
     match args.cmd.as_str() {
         "timeout" => timeout_demo(&conn).await?,
-        "whoelse" => whoelse_demo(&conn).await?,
+        "whoelse" => whoelse_query_demo(&conn).await?,
+        "whoelse_sub" => {
+            let event_task = whoelse_subscribe_demo(&conn).await?;
+            match event_task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!("event task failed: {err}"),
+                Err(err) if err.is_cancelled() => {}
+                Err(err) => warn!("event task join error: {err}"),
+            }
+        }
         _ => echo_demo(&conn, &args.addr).await?,
     }
 
@@ -55,17 +63,18 @@ async fn timeout_demo(conn: &adaptivemsg::Connection) -> anyhow::Result<()> {
     let stream = conn.new_stream();
 
     info!("No timeout by default");
-    stream.send_recv(MessageTimeout { secs: 10 }).await?;
+    let _: OkReply = stream.send_recv(MessageTimeout { secs: 10 }).await?;
     info!("Recv OK");
 
     info!("Set timeout to 15s");
     stream.set_recv_timeout(Duration::from_secs(15));
-    stream.send_recv::<_, OkReply>(MessageTimeout { secs: 10 }).await?;
+    let _: OkReply = stream.send_recv(MessageTimeout { secs: 10 }).await?;
     info!("Recv OK");
 
     info!("Set timeout to 3s");
     stream.set_recv_timeout(Duration::from_secs(3));
-    if let Err(err) = stream.send_recv::<_, OkReply>(MessageTimeout { secs: 10 }).await {
+    let result: Result<OkReply, _> = stream.send_recv(MessageTimeout { secs: 10 }).await;
+    if let Err(err) = result {
         info!("Recv timeout: {err}");
     } else {
         info!("Some unexpected error happened");
@@ -73,31 +82,37 @@ async fn timeout_demo(conn: &adaptivemsg::Connection) -> anyhow::Result<()> {
 
     info!("Set back to no timeout");
     stream.set_recv_timeout(Duration::ZERO);
-    stream.send_recv(MessageTimeout { secs: 10 }).await?;
+    let _: OkReply = stream.send_recv(MessageTimeout { secs: 10 }).await?;
     info!("Recv OK");
     Ok(())
 }
 
-async fn whoelse_demo(conn: &adaptivemsg::Connection) -> anyhow::Result<()> {
+async fn whoelse_subscribe_demo(
+    conn: &adaptivemsg::Connection,
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
     let event_stream = conn.new_stream();
-    event_stream.send(SubWhoElseEvent {}).await?;
+    let _: OkReply = event_stream.send_recv(SubWhoElseEvent {}).await?;
 
     let event_task = tokio::spawn(async move {
         loop {
-            let evt: WhoElseEvent = event_stream.recv().await?;
-            info!("event: new client {}", evt.addr);
+            match event_stream.recv::<WhoElseEvent>().await {
+                Ok(evt) => info!("event: new client {}", evt.addr),
+                Err(err) => {
+                    warn!("event recv error: {err}");
+                    return Err(err.into());
+                }
+            }
         }
-        #[allow(unreachable_code)]
-        Ok::<_, anyhow::Error>(())
     });
+    Ok(event_task)
+}
 
+async fn whoelse_query_demo(conn: &adaptivemsg::Connection) -> anyhow::Result<()> {
     for _ in 0..100 {
         let rep: WhoElseReply = conn.send_recv(WhoElse {}).await?;
         info!("clients: {}", rep.clients);
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-
-    event_task.abort();
     Ok(())
 }
 
@@ -119,15 +134,14 @@ async fn echo_demo(conn: &adaptivemsg::Connection, addr: &str) -> anyhow::Result
 }
 
 async fn concurrent_demo(addr: &str) -> anyhow::Result<()> {
-    let mut client_tasks = Vec::new();
+    let mut client_tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
     for _ in 0..6 {
         let addr = addr.to_string();
         client_tasks.push(tokio::spawn(async move {
             let client = adaptivemsg::Client::new();
             let conn = client.connect(&addr).await?;
-            let conn = Arc::new(conn);
 
-            let mut stream_tasks = Vec::new();
+            let mut stream_tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
             for i in 0..10 {
                 let conn = conn.clone();
                 stream_tasks.push(tokio::spawn(async move {
@@ -149,11 +163,15 @@ async fn concurrent_demo(addr: &str) -> anyhow::Result<()> {
                 }));
             }
 
-            try_join_all(stream_tasks).await??;
+            for result in try_join_all(stream_tasks).await? {
+                result?;
+            }
             Ok(())
         }));
     }
 
-    try_join_all(client_tasks).await??;
+    for result in try_join_all(client_tasks).await? {
+        result?;
+    }
     Ok(())
 }

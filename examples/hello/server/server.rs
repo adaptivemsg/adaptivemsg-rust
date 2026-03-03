@@ -1,3 +1,4 @@
+use adaptivemsg_hello_server as _;
 use clap::Parser;
 
 #[derive(Parser)]

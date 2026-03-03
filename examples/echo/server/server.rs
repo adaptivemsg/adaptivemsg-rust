@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use adaptivemsg_echo_server::state::StatMgr;
+use adaptivemsg_echo_server::state::{StatMgr, StreamContext};
 use clap::Parser;
 use tracing::info;
 
@@ -53,8 +53,18 @@ async fn main() -> anyhow::Result<()> {
         .on_new_stream({
             let mgr = mgr.clone();
             move |stream| {
-                stream.set_context(mgr.clone());
+                stream.set_context(Arc::new(StreamContext::new(mgr.clone())));
                 info!("on new stream {}", stream.id());
+            }
+        })
+        .on_close_stream({
+            let mgr = mgr.clone();
+            move |stream| {
+                if let Some(ctx) = stream.get_context::<StreamContext>() {
+                    if let Some(sub_id) = ctx.take_subscriber() {
+                        mgr.remove_subscriber(sub_id);
+                    }
+                }
             }
         });
 
