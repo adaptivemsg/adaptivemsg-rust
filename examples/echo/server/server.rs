@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use adaptivemsg_echo_server::state::{StatMgr, StreamContext};
+use adaptivemsg_echo_server::state::StatMgr;
 use adaptivemsg as am;
 use clap::Parser;
 use tracing::info;
@@ -30,42 +30,28 @@ async fn main() -> anyhow::Result<()> {
 
     let server = am::Server::new()
         .on_connect({
-            let mgr = mgr.clone();
-            move |conn| {
-                let addr = conn
-                    .peer_addr()
-                    .unwrap_or_else(|| "client-unknown".to_string());
-                mgr.on_connect(&addr);
+            let mgr = Arc::clone(&mgr);
+            move |netconn| {
+                let addr = netconn.peer_addr().unwrap_or("client-unknown");
+                mgr.on_connect(addr);
                 info!("connect: {}", addr);
                 Ok(())
             }
         })
         .on_disconnect({
-            let mgr = mgr.clone();
-            move |conn| {
-                let addr = conn
-                    .peer_addr()
-                    .unwrap_or_else(|| "client-unknown".to_string());
-                mgr.on_disconnect(&addr);
+            let mgr = Arc::clone(&mgr);
+            move |netconn| {
+                let addr = netconn.peer_addr().unwrap_or("client-unknown");
+                mgr.on_disconnect(addr);
                 info!("disconnect: {}", addr);
                 Ok(())
             }
         })
         .on_new_stream({
-            let mgr = mgr.clone();
-            move |stream| {
-                stream.set_context(Arc::new(StreamContext::new(mgr.clone())));
-                info!("on new stream {}", stream.id());
-            }
-        })
-        .on_close_stream({
-            let mgr = mgr.clone();
-            move |stream| {
-                if let Some(ctx) = stream.get_context::<StreamContext>() {
-                    if let Some(sub_id) = ctx.take_subscriber() {
-                        mgr.remove_subscriber(sub_id);
-                    }
-                }
+            let mgr = Arc::clone(&mgr);
+            move |ctx| {
+                ctx.set_context(Arc::clone(&mgr));
+                info!("on new stream");
             }
         });
 

@@ -24,4 +24,6 @@ pub enum Error {
     Closed,
     #[error("remote error: {code}: {message}")]
     Remote { code: String, message: String },
+    #[error("only one handler task allowed per stream")]
+    HandlerTaskBusy,
 }

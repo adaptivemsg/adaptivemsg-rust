@@ -16,9 +16,9 @@ Minimal async message library over multiplexed streams, with optional server-sid
 - **Message**: typetag-enabled trait object serialized via postcard.
 - **Known message**: has a registered handler (server-side dispatch). Clients MUST use `send_recv()` for handled messages.
 - **Handler reply**: `Ok(Some(msg))` sends `msg`, `Ok(None)` sends `OkReply`, and `Err(e)` sends `ErrorReply`.
-- **Handler stream**: handlers get `HandlerStream` (id + context + `new_task`), not full I/O.
+- **Handler context**: handlers get `StreamContext` (context + `new_task`), not full I/O.
 - **Unknown message**: delivered to the stream's recv queue.
-- **Stream**: logical channel over a single connection (stream_id).
+- **Stream**: logical channel over a single connection.
 
 Tip: for brevity in local code, you can alias the crate, e.g. `use adaptivemsg as am;`.
 
@@ -26,7 +26,7 @@ Tip: for brevity in local code, you can alias the crate, e.g. `use adaptivemsg a
 
 ```rust
 use adaptivemsg as am;
-use am::{HandlerStream, Message, MessageHandler, Result};
+use am::{Message, MessageHandler, Result, StreamContext};
 
 #[am::message]
 struct HelloRequest {
@@ -40,7 +40,7 @@ struct HelloReply {
 
 #[am::message_handler]
 impl MessageHandler for HelloRequest {
-    async fn handle(self: Box<Self>, _stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
+    async fn handle(self: Box<Self>, _stream_ctx: StreamContext) -> Result<Option<Box<dyn Message>>> {
         let reply = HelloReply {
             answer: format!("hi, {}", self.who),
         };

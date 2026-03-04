@@ -5,15 +5,15 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::Error;
 use crate::registry::Registry;
-use crate::stream::{server as stream_server, Connection, ConnectionInner, Stream};
+use crate::stream::{ConnectionInner, Context, Netconn};
 use tracing::warn;
 
 pub struct Server {
     registry: Registry,
-    on_connect: Option<Arc<dyn Fn(Connection) -> Result<(), Error> + Send + Sync>>,
-    on_disconnect: Option<Arc<dyn Fn(Connection) -> Result<(), Error> + Send + Sync>>,
-    on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
-    on_close_stream: Option<Arc<dyn Fn(&Stream) + Send + Sync>>,
+    on_connect: Option<Arc<dyn Fn(Netconn) -> Result<(), Error> + Send + Sync>>,
+    on_disconnect: Option<Arc<dyn Fn(Netconn) -> Result<(), Error> + Send + Sync>>,
+    on_new_stream: Option<Arc<dyn Fn(Context) + Send + Sync>>,
+    on_close_stream: Option<Arc<dyn Fn(Context) + Send + Sync>>,
 }
 
 impl Server {
@@ -29,7 +29,7 @@ impl Server {
 
     pub fn on_connect<F>(mut self, f: F) -> Self
     where
-        F: Fn(Connection) -> Result<(), Error> + Send + Sync + 'static,
+        F: Fn(Netconn) -> Result<(), Error> + Send + Sync + 'static,
     {
         self.on_connect = Some(Arc::new(f));
         self
@@ -37,7 +37,7 @@ impl Server {
 
     pub fn on_disconnect<F>(mut self, f: F) -> Self
     where
-        F: Fn(Connection) -> Result<(), Error> + Send + Sync + 'static,
+        F: Fn(Netconn) -> Result<(), Error> + Send + Sync + 'static,
     {
         self.on_disconnect = Some(Arc::new(f));
         self
@@ -45,7 +45,7 @@ impl Server {
 
     pub fn on_new_stream<F>(mut self, f: F) -> Self
     where
-        F: Fn(Stream) + Send + Sync + 'static,
+        F: Fn(Context) + Send + Sync + 'static,
     {
         self.on_new_stream = Some(Arc::new(f));
         self
@@ -53,7 +53,7 @@ impl Server {
 
     pub fn on_close_stream<F>(mut self, f: F) -> Self
     where
-        F: Fn(&Stream) + Send + Sync + 'static,
+        F: Fn(Context) + Send + Sync + 'static,
     {
         self.on_close_stream = Some(Arc::new(f));
         self
@@ -106,19 +106,18 @@ impl Server {
             let peer_label = peer_addr
                 .clone()
                 .unwrap_or_else(|| "client-unknown".to_string());
+            let netconn = Netconn::new(peer_addr.clone());
             let server = server.clone();
 
             tokio::spawn(async move {
                 let pending = ConnectionInner::new_pending(
                     socket,
-                    peer_addr,
-                    stream_server::dispatch(Some(server.registry.clone())),
                     Some(server.registry.clone()),
                     server.on_new_stream.clone(),
                     server.on_close_stream.clone(),
                 );
                 if let Some(ref f) = server.on_connect {
-                    if let Err(err) = f(pending.connection()) {
+                    if let Err(err) = f(netconn.clone()) {
                         warn!("on_connect failed for {peer_label}: {err}");
                         pending.connection().close();
                         return;
@@ -130,7 +129,7 @@ impl Server {
                 conn.close_all_streams();
 
                 if let Some(ref f) = server.on_disconnect {
-                    if let Err(err) = f(conn) {
+                    if let Err(err) = f(netconn) {
                         warn!("on_disconnect failed for {peer_label}: {err}");
                     }
                 }

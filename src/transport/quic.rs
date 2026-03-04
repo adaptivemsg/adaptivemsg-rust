@@ -4,7 +4,7 @@ use quinn::Endpoint;
 
 use crate::error::Error;
 use crate::registry::Registry;
-use crate::stream::{client as stream_client, server as stream_server, Connection, ConnectionInner};
+use crate::stream::{Connection, ConnectionInner};
 
 pub async fn connect(
     endpoint: &Endpoint,
@@ -13,18 +13,8 @@ pub async fn connect(
 ) -> Result<Connection, Error> {
     let addr = addr.parse().map_err(to_io_err)?;
     let conn = endpoint.connect(addr, server_name).map_err(to_io_err)?.await.map_err(to_io_err)?;
-    let peer_addr = Some(conn.remote_address().to_string());
     let (send, recv) = conn.open_bi().await.map_err(to_io_err)?;
-    Ok(ConnectionInner::new_pending_from_split(
-        recv,
-        send,
-        peer_addr,
-        stream_client::dispatch(),
-        None,
-        None,
-        None,
-    )
-    .start())
+    Ok(ConnectionInner::new_pending_from_split(recv, send, None, None, None).start())
 }
 
 pub async fn accept(
@@ -36,13 +26,10 @@ pub async fn accept(
         io::Error::new(io::ErrorKind::UnexpectedEof, "no incoming connection")
     })?;
     let conn = incoming.await.map_err(to_io_err)?;
-    let peer_addr = Some(conn.remote_address().to_string());
     let (send, recv) = conn.accept_bi().await.map_err(to_io_err)?;
     Ok(ConnectionInner::new_pending_from_split(
         recv,
         send,
-        peer_addr,
-        stream_server::dispatch(registry),
         handler_registry,
         None,
         None,

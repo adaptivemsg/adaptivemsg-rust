@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use adaptivemsg as am;
-use am::{HandlerStream, Message, MessageHandler, Result};
+use am::{Message, MessageHandler, Result, StreamContext};
 use anyhow::anyhow;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
-use crate::state::StreamContext;
+use crate::state::StatMgr;
 
 #[am::message]
 pub struct MessageRequest {
@@ -22,16 +22,18 @@ pub struct MessageReply {
 
 #[am::message_handler]
 impl MessageHandler for MessageRequest {
-    async fn handle(mut self: Box<Self>, stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
-        let ctx = stream
-            .get_context::<StreamContext>()
-            .ok_or_else(|| anyhow!("missing StreamContext"))?;
-        let mgr = ctx.mgr();
+    async fn handle(
+        mut self: Box<Self>,
+        stream_ctx: StreamContext,
+    ) -> Result<Option<Box<dyn Message>>> {
+        let mgr = stream_ctx
+            .get_context::<StatMgr>()
+            .ok_or_else(|| anyhow!("missing stream context"))?;
         mgr.inc_counter();
         self.msg.push('!');
         self.num += 1;
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let signature = format!("yours echo.v1.0 from {}", stream.id());
+        let signature = "yours echo.v1.0".to_string();
         let reply = MessageReply {
             msg: self.msg.clone(),
             num: self.num,
@@ -51,23 +53,27 @@ pub struct WhoElseEvent {
 
 #[am::message_handler]
 impl MessageHandler for SubWhoElseEvent {
-    async fn handle(self: Box<Self>, stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
-        let ctx = stream
-            .get_context::<StreamContext>()
-            .ok_or_else(|| anyhow!("missing StreamContext"))?;
-        let mgr = ctx.mgr();
-        let (tx, mut rx) = mpsc::channel::<String>(8);
-        let sub_id = mgr.add_subscriber(tx);
-        ctx.set_subscriber(sub_id);
-        stream.new_task(move |stream| async move {
-            while let Some(addr) = rx.recv().await {
+    async fn handle(
+        self: Box<Self>,
+        stream_ctx: StreamContext,
+    ) -> Result<Option<Box<dyn Message>>> {
+        let mgr = stream_ctx
+            .get_context::<StatMgr>()
+            .ok_or_else(|| anyhow!("missing stream context"))?;
+        let mut rx = mgr.subscribe();
+        let _task = stream_ctx.new_task(move |stream| async move {
+            loop {
+                let addr = match rx.recv().await {
+                    Ok(addr) => addr,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                };
                 let msg = WhoElseEvent { addr };
                 if stream.send(msg).await.is_err() {
-                    mgr.remove_subscriber(sub_id);
                     break;
                 }
             }
-        });
+        })?;
         Ok(None)
     }
 }
@@ -82,11 +88,10 @@ pub struct WhoElseReply {
 
 #[am::message_handler]
 impl MessageHandler for WhoElse {
-    async fn handle(self: Box<Self>, stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
-        let ctx = stream
-            .get_context::<StreamContext>()
-            .ok_or_else(|| anyhow!("missing StreamContext"))?;
-        let mgr = ctx.mgr();
+    async fn handle(self: Box<Self>, stream_ctx: StreamContext) -> Result<Option<Box<dyn Message>>> {
+        let mgr = stream_ctx
+            .get_context::<StatMgr>()
+            .ok_or_else(|| anyhow!("missing stream context"))?;
         let reply = WhoElseReply {
             clients: mgr.list_clients(),
         };
@@ -101,7 +106,7 @@ pub struct MessageTimeout {
 
 #[am::message_handler]
 impl MessageHandler for MessageTimeout {
-    async fn handle(self: Box<Self>, _stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
+    async fn handle(self: Box<Self>, _stream_ctx: StreamContext) -> Result<Option<Box<dyn Message>>> {
         tokio::time::sleep(Duration::from_secs(self.secs)).await;
         Ok(None)
     }

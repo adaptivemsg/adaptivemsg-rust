@@ -4,14 +4,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use crate::error::{Error, Result};
 use crate::message::{Message, MessageHandler};
-use crate::stream::HandlerStream;
+use crate::stream::StreamContext;
 
 #[async_trait]
 pub(crate) trait Handler: Send + Sync + 'static {
     async fn handle(
         &self,
         msg: Box<dyn Message>,
-        stream: HandlerStream,
+        stream_ctx: StreamContext,
     ) -> Result<Option<Box<dyn Message>>>;
 }
 
@@ -74,12 +74,12 @@ where
     async fn handle(
         &self,
         msg: Box<dyn Message>,
-        stream: HandlerStream,
+        stream_ctx: StreamContext,
     ) -> Result<Option<Box<dyn Message>>> {
         let expected = std::any::type_name::<T>();
         let got = msg.type_name();
         match msg.downcast::<T>() {
-            Ok(val) => val.handle(stream).await,
+            Ok(val) => val.handle(stream_ctx).await,
             Err(_) => Err(Error::TypeMismatch { expected, got }.into()),
         }
     }

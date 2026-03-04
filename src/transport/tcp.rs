@@ -1,20 +1,11 @@
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::Error;
-use crate::stream::{client as stream_client, Connection, ConnectionInner};
+use crate::stream::{Connection, ConnectionInner};
 
 pub async fn connect(addr: &str) -> Result<Connection, Error> {
     let stream = TcpStream::connect(addr).await?;
-    let peer_addr = stream.peer_addr().ok().map(|addr| addr.to_string());
-    Ok(ConnectionInner::new_pending(
-        stream,
-        peer_addr,
-        stream_client::dispatch(),
-        None,
-        None,
-        None,
-    )
-    .start())
+    Ok(ConnectionInner::new_pending(stream, None, None, None).start())
 }
 
 pub async fn listen(addr: &str) -> Result<TcpListener, Error> {

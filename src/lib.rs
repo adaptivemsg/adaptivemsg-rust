@@ -10,7 +10,7 @@ pub use crate::error::{Error, Result};
 pub use crate::client::Client;
 pub use crate::server::Server;
 pub use crate::message::{ErrorReply, Message, MessageHandler, OkReply};
-pub use crate::stream::{Connection, HandlerStream, Stream};
+pub use crate::stream::{Connection, Context, Netconn, Stream, StreamContext};
 #[doc(hidden)]
 pub use async_trait::async_trait;
 #[doc(hidden)]

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::stream::HandlerStream;
+use crate::stream::StreamContext;
 
 #[typetag::serde(tag = "type")]
 pub trait Message: Any + Send + Sync + 'static {
@@ -67,7 +67,10 @@ pub trait MessageHandler: Message {
     /// Handled messages MUST be sent by clients using `send_recv()`.
     /// `Ok(Some(msg))` sends `msg`, `Ok(None)` sends `OkReply`, and `Err(e)` sends an error.
     /// The error type is `anyhow::Error` via `adaptivemsg::Result`.
-    async fn handle(self: Box<Self>, stream: HandlerStream) -> Result<Option<Box<dyn Message>>>;
+    async fn handle(
+        self: Box<Self>,
+        stream_ctx: StreamContext,
+    ) -> Result<Option<Box<dyn Message>>>;
 }
 
 // Helper to force serde to see trait object implementations.

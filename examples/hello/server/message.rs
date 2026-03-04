@@ -1,5 +1,5 @@
 use adaptivemsg as am;
-use am::{HandlerStream, Message, MessageHandler, Result};
+use am::{Message, MessageHandler, Result, StreamContext};
 
 #[am::message]
 pub struct HelloRequest {
@@ -14,7 +14,7 @@ pub struct HelloReply {
 
 #[am::message_handler]
 impl MessageHandler for HelloRequest {
-    async fn handle(self: Box<Self>, _stream: HandlerStream) -> Result<Option<Box<dyn Message>>> {
+    async fn handle(self: Box<Self>, _stream_ctx: StreamContext) -> Result<Option<Box<dyn Message>>> {
         let question = self.question.to_lowercase();
         if question.contains("error") {
             return Err(anyhow::anyhow!("bad request: {question}"));
