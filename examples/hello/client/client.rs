@@ -54,13 +54,19 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let t2: Task = tokio::spawn(async move {
-        let reply: HelloReply = stream_b
+        let reply: Result<HelloReply, am::Error> = stream_b
             .send_recv(HelloRequest {
                 who: "Bob".into(),
                 question: "error please".into(),
             })
-            .await?;
-        info!("stream B: {}", reply.answer);
+            .await;
+        match reply {
+            Ok(reply) => info!("stream B: {}", reply.answer),
+            Err(am::Error::Remote { code, message }) => {
+                warn!("stream B expected error: {code}: {message}");
+            }
+            Err(err) => return Err(err.into()),
+        }
         Ok(())
     });
 

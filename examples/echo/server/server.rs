@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use adaptivemsg_echo_server::state::StatMgr;
 use adaptivemsg as am;
@@ -27,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let mgr = Arc::new(StatMgr::new());
+    let stream_seq = Arc::new(AtomicU64::new(1));
 
     let server = am::Server::new()
         .on_connect({
@@ -49,9 +51,11 @@ async fn main() -> anyhow::Result<()> {
         })
         .on_new_stream({
             let mgr = Arc::clone(&mgr);
+            let stream_seq = Arc::clone(&stream_seq);
             move |ctx| {
                 ctx.set_context(Arc::clone(&mgr));
-                info!("on new stream");
+                let id = stream_seq.fetch_add(1, Ordering::Relaxed);
+                info!("on new stream: {}", id);
             }
         });
 
