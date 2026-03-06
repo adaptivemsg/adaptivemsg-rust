@@ -17,7 +17,7 @@ impl Default for Client {
     fn default() -> Self {
         Self {
             timeout: None,
-            codec: Codec::Compact,
+            codec: Codec::default(),
             max_frame: u32::MAX,
         }
     }

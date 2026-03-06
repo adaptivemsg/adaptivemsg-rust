@@ -66,7 +66,7 @@ impl Codec {
 
 impl Default for Codec {
     fn default() -> Self {
-        Self::Compact
+        Self::Map
     }
 }
 
