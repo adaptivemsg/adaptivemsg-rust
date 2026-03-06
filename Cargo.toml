@@ -13,8 +13,9 @@ quic = ["dep:quinn", "dep:rustls"]
 [dependencies]
 tokio = { version = "1.38", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
-postcard = { version = "1.0", features = ["use-std"] }
-typetag = "0.2"
+rmp-serde = "=1.2.0"
+rmp = "=0.8.14"
+rmpv = { version = "=1.0.2", features = ["with-serde"] }
 tracing = "0.1"
 thiserror = "1.0"
 inventory = "0.3"

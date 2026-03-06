@@ -112,18 +112,26 @@ impl Server {
             tokio::spawn(async move {
                 let pending = ConnectionInner::new_pending(
                     socket,
-                    Some(server.registry.clone()),
+                    server.registry.clone(),
                     server.on_new_stream.clone(),
                     server.on_close_stream.clone(),
                 );
+                let conn_handle = pending.connection();
                 if let Some(ref f) = server.on_connect {
                     if let Err(err) = f(netconn.clone()) {
                         warn!("on_connect failed for {peer_label}: {err}");
-                        pending.connection().close();
+                        conn_handle.close();
                         return;
                     }
                 }
-                let conn = pending.start();
+                let conn = match pending.start_server().await {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        warn!("handshake failed for {peer_label}: {err}");
+                        conn_handle.close();
+                        return;
+                    }
+                };
                 conn.wait_closed().await;
 
                 conn.close_all_streams();

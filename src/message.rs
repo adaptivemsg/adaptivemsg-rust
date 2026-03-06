@@ -1,45 +1,52 @@
 use std::any::Any;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use rmpv::Value;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::stream::StreamContext;
 
-#[typetag::serde(tag = "type")]
 pub trait Message: Any + Send + Sync + 'static {
-    fn type_name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
+    fn wire_name(&self) -> &'static str;
+    fn wire_name_static() -> &'static str
+    where
+        Self: Sized;
+    fn encode_map(&self) -> std::result::Result<Vec<u8>, Error>;
+    fn encode_compact(&self) -> std::result::Result<Vec<u8>, Error>;
+    fn as_any(&self) -> &dyn Any;
+}
+
+#[doc(hidden)]
+pub trait MessageDecode: Message {
+    fn decode_map(value: Value) -> std::result::Result<Self, Error>
+    where
+        Self: Sized;
+    fn decode_compact(values: Vec<Value>) -> std::result::Result<Self, Error>
+    where
+        Self: Sized;
 }
 
 impl dyn Message {
     pub(crate) fn downcast<T: Message>(
         self: Box<Self>,
     ) -> std::result::Result<Box<T>, Box<dyn Message>> {
-        if self.type_name() == std::any::type_name::<T>() {
+        if self.as_any().is::<T>() {
             let raw = Box::into_raw(self);
-            // Safety: the type_name check ensures the cast target matches the concrete type.
+            // Safety: the `Any` check ensures the cast target matches the concrete type.
             return Ok(unsafe { Box::from_raw(raw as *mut T) });
         }
         Err(self)
     }
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct OkReply;
+#[crate::message]
+pub struct OkReply {}
 
-#[typetag::serde]
-impl Message for OkReply {}
-
-#[derive(Serialize, Deserialize)]
+#[crate::message]
 pub struct ErrorReply {
     code: String,
     message: String,
 }
-
-#[typetag::serde]
-impl Message for ErrorReply {}
 
 impl ErrorReply {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -72,7 +79,3 @@ pub trait MessageHandler: Message {
         stream_ctx: StreamContext,
     ) -> Result<Option<Box<dyn Message>>>;
 }
-
-// Helper to force serde to see trait object implementations.
-#[allow(dead_code)]
-fn _serde_compile_guard<T: Serialize + for<'de> Deserialize<'de>>() {}
