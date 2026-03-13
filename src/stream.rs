@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::Notify;
 
 use crate::connection::{Connection, HandlerJob};
 use crate::error::Error;
@@ -25,6 +26,8 @@ pub struct StreamInner {
     recv_timeout_nanos: AtomicU64,
     recv_active: AtomicBool,
     peeked: Mutex<Option<RawMessage>>,
+    closed: AtomicBool,
+    closed_notify: Notify,
 }
 
 impl StreamInner {
@@ -48,6 +51,8 @@ impl StreamInner {
             recv_timeout_nanos: AtomicU64::new(RECV_TIMEOUT_NONE),
             recv_active: AtomicBool::new(false),
             peeked: Mutex::new(None),
+            closed: AtomicBool::new(false),
+            closed_notify: Notify::new(),
         }
     }
 
@@ -59,6 +64,19 @@ impl StreamInner {
         if let Some(stream_ctx) = self.connection.remove_stream(self.id) {
             self.connection.notify_close(&stream_ctx);
         }
+    }
+
+    pub(crate) fn close_channels(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.closed_notify.notify_waiters();
+        }
+    }
+
+    pub(crate) async fn wait_closed(&self) {
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        self.closed_notify.notified().await;
     }
 
     pub fn set_recv_timeout(&self, timeout: Duration) {
@@ -145,7 +163,10 @@ impl StreamInner {
             return Err(Error::Closed);
         };
         let mut handler_rx = handler_rx.lock().await;
-        handler_rx.recv().await.ok_or(Error::Closed)
+        tokio::select! {
+            job = handler_rx.recv() => job.ok_or(Error::Closed),
+            _ = self.closed_notify.notified() => Err(Error::Closed),
+        }
     }
 
     fn recv_guard(&self) -> Result<RecvGuard<'_>, Error> {
@@ -172,16 +193,24 @@ impl StreamInner {
     async fn read_raw(&self) -> Result<RawMessage, Error> {
         let timeout_nanos = self.recv_timeout_nanos.load(Ordering::Relaxed);
         let mut inbox = self.inbox_rx.lock().await;
+        if let Ok(msg) = inbox.try_recv() {
+            return Ok(msg);
+        }
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Error::Closed);
+        }
         if timeout_nanos == RECV_TIMEOUT_NONE {
             tokio::select! {
                 msg = inbox.recv() => msg.ok_or(Error::Closed),
                 _ = self.connection.wait_closed() => Err(Error::Closed),
+                _ = self.closed_notify.notified() => Err(Error::Closed),
             }
         } else {
             let timeout = Duration::from_nanos(timeout_nanos);
             tokio::select! {
                 msg = inbox.recv() => msg.ok_or(Error::Closed),
                 _ = self.connection.wait_closed() => Err(Error::Closed),
+                _ = self.closed_notify.notified() => Err(Error::Closed),
                 _ = tokio::time::sleep(timeout) => Err(Error::RecvTimeout),
             }
         }

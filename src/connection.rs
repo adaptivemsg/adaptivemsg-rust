@@ -209,6 +209,7 @@ impl ConnectionInner {
     pub(crate) fn close_all_streams(&self) {
         let stream_contexts = std::mem::take(&mut *self.stream_contexts.lock().unwrap());
         for stream_ctx in stream_contexts.values() {
+            stream_ctx.stream.close_channels();
             self.notify_close(stream_ctx);
         }
     }
@@ -258,7 +259,11 @@ impl ConnectionInner {
     }
 
     pub(crate) fn remove_stream(&self, stream_id: u32) -> Option<StreamContext> {
-        self.stream_contexts.lock().unwrap().remove(&stream_id)
+        let stream_ctx = self.stream_contexts.lock().unwrap().remove(&stream_id);
+        if let Some(ref ctx) = stream_ctx {
+            ctx.stream.close_channels();
+        }
+        stream_ctx
     }
 
     pub(crate) fn notify_close(&self, stream_ctx: &StreamContext) {
@@ -349,12 +354,21 @@ impl ConnectionInner {
         let _ = tokio::spawn({
             let stream = stream.clone();
             async move {
-                while let Some(payload) = incoming_rx.recv().await {
+                loop {
+                    let payload = tokio::select! {
+                        msg = incoming_rx.recv() => match msg {
+                            Some(payload) => payload,
+                            None => break,
+                        },
+                        _ = stream.wait_closed() => break,
+                    };
                     let raw = match stream.connection.decode_envelope(&payload) {
                         Ok(raw) => raw,
                         Err(err) => {
                             warn!("decode failed: {err}");
-                            stream.connection.mark_closed();
+                            stream
+                                .protocol_error("codec_error", err.to_string())
+                                .await;
                             break;
                         }
                     };
