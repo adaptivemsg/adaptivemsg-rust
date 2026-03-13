@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rmpv::Value;
 
 use crate::error::{Error, Result};
-use crate::stream::StreamContext;
+use crate::context::StreamContext;
 
 pub trait Message: Any + Send + Sync + 'static {
     fn wire_name(&self) -> &'static str;
@@ -32,17 +32,16 @@ impl dyn Message {
     ) -> std::result::Result<Box<T>, Box<dyn Message>> {
         if self.as_any().is::<T>() {
             let raw = Box::into_raw(self);
-            // Safety: the `Any` check ensures the cast target matches the concrete type.
             return Ok(unsafe { Box::from_raw(raw as *mut T) });
         }
         Err(self)
     }
 }
 
-#[crate::message]
+#[crate::message(register)]
 pub struct OkReply {}
 
-#[crate::message]
+#[crate::message(register)]
 pub struct ErrorReply {
     code: String,
     message: String,

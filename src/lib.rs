@@ -1,20 +1,37 @@
 extern crate self as adaptivemsg;
 
+mod codec;
+mod codec_msgpack;
+mod codec_registry;
+mod connection;
+mod context;
 mod error;
-mod client;
-mod server;
+mod frame;
 mod message;
+mod protocol;
+mod raw_message;
 mod registry;
+mod server;
 mod stream;
 mod transport;
+mod client;
+mod type_info;
 
+pub use crate::codec::{CodecID, CodecImpl};
+pub use crate::codec_msgpack::{CodecMsgpackCompact, CodecMsgpackMap};
+pub use crate::codec_registry::{must_register_codec as MustRegisterCodec, register_codec as RegisterCodec};
+pub use crate::connection::{Connection, Netconn};
+pub use crate::context::{Context, StreamContext};
 pub use crate::error::{Error, Result};
-pub use crate::client::Client;
-pub use crate::server::Server;
 pub use crate::message::{ErrorReply, Message, MessageHandler, OkReply};
-pub use crate::stream::{Codec, Connection, Context, Netconn, Stream, StreamContext};
+pub use crate::registry::Registry;
+pub use crate::server::Server;
+pub use crate::stream::Stream;
+pub use crate::client::Client;
+
 #[doc(hidden)]
 pub use async_trait::async_trait;
+
 #[doc(hidden)]
 pub mod __private {
     pub use rmp_serde;
@@ -22,6 +39,7 @@ pub mod __private {
     pub use crate::message::MessageDecode;
     pub use crate::registry::{KnownEntry, KnownMessageEntry, Registry};
 }
+
 pub use adaptivemsg_macros::message_handler;
 pub use adaptivemsg_macros::message;
 

@@ -4,9 +4,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rmpv::Value;
 
+use crate::context::StreamContext;
 use crate::error::{Error, Result as HandlerResult};
 use crate::message::{Message, MessageDecode, MessageHandler};
-use crate::stream::StreamContext;
 
 #[async_trait]
 pub(crate) trait Handler: Send + Sync + 'static {
@@ -122,8 +122,8 @@ where
         msg: Box<dyn Message>,
         stream_ctx: StreamContext,
     ) -> HandlerResult<Option<Box<dyn Message>>> {
-        let expected = T::wire_name_static();
-        let got = msg.wire_name();
+        let expected = T::wire_name_static().to_string();
+        let got = msg.wire_name().to_string();
         match msg.downcast::<T>() {
             Ok(val) => val.handle(stream_ctx).await,
             Err(_) => Err(Error::TypeMismatch { expected, got }.into()),

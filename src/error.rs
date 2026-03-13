@@ -14,6 +14,10 @@ pub enum Error {
     UnsupportedFrameVersion(u8),
     #[error("unsupported codec: {0}")]
     UnsupportedCodec(u8),
+    #[error("no common codec")]
+    NoCommonCodec,
+    #[error("too many codecs: {0}")]
+    TooManyCodecs(usize),
     #[error("handshake rejected")]
     HandshakeRejected,
     #[error("no common protocol version: client {client_min}-{client_max}, server {server_min}-{server_max}")]
@@ -29,18 +33,24 @@ pub enum Error {
     UnknownMessage(String),
     #[error("compact field count mismatch: expected {expected}, got {got}")]
     CompactFieldCount { expected: usize, got: usize },
+    #[error("invalid message: {0}")]
+    InvalidMessage(String),
     #[error("connect timeout")]
     ConnectTimeout,
     #[error("recv timeout")]
     RecvTimeout,
     #[error("message type mismatch: expected {expected}, got {got}")]
-    TypeMismatch { expected: &'static str, got: &'static str },
+    TypeMismatch { expected: String, got: String },
     #[error("connection closed")]
     Closed,
     #[error("remote error: {code}: {message}")]
     Remote { code: String, message: String },
     #[error("only one handler task allowed per stream")]
     HandlerTaskBusy,
+    #[error("concurrent recv on stream")]
+    ConcurrentRecv,
+    #[error("unsupported transport: {0}")]
+    UnsupportedTransport(String),
 }
 
 impl From<rmp_serde::encode::Error> for Error {

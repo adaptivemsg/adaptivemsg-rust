@@ -4,21 +4,22 @@ Typed Rust messages with server-side handler routing over multiplexed streams (n
 Minimal async message library over multiplexed streams, with optional server-side handlers.
 
 - Transport: TCP / UDS / QUIC (feature)
-- Framing: versioned header + length-prefixed payload
-- Codec: postcard
+- Framing: v2 handshake + versioned header + length-prefixed payload
+- Codec: MessagePack map/compact, pluggable codecs
 - Data model: serde
-- Extensibility: typetag
-- Dispatch: dyn trait handlers
+- Dispatch: registry-driven handlers
 - Logs: tracing
 
 ## Concepts
 
-- **Message**: typetag-enabled trait object serialized via postcard.
+- **Message**: a serde struct annotated with `#[am::message]`.
+- **Wire name**: derived from module/type or overridden by attributes.
 - **Known message**: has a registered handler (server-side dispatch). Clients MUST use `send_recv()` for handled messages.
 - **Handler reply**: `Ok(Some(msg))` sends `msg`, `Ok(None)` sends `OkReply`, and `Err(e)` sends `ErrorReply`.
 - **Handler context**: handlers get `StreamContext` (context + `new_task`), not full I/O.
-- **Unknown message**: delivered to the stream's recv queue.
-- **Stream**: logical channel over a single connection.
+- **Unknown message**: delivered to the stream's recv queue and decoded on demand.
+- **Registry**: `#[am::message_handler]` registers handler + message. Use `#[am::message(register)]` to opt into dynamic receive.
+- **Lazy decode**: envelopes are queued; payload decode happens in `recv()`.
 
 Tip: for brevity in local code, you can alias the crate, e.g. `use adaptivemsg as am;`.
 

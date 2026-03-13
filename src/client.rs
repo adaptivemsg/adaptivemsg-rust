@@ -3,22 +3,28 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::debug;
 
+use crate::codec::CodecID;
+use crate::codec_msgpack::{CodecMsgpackCompact, CodecMsgpackMap};
+use crate::connection::Connection;
 use crate::error::Error;
-use crate::stream::{Codec, Connection};
+use crate::protocol::DEFAULT_MAX_FRAME;
+use crate::registry::Registry;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Client {
     timeout: Option<Duration>,
-    codec: Codec,
     max_frame: u32,
+    codecs: Vec<CodecID>,
+    registry: Registry,
 }
 
 impl Default for Client {
     fn default() -> Self {
         Self {
             timeout: None,
-            codec: Codec::default(),
-            max_frame: u32::MAX,
+            max_frame: DEFAULT_MAX_FRAME,
+            codecs: vec![CodecMsgpackMap, CodecMsgpackCompact],
+            registry: Registry::from_inventory(),
         }
     }
 }
@@ -33,8 +39,8 @@ impl Client {
         self
     }
 
-    pub fn with_codec(mut self, codec: Codec) -> Self {
-        self.codec = codec;
+    pub fn with_codecs(mut self, codecs: &[CodecID]) -> Self {
+        self.codecs = codecs.to_vec();
         self
     }
 
@@ -45,19 +51,20 @@ impl Client {
 
     pub async fn connect(&self, addr: &str) -> Result<Connection, Error> {
         debug!("client connect: {}", addr);
-        let codec = self.codec;
+        let codecs = self.codecs.clone();
         let max_frame = self.max_frame;
+        let registry = self.registry.clone();
         let fut = async {
             if let Some(stripped) = addr.strip_prefix("uds://") {
-                return crate::transport::uds::connect(stripped, codec, max_frame).await;
+                return crate::transport::uds::connect(stripped, registry, &codecs, max_frame).await;
             }
             if let Some(stripped) = addr.strip_prefix("unix://") {
-                return crate::transport::uds::connect(stripped, codec, max_frame).await;
+                return crate::transport::uds::connect(stripped, registry, &codecs, max_frame).await;
             }
             if let Some(stripped) = addr.strip_prefix("tcp://") {
-                return crate::transport::tcp::connect(stripped, codec, max_frame).await;
+                return crate::transport::tcp::connect(stripped, registry, &codecs, max_frame).await;
             }
-            crate::transport::tcp::connect(addr, codec, max_frame).await
+            crate::transport::tcp::connect(addr, registry, &codecs, max_frame).await
         };
 
         match self.timeout {

@@ -2,14 +2,19 @@ use std::future::Future;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-
-use crate::error::Error;
-use crate::registry::Registry;
-use crate::stream::{ConnectionInner, Context, Netconn};
 use tracing::warn;
+
+use crate::codec::CodecID;
+use crate::codec_msgpack::{CodecMsgpackCompact, CodecMsgpackMap};
+use crate::connection::{ConnectionInner, Netconn};
+use crate::context::Context;
+use crate::error::Error;
+use crate::protocol::DEFAULT_MAX_FRAME;
+use crate::registry::Registry;
 
 pub struct Server {
     registry: Registry,
+    codecs: Vec<CodecID>,
     on_connect: Option<Arc<dyn Fn(Netconn) -> Result<(), Error> + Send + Sync>>,
     on_disconnect: Option<Arc<dyn Fn(Netconn) -> Result<(), Error> + Send + Sync>>,
     on_new_stream: Option<Arc<dyn Fn(Context) + Send + Sync>>,
@@ -20,6 +25,7 @@ impl Server {
     pub fn new() -> Self {
         Self {
             registry: Registry::from_inventory(),
+            codecs: vec![CodecMsgpackMap, CodecMsgpackCompact],
             on_connect: None,
             on_disconnect: None,
             on_new_stream: None,
@@ -59,15 +65,18 @@ impl Server {
         self
     }
 
+    pub fn with_codecs(mut self, codecs: &[CodecID]) -> Self {
+        self.codecs = codecs.to_vec();
+        self
+    }
+
     pub async fn serve(self, addr: &str) -> Result<(), Error> {
         if let Some(stripped) = addr.strip_prefix("tcp://") {
             return self.serve_tcp(stripped).await;
         }
-        #[cfg(feature = "uds")]
         if let Some(stripped) = addr.strip_prefix("uds://") {
             return self.serve_uds(stripped).await;
         }
-        #[cfg(feature = "uds")]
         if let Some(stripped) = addr.strip_prefix("unix://") {
             return self.serve_uds(stripped).await;
         }
@@ -83,14 +92,24 @@ impl Server {
         .await
     }
 
-    #[cfg(feature = "uds")]
     async fn serve_uds(self, path: &str) -> Result<(), Error> {
-        let listener = Arc::new(crate::transport::uds::listen(path).await?);
-        self.serve_with_accept(move || {
-            let listener = listener.clone();
-            crate::transport::uds::accept_stream(listener)
-        })
-        .await
+        #[cfg(feature = "uds")]
+        {
+            let listener = Arc::new(crate::transport::uds::listen(path).await?);
+            return self
+                .serve_with_accept(move || {
+                    let listener = listener.clone();
+                    crate::transport::uds::accept_stream(listener)
+                })
+                .await;
+        }
+        #[cfg(not(feature = "uds"))]
+        {
+            let _ = path;
+            return Err(Error::UnsupportedTransport(
+                "uds transport not enabled".to_string(),
+            ));
+        }
     }
 
     async fn serve_with_accept<R, A, F>(self, mut accept: A) -> Result<(), Error>
@@ -108,6 +127,7 @@ impl Server {
                 .unwrap_or_else(|| "client-unknown".to_string());
             let netconn = Netconn::new(peer_addr.clone());
             let server = server.clone();
+            let codecs = server.codecs.clone();
 
             tokio::spawn(async move {
                 let pending = ConnectionInner::new_pending(
@@ -124,7 +144,7 @@ impl Server {
                         return;
                     }
                 }
-                let conn = match pending.start_server().await {
+                let conn = match pending.start_server(&codecs, DEFAULT_MAX_FRAME).await {
                     Ok(conn) => conn,
                     Err(err) => {
                         warn!("handshake failed for {peer_label}: {err}");
