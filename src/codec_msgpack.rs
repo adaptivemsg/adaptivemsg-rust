@@ -125,3 +125,113 @@ fn decode_compact_envelope(payload: &[u8]) -> Result<Envelope, Error> {
         body: Box::new(values),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::de::{self, MapAccess, Visitor};
+    use serde::ser::SerializeMap;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::fmt;
+
+    #[crate::message]
+    struct CompactCustom {
+        name: String,
+        inner: InnerCustom,
+    }
+
+    struct InnerCustom {
+        value: String,
+    }
+
+    impl Serialize for InnerCustom {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry("value", &self.value)?;
+            map.end()
+        }
+    }
+
+    impl<'de> Deserialize<'de> for InnerCustom {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            struct InnerVisitor;
+
+            impl<'de> Visitor<'de> for InnerVisitor {
+                type Value = InnerCustom;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                    formatter.write_str("a map with a value field")
+                }
+
+                fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+                where
+                    M: MapAccess<'de>,
+                {
+                    let mut value: Option<String> = None;
+                    while let Some(key) = map.next_key::<String>()? {
+                        match key.as_str() {
+                            "value" => {
+                                if value.is_some() {
+                                    return Err(de::Error::duplicate_field("value"));
+                                }
+                                value = Some(map.next_value()?);
+                            }
+                            _ => {
+                                let _: de::IgnoredAny = map.next_value()?;
+                            }
+                        }
+                    }
+                    let value = value.ok_or_else(|| de::Error::missing_field("value"))?;
+                    Ok(InnerCustom { value })
+                }
+            }
+
+            deserializer.deserialize_map(InnerVisitor)
+        }
+    }
+
+    #[test]
+    fn compact_nested_custom_fallback() {
+        let msg = CompactCustom {
+            name: "hello".to_string(),
+            inner: InnerCustom {
+                value: "ok".to_string(),
+            },
+        };
+        let payload = msg.encode_compact().expect("encode_compact");
+        let value = rmpv::decode::read_value(&mut Cursor::new(&payload)).expect("decode value");
+        let mut items = match value {
+            Value::Array(items) => items,
+            other => panic!("expected array, got {other:?}"),
+        };
+        assert_eq!(items.len(), 3);
+        match &items[2] {
+            Value::Map(_) => {}
+            other => panic!("expected nested map, got {other:?}"),
+        }
+
+        let wire_value = items.remove(0);
+        let wire = match wire_value {
+            Value::String(s) => s
+                .as_str()
+                .expect("wire name must be utf-8")
+                .to_string(),
+            other => panic!("expected wire string, got {other:?}"),
+        };
+        let raw = crate::raw_message::RawMessage {
+            wire,
+            codec: CODEC_MSGPACK_COMPACT,
+            body: Box::new(items),
+        };
+        let decoded: CompactCustom =
+            crate::raw_message::decode_raw_as(raw).expect("decode_raw_as");
+        assert_eq!(decoded.name, "hello");
+        assert_eq!(decoded.inner.value, "ok");
+    }
+}

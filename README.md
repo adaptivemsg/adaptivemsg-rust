@@ -20,6 +20,7 @@ Minimal async message library over multiplexed streams, with optional server-sid
 - **Unknown message**: delivered to the stream's recv queue and decoded on demand.
 - **Registry**: `#[am::message_handler]` registers handler + message. Use `#[am::message(register)]` to opt into dynamic receive.
 - **Lazy decode**: envelopes are queued; payload decode happens in `recv()`.
+- **Compact codec**: positional arrays for fields; nested structs encode as arrays unless they implement custom serde encoding, in which case their custom representation (often map) is used.
 
 Tip: for brevity in local code, you can alias the crate, e.g. `use adaptivemsg as am;`.
 
