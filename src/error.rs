@@ -82,3 +82,9 @@ impl From<rmpv::ext::Error> for Error {
         Self::Codec(err.to_string())
     }
 }
+
+impl From<postcard::Error> for Error {
+    fn from(err: postcard::Error) -> Self {
+        Self::Codec(err.to_string())
+    }
+}

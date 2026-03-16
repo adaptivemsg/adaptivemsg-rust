@@ -2,6 +2,7 @@ extern crate self as adaptivemsg;
 
 mod codec;
 mod codec_msgpack;
+mod codec_postcard;
 mod codec_registry;
 mod connection;
 mod context;
@@ -19,6 +20,7 @@ mod type_info;
 
 pub use crate::codec::{CodecID, CodecImpl};
 pub use crate::codec_msgpack::{CodecMsgpackCompact, CodecMsgpackMap};
+pub use crate::codec_postcard::CodecPostcard;
 pub use crate::codec_registry::{must_register_codec as MustRegisterCodec, register_codec as RegisterCodec};
 pub use crate::connection::{Connection, Netconn};
 pub use crate::context::{Context, StreamContext};
@@ -36,6 +38,7 @@ pub use async_trait::async_trait;
 pub mod __private {
     pub use rmp_serde;
     pub use rmpv;
+    pub use postcard;
     pub use crate::message::MessageDecode;
     pub use crate::registry::{KnownEntry, KnownMessageEntry, Registry};
 }

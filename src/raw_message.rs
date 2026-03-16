@@ -73,6 +73,11 @@ where
         self.value = Some(T::decode_compact(values)?);
         Ok(())
     }
+
+    fn decode_postcard(&mut self, payload: &[u8]) -> Result<(), Error> {
+        self.value = Some(T::decode_postcard(payload)?);
+        Ok(())
+    }
 }
 
 struct FactoryTarget<'a> {
@@ -95,6 +100,11 @@ impl<'a> DecodeTarget for FactoryTarget<'a> {
 
     fn decode_compact(&mut self, values: Vec<Value>) -> Result<(), Error> {
         self.msg = Some(self.factory.decode_compact(values)?);
+        Ok(())
+    }
+
+    fn decode_postcard(&mut self, payload: &[u8]) -> Result<(), Error> {
+        self.msg = Some(self.factory.decode_postcard(payload)?);
         Ok(())
     }
 }

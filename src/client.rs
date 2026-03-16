@@ -5,6 +5,7 @@ use tracing::debug;
 
 use crate::codec::CodecID;
 use crate::codec_msgpack::{CodecMsgpackCompact, CodecMsgpackMap};
+use crate::codec_postcard::CodecPostcard;
 use crate::connection::Connection;
 use crate::error::Error;
 use crate::protocol::DEFAULT_MAX_FRAME;
@@ -23,7 +24,7 @@ impl Default for Client {
         Self {
             timeout: None,
             max_frame: DEFAULT_MAX_FRAME,
-            codecs: vec![CodecMsgpackMap, CodecMsgpackCompact],
+            codecs: vec![CodecPostcard, CodecMsgpackCompact, CodecMsgpackMap],
             registry: Registry::from_inventory(),
         }
     }

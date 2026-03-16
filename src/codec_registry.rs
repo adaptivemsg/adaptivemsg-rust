@@ -14,6 +14,7 @@ fn registry() -> &'static RwLock<HashMap<CodecID, Arc<dyn CodecImpl>>> {
 fn ensure_builtin_codecs() {
     BUILTIN_CODECS.get_or_init(|| {
         let _ = crate::codec_msgpack::register_builtin_codecs();
+        let _ = crate::codec_postcard::register_builtin_codecs();
     });
 }
 

@@ -6,6 +6,7 @@ use tracing::warn;
 
 use crate::codec::CodecID;
 use crate::codec_msgpack::{CodecMsgpackCompact, CodecMsgpackMap};
+use crate::codec_postcard::CodecPostcard;
 use crate::connection::{ConnectionInner, Netconn};
 use crate::context::Context;
 use crate::error::Error;
@@ -25,7 +26,7 @@ impl Server {
     pub fn new() -> Self {
         Self {
             registry: Registry::from_inventory(),
-            codecs: vec![CodecMsgpackMap, CodecMsgpackCompact],
+            codecs: vec![CodecPostcard, CodecMsgpackCompact, CodecMsgpackMap],
             on_connect: None,
             on_disconnect: None,
             on_new_stream: None,

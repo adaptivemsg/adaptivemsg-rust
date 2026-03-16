@@ -33,6 +33,7 @@ pub struct Envelope {
 pub trait DecodeTarget {
     fn decode_map(&mut self, value: Value) -> Result<(), Error>;
     fn decode_compact(&mut self, values: Vec<Value>) -> Result<(), Error>;
+    fn decode_postcard(&mut self, payload: &[u8]) -> Result<(), Error>;
 }
 
 pub trait CodecImpl: Send + Sync + 'static {

@@ -20,6 +20,7 @@ pub(crate) trait Handler: Send + Sync + 'static {
 pub(crate) trait MessageFactory: Send + Sync + 'static {
     fn decode_map(&self, value: Value) -> std::result::Result<Box<dyn Message>, Error>;
     fn decode_compact(&self, values: Vec<Value>) -> std::result::Result<Box<dyn Message>, Error>;
+    fn decode_postcard(&self, payload: &[u8]) -> std::result::Result<Box<dyn Message>, Error>;
 }
 
 #[derive(Default, Clone)]
@@ -142,6 +143,11 @@ where
 
     fn decode_compact(&self, values: Vec<Value>) -> std::result::Result<Box<dyn Message>, Error> {
         let msg = T::decode_compact(values)?;
+        Ok(Box::new(msg))
+    }
+
+    fn decode_postcard(&self, payload: &[u8]) -> std::result::Result<Box<dyn Message>, Error> {
+        let msg = T::decode_postcard(payload)?;
         Ok(Box::new(msg))
     }
 }

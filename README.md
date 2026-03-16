@@ -5,7 +5,7 @@ Minimal async message library over multiplexed streams, with optional server-sid
 
 - Transport: TCP / UDS / QUIC (feature)
 - Framing: v2 handshake + versioned header + length-prefixed payload
-- Codec: MessagePack map/compact, pluggable codecs
+- Codec: MessagePack map/compact, postcard (Rust-only), pluggable codecs (compact-first for shared codecs)
 - Data model: serde
 - Dispatch: registry-driven handlers
 - Logs: tracing

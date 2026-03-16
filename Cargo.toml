@@ -16,6 +16,7 @@ serde = { version = "1.0", features = ["derive"] }
 rmp-serde = "=1.2.0"
 rmp = "=0.8.14"
 rmpv = { version = "=1.0.2", features = ["with-serde"] }
+postcard = { version = "1.0", features = ["use-std"] }
 tracing = "0.1"
 thiserror = "1.0"
 inventory = "0.3"

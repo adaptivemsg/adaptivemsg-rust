@@ -13,6 +13,7 @@ pub trait Message: Any + Send + Sync + 'static {
         Self: Sized;
     fn encode_map(&self) -> std::result::Result<Vec<u8>, Error>;
     fn encode_compact(&self) -> std::result::Result<Vec<u8>, Error>;
+    fn encode_postcard(&self) -> std::result::Result<Vec<u8>, Error>;
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -22,6 +23,9 @@ pub trait MessageDecode: Message {
     where
         Self: Sized;
     fn decode_compact(values: Vec<Value>) -> std::result::Result<Self, Error>
+    where
+        Self: Sized;
+    fn decode_postcard(payload: &[u8]) -> std::result::Result<Self, Error>
     where
         Self: Sized;
 }
