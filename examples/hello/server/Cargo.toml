@@ -3,6 +3,10 @@ name = "adaptivemsg-hello-server"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+client = []
+
 [dependencies]
 adaptivemsg = { path = "../../.." }
 serde = { version = "1.0", features = ["derive"] }

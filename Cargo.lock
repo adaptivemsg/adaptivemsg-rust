@@ -23,6 +23,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "adaptivemsg-amgen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "syn",
+]
+
+[[package]]
 name = "adaptivemsg-echo-client"
 version = "0.1.0"
 dependencies = [

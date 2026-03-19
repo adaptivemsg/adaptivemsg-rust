@@ -1,5 +1,7 @@
 use adaptivemsg as am;
-use am::{Message, MessageHandler, Result, StreamContext};
+use am::Message;
+#[cfg(not(feature = "client"))]
+use am::{MessageHandler, Result, StreamContext};
 
 #[am::message]
 pub struct HelloRequest {
@@ -12,6 +14,7 @@ pub struct HelloReply {
     pub answer: String,
 }
 
+#[cfg(not(feature = "client"))]
 #[am::message_handler]
 impl MessageHandler for HelloRequest {
     async fn handle(self: Box<Self>, _stream_ctx: StreamContext) -> Result<Option<Box<dyn Message>>> {
