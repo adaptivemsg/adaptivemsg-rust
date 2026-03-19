@@ -20,9 +20,11 @@ use crate::stream::{Stream, StreamInner};
 pub(crate) const STREAM_QUEUE_SIZE: usize = 1024;
 const DEFAULT_STREAM_ID: u32 = 0;
 
+/// Shared handle to a negotiated connection.
 pub type Connection = Arc<ConnectionInner>;
 
 #[derive(Clone, Debug)]
+/// Connection metadata passed to server callbacks.
 pub struct Netconn {
     peer_addr: Option<String>,
 }
@@ -32,6 +34,7 @@ impl Netconn {
         Self { peer_addr }
     }
 
+    /// Peer address string when available.
     pub fn peer_addr(&self) -> Option<&str> {
         self.peer_addr.as_deref()
     }
@@ -199,6 +202,7 @@ impl ConnectionInner {
         }
     }
 
+    /// Wait until the connection is closed.
     pub async fn wait_closed(&self) {
         if self.closed.load(Ordering::Relaxed) {
             return;
@@ -214,21 +218,25 @@ impl ConnectionInner {
         }
     }
 
+    /// Open a new logical stream on this connection.
     pub fn new_stream(self: &Arc<Self>) -> Stream {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         Arc::clone(&self.make_stream(stream_id).stream)
     }
 
+    /// Send a message on the default stream.
     pub async fn send<M: crate::message::Message>(self: &Arc<Self>, msg: M) -> Result<(), Error> {
         self.default_stream().send(msg).await
     }
 
+    /// Receive the next message on the default stream.
     pub async fn recv<T: crate::message::MessageDecode + 'static>(
         self: &Arc<Self>,
     ) -> Result<T, Error> {
         self.default_stream().recv::<T>().await
     }
 
+    /// Send a request and wait for a response on the default stream.
     pub async fn send_recv<TReq: crate::message::Message, TResp: crate::message::MessageDecode + 'static>(
         self: &Arc<Self>,
         msg: TReq,
@@ -236,14 +244,17 @@ impl ConnectionInner {
         self.default_stream().send_recv::<TReq, TResp>(msg).await
     }
 
+    /// Peek the next wire name on the default stream without consuming it.
     pub async fn peek_wire(self: &Arc<Self>) -> Result<String, Error> {
         self.default_stream().peek_wire().await
     }
 
+    /// Set the receive timeout on the default stream.
     pub fn set_recv_timeout(self: &Arc<Self>, timeout: std::time::Duration) {
         self.default_stream().set_recv_timeout(timeout);
     }
 
+    /// Close the connection and all streams.
     pub fn close(self: &Arc<Self>) {
         self.close_internal();
     }

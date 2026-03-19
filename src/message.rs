@@ -6,14 +6,23 @@ use rmpv::Value;
 use crate::error::{Error, Result};
 use crate::context::StreamContext;
 
+/// Application message that can be encoded and decoded by codecs.
+///
+/// Prefer using the `#[message]` macro to implement this trait.
 pub trait Message: Any + Send + Sync + 'static {
+    /// Wire name used for routing and decoding.
     fn wire_name(&self) -> &'static str;
+    /// Wire name for this type without a value instance.
     fn wire_name_static() -> &'static str
     where
         Self: Sized;
+    /// Encode this message in MessagePack map form.
     fn encode_map(&self) -> std::result::Result<Vec<u8>, Error>;
+    /// Encode this message in MessagePack compact array form.
     fn encode_compact(&self) -> std::result::Result<Vec<u8>, Error>;
+    /// Encode this message in postcard form.
     fn encode_postcard(&self) -> std::result::Result<Vec<u8>, Error>;
+    /// Return a type-erased reference for downcasting.
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -42,9 +51,11 @@ impl dyn Message {
     }
 }
 
+/// Empty success reply sent when a handler returns `Ok(None)`.
 #[crate::message(register)]
 pub struct OkReply {}
 
+/// Error reply sent when a handler returns an error.
 #[crate::message(register)]
 pub struct ErrorReply {
     code: String,
@@ -52,6 +63,7 @@ pub struct ErrorReply {
 }
 
 impl ErrorReply {
+    /// Create an error reply from a code and message.
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
@@ -59,24 +71,30 @@ impl ErrorReply {
         }
     }
 
+    /// Machine-readable error code.
     pub fn code(&self) -> &str {
         &self.code
     }
 
+    /// Human-readable error message.
     pub fn message(&self) -> &str {
         &self.message
     }
 
+    /// Split into `(code, message)` parts.
     pub fn into_parts(self) -> (String, String) {
         (self.code, self.message)
     }
 }
 
 #[async_trait]
+/// Server-side handler for a message type.
 pub trait MessageHandler: Message {
-    /// Handled messages MUST be sent by clients using `send_recv()`.
-    /// `Ok(Some(msg))` sends `msg`, `Ok(None)` sends `OkReply`, and `Err(e)` sends an error.
-    /// The error type is `anyhow::Error` via `adaptivemsg::Result`.
+    /// Handle a request and optionally return a reply.
+    ///
+    /// Handled messages must be sent using `send_recv()`. `Ok(Some(msg))` sends
+    /// `msg`, `Ok(None)` sends `OkReply`, and `Err(e)` sends `ErrorReply`.
+    /// Use `adaptivemsg::Result` (anyhow) for application errors.
     async fn handle(
         self: Box<Self>,
         stream_ctx: StreamContext,

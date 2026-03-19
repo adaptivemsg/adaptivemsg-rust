@@ -8,9 +8,12 @@ use tokio::task::JoinHandle;
 use crate::error::Error;
 use crate::stream::Stream;
 
+/// Shared handle to a stream and its associated context.
 pub type StreamContext = Arc<StreamContextInner>;
+/// Shared context storage associated with a stream.
 pub type Context = Arc<ContextInner>;
 
+/// Typed context storage for a stream.
 pub struct ContextInner {
     data: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
 }
@@ -22,6 +25,7 @@ impl ContextInner {
         }
     }
 
+    /// Store a typed context value, replacing any existing value.
     pub fn set_context<T>(&self, ctx: Arc<T>)
     where
         T: Any + Send + Sync + 'static,
@@ -29,6 +33,7 @@ impl ContextInner {
         *self.data.lock().unwrap() = Some(ctx);
     }
 
+    /// Retrieve the context value if it matches the requested type.
     pub fn get_context<T>(&self) -> Option<Arc<T>>
     where
         T: Any + Send + Sync + 'static,
@@ -41,6 +46,7 @@ impl ContextInner {
     }
 }
 
+/// Context wrapper passed to message handlers.
 pub struct StreamContextInner {
     pub(crate) stream: Stream,
     pub(crate) context: Context,
@@ -56,6 +62,7 @@ impl StreamContextInner {
         }
     }
 
+    /// Store a typed context value, replacing any existing value.
     pub fn set_context<T>(&self, ctx: Arc<T>)
     where
         T: Any + Send + Sync + 'static,
@@ -63,6 +70,7 @@ impl StreamContextInner {
         self.context.set_context(ctx);
     }
 
+    /// Retrieve the context value if it matches the requested type.
     pub fn get_context<T>(&self) -> Option<Arc<T>>
     where
         T: Any + Send + Sync + 'static,

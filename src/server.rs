@@ -13,6 +13,7 @@ use crate::error::Error;
 use crate::protocol::DEFAULT_MAX_FRAME;
 use crate::registry::Registry;
 
+/// Message server that accepts connections and dispatches handlers.
 pub struct Server {
     registry: Registry,
     codecs: Vec<CodecID>,
@@ -23,6 +24,7 @@ pub struct Server {
 }
 
 impl Server {
+    /// Create a server with inventory handlers and built-in codecs.
     pub fn new() -> Self {
         Self {
             registry: Registry::from_inventory(),
@@ -34,6 +36,7 @@ impl Server {
         }
     }
 
+    /// Run a callback when a new connection is accepted.
     pub fn on_connect<F>(mut self, f: F) -> Self
     where
         F: Fn(Netconn) -> Result<(), Error> + Send + Sync + 'static,
@@ -42,6 +45,7 @@ impl Server {
         self
     }
 
+    /// Run a callback when a connection is closed.
     pub fn on_disconnect<F>(mut self, f: F) -> Self
     where
         F: Fn(Netconn) -> Result<(), Error> + Send + Sync + 'static,
@@ -50,6 +54,7 @@ impl Server {
         self
     }
 
+    /// Run a callback when a new stream is opened.
     pub fn on_new_stream<F>(mut self, f: F) -> Self
     where
         F: Fn(Context) + Send + Sync + 'static,
@@ -58,6 +63,7 @@ impl Server {
         self
     }
 
+    /// Run a callback when a stream is closed.
     pub fn on_close_stream<F>(mut self, f: F) -> Self
     where
         F: Fn(Context) + Send + Sync + 'static,
@@ -66,11 +72,15 @@ impl Server {
         self
     }
 
+    /// Override the codec preference list.
     pub fn with_codecs(mut self, codecs: &[CodecID]) -> Self {
         self.codecs = codecs.to_vec();
         self
     }
 
+    /// Serve on `addr`, using `tcp://`, `uds://`, or `unix://` prefixes.
+    ///
+    /// Without a scheme, TCP is used by default.
     pub async fn serve(self, addr: &str) -> Result<(), Error> {
         if let Some(stripped) = addr.strip_prefix("tcp://") {
             return self.serve_tcp(stripped).await;

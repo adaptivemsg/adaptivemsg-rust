@@ -12,6 +12,7 @@ use crate::protocol::DEFAULT_MAX_FRAME;
 use crate::registry::Registry;
 
 #[derive(Clone)]
+/// Client configuration for connecting to a server.
 pub struct Client {
     timeout: Option<Duration>,
     max_frame: u32,
@@ -31,25 +32,30 @@ impl Default for Client {
 }
 
 impl Client {
+    /// Create a client with default codecs and no timeout.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Set a connect timeout.
     pub fn with_timeout(mut self, d: Duration) -> Self {
         self.timeout = Some(d);
         self
     }
 
+    /// Override the codec preference list.
     pub fn with_codecs(mut self, codecs: &[CodecID]) -> Self {
         self.codecs = codecs.to_vec();
         self
     }
 
+    /// Set the maximum frame size to advertise.
     pub fn with_max_frame(mut self, max_frame: u32) -> Self {
         self.max_frame = max_frame;
         self
     }
 
+    /// Connect to a server at `addr` using `tcp://`, `uds://`, or `unix://`.
     pub async fn connect(&self, addr: &str) -> Result<Connection, Error> {
         debug!("client connect: {}", addr);
         let codecs = self.codecs.clone();

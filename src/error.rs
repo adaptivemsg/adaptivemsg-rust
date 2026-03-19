@@ -1,8 +1,10 @@
 use thiserror::Error;
 
+/// Result type for handler code and application logic.
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
 
 #[derive(Debug, Error)]
+/// Protocol and transport errors from the runtime.
 pub enum Error {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

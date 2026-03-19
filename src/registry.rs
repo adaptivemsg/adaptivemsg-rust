@@ -24,6 +24,7 @@ pub(crate) trait MessageFactory: Send + Sync + 'static {
 }
 
 #[derive(Default, Clone)]
+/// Registry of message handlers and decoders.
 pub struct Registry {
     handlers: Arc<HashMap<&'static str, Arc<dyn Handler>>>,
     messages: Arc<HashMap<&'static str, Arc<dyn MessageFactory>>>,
@@ -63,10 +64,12 @@ impl KnownMessageEntry {
 }
 
 impl Registry {
+    /// Create an empty registry.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Create a registry populated from inventory submissions.
     pub fn from_inventory() -> Self {
         let mut reg = Registry::new();
         for entry in inventory::iter::<KnownEntry> {
@@ -78,6 +81,7 @@ impl Registry {
         reg
     }
 
+    /// Register a message handler type.
     pub fn register<T>(&mut self)
     where
         T: MessageHandler + 'static,
@@ -95,6 +99,7 @@ impl Registry {
         !self.handlers.is_empty()
     }
 
+    /// Register a message type for decoding without a handler.
     pub fn register_message<T>(&mut self)
     where
         T: MessageDecode + 'static,

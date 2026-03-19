@@ -1,3 +1,12 @@
+//! Adaptive message protocol runtime.
+//!
+//! Define messages with `#[message]`, optionally attach handlers with
+//! `#[message_handler]`, then use `Server` to accept connections and `Client`
+//! to connect and exchange messages.
+//!
+//! Built-in codecs include `CodecMsgpackCompact`, `CodecMsgpackMap`, and
+//! `CodecPostcard`; register custom codecs with `RegisterCodec`.
+
 extern crate self as adaptivemsg;
 
 mod codec;
@@ -43,8 +52,10 @@ pub mod __private {
     pub use crate::registry::{KnownEntry, KnownMessageEntry, Registry};
 }
 
-pub use adaptivemsg_macros::message_handler;
+/// Define a message type with encode/decode support and a wire name.
 pub use adaptivemsg_macros::message;
+/// Define a server-side handler for a message type.
+pub use adaptivemsg_macros::message_handler;
 
 #[doc(hidden)]
 #[macro_export]

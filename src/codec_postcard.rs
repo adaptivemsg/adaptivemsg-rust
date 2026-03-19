@@ -10,6 +10,7 @@ use crate::message::Message;
 pub const CODEC_POSTCARD: CodecID = CodecID(64);
 
 #[allow(non_upper_case_globals)]
+/// Postcard codec ID.
 pub const CodecPostcard: CodecID = CODEC_POSTCARD;
 
 struct PostcardCodec;

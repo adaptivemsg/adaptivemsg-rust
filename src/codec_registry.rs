@@ -18,6 +18,10 @@ fn ensure_builtin_codecs() {
     });
 }
 
+/// Register a codec implementation for handshake negotiation.
+///
+/// Returns an error if the codec ID is zero, the name is empty, or the ID is
+/// already registered.
 pub fn register_codec<C>(codec: C) -> Result<(), Error>
 where
     C: CodecImpl,
@@ -37,6 +41,7 @@ where
     Ok(())
 }
 
+/// Register a codec and panic if registration fails.
 pub fn must_register_codec<C>(codec: C)
 where
     C: CodecImpl,

@@ -65,3 +65,19 @@ let client = am::Client::new();
 let conn = client.connect("tcp://127.0.0.1:5555").await?;
 let reply: HelloReply = conn.send_recv(HelloRequest { who: "alice".into() }).await?;
 ```
+
+## Code generation (amgen-rs)
+
+Install:
+
+```bash
+cargo install adaptivemsg-amgen
+```
+
+Run:
+
+```bash
+amgen-rs --in api/<service>/message.rs
+```
+
+This writes `<input>.go` alongside the Rust source and a `go.mod` at the repo root.

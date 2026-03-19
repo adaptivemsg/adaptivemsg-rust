@@ -11,10 +11,12 @@ use crate::message::{ErrorReply, Message, MessageDecode};
 use crate::type_info::expected_wire_name;
 use crate::raw_message::{decode_raw_as, RawMessage};
 
+/// Shared handle to a logical stream within a connection.
 pub type Stream = Arc<StreamInner>;
 
 const RECV_TIMEOUT_NONE: u64 = 0;
 
+/// A logical stream for sending and receiving messages.
 pub struct StreamInner {
     pub(crate) id: u32,
     pub(crate) connection: Connection,
@@ -56,10 +58,12 @@ impl StreamInner {
         }
     }
 
+    /// Stream identifier within the connection.
     pub fn id(&self) -> u32 {
         self.id
     }
 
+    /// Close this stream and notify close callbacks.
     pub fn close(self: &Arc<Self>) {
         if let Some(stream_ctx) = self.connection.remove_stream(self.id) {
             self.connection.notify_close(&stream_ctx);
@@ -79,6 +83,9 @@ impl StreamInner {
         self.closed_notify.notified().await;
     }
 
+    /// Set the receive timeout for `recv` and `send_recv`.
+    ///
+    /// Use `Duration::ZERO` to disable timeouts.
     pub fn set_recv_timeout(&self, timeout: Duration) {
         let nanos = if timeout.is_zero() {
             RECV_TIMEOUT_NONE
@@ -88,10 +95,12 @@ impl StreamInner {
         self.recv_timeout_nanos.store(nanos, Ordering::Relaxed);
     }
 
+    /// Send a message without waiting for a reply.
     pub async fn send<M: Message>(&self, msg: M) -> Result<(), Error> {
         self.send_boxed(Box::new(msg)).await
     }
 
+    /// Receive the next message and decode it as `T`.
     pub async fn recv<T: MessageDecode + 'static>(&self) -> Result<T, Error> {
         let raw = self.recv_raw().await?;
         let result = decode_raw_as::<T>(raw);
@@ -101,6 +110,9 @@ impl StreamInner {
         result
     }
 
+    /// Send a request and wait for a response of type `TResp`.
+    ///
+    /// If the remote sends `ErrorReply`, this returns `Error::Remote`.
     pub async fn send_recv<TReq: Message, TResp: MessageDecode + 'static>(
         &self,
         msg: TReq,
@@ -126,6 +138,7 @@ impl StreamInner {
         result
     }
 
+    /// Peek the wire name of the next message without consuming it.
     pub async fn peek_wire(&self) -> Result<String, Error> {
         let _guard = self.recv_guard()?;
         if let Some(msg) = self.peeked.lock().unwrap().as_ref() {

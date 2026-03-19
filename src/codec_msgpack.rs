@@ -14,8 +14,10 @@ pub const CODEC_MSGPACK_COMPACT: CodecID = CodecID(1);
 pub const CODEC_MSGPACK_MAP: CodecID = CodecID(2);
 
 #[allow(non_upper_case_globals)]
+/// MessagePack compact array codec ID.
 pub const CodecMsgpackCompact: CodecID = CODEC_MSGPACK_COMPACT;
 #[allow(non_upper_case_globals)]
+/// MessagePack map codec ID.
 pub const CodecMsgpackMap: CodecID = CODEC_MSGPACK_MAP;
 
 struct MsgpackMapCodec;
