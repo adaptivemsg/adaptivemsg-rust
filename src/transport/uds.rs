@@ -2,21 +2,11 @@ use std::path::PathBuf;
 
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::codec::CodecID;
-use crate::connection::{Connection, ConnectionInner};
 use crate::error::Error;
-use crate::registry::Registry;
 
-pub async fn connect(
-    path: &str,
-    registry: Registry,
-    codecs: &[CodecID],
-    max_frame: u32,
-) -> Result<Connection, Error> {
+pub(crate) async fn dial(path: &str) -> Result<UnixStream, Error> {
     let path = to_uds_path(path)?;
-    let stream = UnixStream::connect(path).await?;
-    let pending = ConnectionInner::new_pending(stream, registry, None, None);
-    pending.start_client(codecs, max_frame).await
+    Ok(UnixStream::connect(path).await?)
 }
 
 pub async fn listen(path: &str) -> Result<UnixListener, Error> {
@@ -24,9 +14,7 @@ pub async fn listen(path: &str) -> Result<UnixListener, Error> {
     Ok(UnixListener::bind(path)?)
 }
 
-pub(crate) async fn accept_stream<L>(
-    listener: L,
-) -> Result<(UnixStream, Option<String>), Error>
+pub(crate) async fn accept_stream<L>(listener: L) -> Result<(UnixStream, Option<String>), Error>
 where
     L: std::ops::Deref<Target = UnixListener>,
 {

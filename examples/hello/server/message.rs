@@ -1,7 +1,8 @@
 use adaptivemsg as am;
-use am::Message;
 #[cfg(not(feature = "client"))]
 use am::{MessageHandler, Result, StreamContext};
+#[cfg(not(feature = "client"))]
+use am::Message;
 
 #[am::message]
 pub struct HelloRequest {

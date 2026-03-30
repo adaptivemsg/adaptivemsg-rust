@@ -53,6 +53,10 @@ pub enum Error {
     ConcurrentRecv,
     #[error("unsupported transport: {0}")]
     UnsupportedTransport(String),
+    #[error("resume rejected: {0}")]
+    ResumeRejected(String),
+    #[error("replay buffer full: limit {limit}, size {size}")]
+    ReplayBufferFull { limit: i64, size: i64 },
 }
 
 impl From<rmp_serde::encode::Error> for Error {

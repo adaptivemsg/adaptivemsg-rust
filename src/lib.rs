@@ -9,6 +9,7 @@
 
 extern crate self as adaptivemsg;
 
+mod client;
 mod codec;
 mod codec_msgpack;
 mod codec_postcard;
@@ -17,39 +18,48 @@ mod connection;
 mod context;
 mod error;
 mod frame;
+mod frame_queue;
 mod message;
 mod protocol;
 mod raw_message;
+mod recovery;
+mod recovery_protocol;
 mod registry;
+mod replay;
 mod server;
 mod stream;
 mod transport;
-mod client;
 mod type_info;
 
+#[cfg(test)]
+mod recovery_integration_test;
+
+pub use crate::client::Client;
 pub use crate::codec::{CodecID, CodecImpl};
 pub use crate::codec_msgpack::{CodecMsgpackCompact, CodecMsgpackMap};
 pub use crate::codec_postcard::CodecPostcard;
-pub use crate::codec_registry::{must_register_codec as MustRegisterCodec, register_codec as RegisterCodec};
+pub use crate::codec_registry::{
+    must_register_codec as MustRegisterCodec, register_codec as RegisterCodec,
+};
 pub use crate::connection::{Connection, Netconn};
 pub use crate::context::{Context, StreamContext};
 pub use crate::error::{Error, Result};
 pub use crate::message::{ErrorReply, Message, MessageHandler, OkReply};
+pub use crate::recovery::{ClientRecoveryOptions, ServerRecoveryOptions};
 pub use crate::registry::Registry;
 pub use crate::server::Server;
 pub use crate::stream::Stream;
-pub use crate::client::Client;
 
 #[doc(hidden)]
 pub use async_trait::async_trait;
 
 #[doc(hidden)]
 pub mod __private {
-    pub use rmp_serde;
-    pub use rmpv;
-    pub use postcard;
     pub use crate::message::MessageDecode;
     pub use crate::registry::{KnownEntry, KnownMessageEntry, Registry};
+    pub use postcard;
+    pub use rmp_serde;
+    pub use rmpv;
 }
 
 /// Define a message type with encode/decode support and a wire name.
