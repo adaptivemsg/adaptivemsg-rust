@@ -26,6 +26,7 @@ adaptivemsg-macros = { path = "../adaptivemsg-macros" }
 
 quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23", optional = true }
+rand = "0.8"
 
 [workspace]
 members = [

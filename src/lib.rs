@@ -32,7 +32,11 @@ mod transport;
 mod type_info;
 
 #[cfg(test)]
+mod protocol_version_bench_test;
+#[cfg(test)]
 mod recovery_integration_test;
+#[cfg(test)]
+mod recovery_runtime_bench_test;
 
 pub use crate::client::Client;
 pub use crate::codec::{CodecID, CodecImpl};

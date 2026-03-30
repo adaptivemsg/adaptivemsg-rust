@@ -1,7 +1,7 @@
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener as TokioTcpListener;
@@ -134,84 +134,6 @@ async fn start_message_recovery_server(addr: &str) -> JoinHandle<()> {
         let server = Server::new().with_recovery(recovery);
         let _ = server.serve(&serve_addr).await;
     })
-}
-
-async fn run_protocol_send_recv_perf_case(recovery_enabled: bool, iterations: usize) -> f64 {
-    run_protocol_send_recv_perf_case_with_codec(recovery_enabled, iterations, None).await
-}
-
-async fn run_protocol_send_recv_perf_case_with_codec(
-    recovery_enabled: bool,
-    iterations: usize,
-    codecs: Option<Vec<crate::CodecID>>,
-) -> f64 {
-    let addr = ephemeral_tcp_addr();
-    let serve_addr = addr.clone();
-    let server_codecs = codecs.clone();
-    // Benchmark server uses production-like recovery options matching Go's benchmark config
-    let server = tokio::spawn(async move {
-        let mut server = Server::new();
-        if let Some(codecs) = server_codecs {
-            server = server.with_codecs(&codecs);
-        }
-        if recovery_enabled {
-            server = server.with_recovery(ServerRecoveryOptions {
-                enable: true,
-                detached_ttl: Duration::from_secs(5),
-                ack_every: 64,
-                ack_delay: Duration::from_millis(20),
-                heartbeat_interval: Duration::from_secs(30),
-                heartbeat_timeout: Duration::from_secs(90),
-                ..ServerRecoveryOptions::default()
-            });
-        }
-        let _ = server.serve(&serve_addr).await;
-    });
-    wait_server_ready(&addr).await;
-
-    let mut client = crate::Client::new().with_timeout(Duration::from_secs(2));
-    if let Some(codecs) = codecs {
-        client = client.with_codecs(&codecs);
-    }
-    if recovery_enabled {
-        client = client.with_recovery(crate::ClientRecoveryOptions {
-            enable: true,
-            reconnect_min_backoff: Duration::from_millis(100),
-            reconnect_max_backoff: Duration::from_secs(2),
-            max_replay_bytes: 8 << 20,
-        });
-    }
-    let conn = client
-        .connect(&format!("tcp://{addr}"))
-        .await
-        .expect("client connect");
-    conn.set_recv_timeout(Duration::from_secs(2));
-
-    let warmup: RecoveryEchoReply = conn
-        .send_recv(RecoveryEchoRequest {
-            text: "warmup".to_string(),
-        })
-        .await
-        .expect("warmup send_recv");
-    assert_eq!(warmup.text, "warmup");
-
-    let start = Instant::now();
-    for _ in 0..iterations {
-        let reply: RecoveryEchoReply = conn
-            .send_recv(RecoveryEchoRequest {
-                text: "x".to_string(),
-            })
-            .await
-            .expect("bench send_recv");
-        assert_eq!(reply.text, "x");
-    }
-    let elapsed = start.elapsed();
-    let ns_per_op = elapsed.as_nanos() as f64 / iterations as f64;
-
-    conn.close();
-    server.abort();
-
-    ns_per_op
 }
 
 async fn wait_for_generation_change(connection: &crate::Connection, previous: u64) {
@@ -696,44 +618,4 @@ async fn recovery_heartbeat_keeps_idle_connection_alive() {
     assert_eq!(reply.text, "idle-ok");
 
     server.abort();
-}
-
-fn bench_iterations() -> usize {
-    std::env::var("AM_BENCH_ITERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(1000)
-}
-
-#[tokio::test]
-#[ignore = "manual benchmark test; run with -- --ignored --nocapture"]
-async fn benchmark_protocol_v2_send_recv() {
-    let ns_per_op = run_protocol_send_recv_perf_case(false, bench_iterations()).await;
-    println!("BenchmarkProtocolV2SendRecv\t{ns_per_op:.2} ns/op");
-}
-
-#[tokio::test]
-#[ignore = "manual benchmark test; run with -- --ignored --nocapture"]
-async fn benchmark_protocol_v3_recovery_send_recv() {
-    let ns_per_op = run_protocol_send_recv_perf_case(true, bench_iterations()).await;
-    println!("BenchmarkProtocolV3RecoverySendRecv\t{ns_per_op:.2} ns/op");
-}
-
-#[tokio::test]
-#[ignore = "manual benchmark test; run with -- --ignored --nocapture"]
-async fn benchmark_protocol_v2_send_recv_msgpack() {
-    let codecs = vec![crate::codec_msgpack::CodecMsgpackCompact];
-    let ns_per_op =
-        run_protocol_send_recv_perf_case_with_codec(false, bench_iterations(), Some(codecs)).await;
-    println!("BenchmarkProtocolV2SendRecv_Msgpack\t{ns_per_op:.2} ns/op");
-}
-
-#[tokio::test]
-#[ignore = "manual benchmark test; run with -- --ignored --nocapture"]
-async fn benchmark_protocol_v3_recovery_send_recv_msgpack() {
-    let codecs = vec![crate::codec_msgpack::CodecMsgpackCompact];
-    let ns_per_op =
-        run_protocol_send_recv_perf_case_with_codec(true, bench_iterations(), Some(codecs)).await;
-    println!("BenchmarkProtocolV3RecoverySendRecv_Msgpack\t{ns_per_op:.2} ns/op");
 }
