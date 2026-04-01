@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::sync::Notify;
 
 use crate::connection::{Connection, HandlerJob};
+use crate::debug::{StreamDebugCounters, StreamDebugState};
 use crate::error::Error;
 use crate::message::{ErrorReply, Message, MessageDecode};
 use crate::type_info::expected_wire_name;
@@ -30,6 +31,7 @@ pub struct StreamInner {
     peeked: Mutex<Option<RawMessage>>,
     closed: AtomicBool,
     closed_notify: Notify,
+    pub(crate) debug: StreamDebugCounters,
 }
 
 impl StreamInner {
@@ -55,12 +57,36 @@ impl StreamInner {
             peeked: Mutex::new(None),
             closed: AtomicBool::new(false),
             closed_notify: Notify::new(),
+            debug: StreamDebugCounters::new(),
         }
     }
 
     /// Stream identifier within the connection.
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// Returns a point-in-time diagnostic snapshot of this stream.
+    pub fn debug_state(&self) -> StreamDebugState {
+        let recv_nanos = self.recv_timeout_nanos.load(Ordering::Relaxed);
+        let recv_timeout = if recv_nanos == RECV_TIMEOUT_NONE {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(recv_nanos)
+        };
+        let handler_q_depth = self
+            .handler_tx
+            .as_ref()
+            .map(|tx| tx.max_capacity() - tx.capacity())
+            .unwrap_or(0);
+        self.debug.build_state(
+            self.id,
+            self.closed.load(Ordering::Relaxed),
+            recv_timeout,
+            self.inbox_tx.max_capacity() - self.inbox_tx.capacity(),
+            self.incoming_tx.max_capacity() - self.incoming_tx.capacity(),
+            handler_q_depth,
+        )
     }
 
     /// Close this stream and notify close callbacks.
@@ -153,7 +179,9 @@ impl StreamInner {
     pub(crate) async fn send_boxed(&self, msg: Box<dyn Message>) -> Result<(), Error> {
         let payload = self.connection.encode_message(msg.as_ref())?;
         let frame = (self.id, payload);
-        self.connection.enqueue_frame(frame).await
+        self.connection.enqueue_frame(frame).await?;
+        self.debug.data_messages_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     pub(crate) async fn inbox_q(&self, msg: RawMessage) -> Result<(), Error> {
@@ -230,6 +258,7 @@ impl StreamInner {
     }
 
     pub(crate) async fn protocol_error(&self, code: &str, message: String) {
+        self.debug.protocol_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = self
             .send_boxed(Box::new(ErrorReply::new(code, message)))
             .await;

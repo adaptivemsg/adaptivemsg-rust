@@ -230,12 +230,8 @@ impl RecoveryState {
             ack_every: AtomicU32::new(neg.ack_every),
             ack_due_flag: AtomicBool::new(false),
             ack_delay_nanos: AtomicI64::new(neg.ack_delay.as_nanos() as i64),
-            heartbeat_interval_nanos: AtomicI64::new(
-                neg.heartbeat_interval.as_nanos() as i64,
-            ),
-            heartbeat_timeout_nanos: AtomicI64::new(
-                neg.heartbeat_timeout.as_nanos() as i64,
-            ),
+            heartbeat_interval_nanos: AtomicI64::new(neg.heartbeat_interval.as_nanos() as i64),
+            heartbeat_timeout_nanos: AtomicI64::new(neg.heartbeat_timeout.as_nanos() as i64),
             last_activity_nanos: AtomicU64::new(now_nanos()),
             resume_connector: Some(resume_connector),
             registry: None,
@@ -349,7 +345,9 @@ impl RecoveryState {
         frame
     }
 
-    pub(crate) fn take_live_rx(&self) -> Option<mpsc::UnboundedReceiver<Arc<crate::replay::FrameRecord>>> {
+    pub(crate) fn take_live_rx(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<Arc<crate::replay::FrameRecord>>> {
         self.live_rx.lock().unwrap().take()
     }
 
@@ -459,6 +457,35 @@ impl RecoveryState {
 
     pub(crate) fn detached_ttl(&self) -> Duration {
         self.detached_ttl
+    }
+
+    pub(crate) fn debug_state(&self, transport_gen: u64) -> crate::debug::RecoveryDebugState {
+        let fields = self.fields.lock().unwrap();
+        let role = match self.role {
+            RecoveryRole::Client => "client",
+            RecoveryRole::Server => "server",
+        };
+        crate::debug::RecoveryDebugState {
+            role: role.to_string(),
+            connection_id: self.connection_id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            transport_attached: transport_gen > 0,
+            transport_gen,
+            reconnect_active: self.reconnect_active.load(Ordering::Relaxed),
+            last_recv_seq: fields.last_recv_seq,
+            last_acked_seq: fields.last_ack_sent,
+            ack_pending: fields.ack_pending,
+            ack_due: fields.ack_due,
+            ack_every: self.ack_every.load(Ordering::Relaxed),
+            ack_delay: Duration::from_nanos(
+                self.ack_delay_nanos.load(Ordering::Relaxed).max(0) as u64
+            ),
+            heartbeat_interval: self.heartbeat_interval(),
+            heartbeat_timeout: self.heartbeat_timeout(),
+            replay_queued: self.replay.queued_count(),
+            replay_bytes: self.replay.used_bytes(),
+            live_queue_depth: 0, // live_rx is taken; cannot inspect depth
+            resume_queue_depth: self.resume_queue.len(),
+        }
     }
 }
 

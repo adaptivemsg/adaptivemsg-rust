@@ -22,4 +22,8 @@ impl FrameDeque {
         inner.clear();
         inner.extend(frames);
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
 }

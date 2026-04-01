@@ -51,6 +51,7 @@ impl ConnectionInner {
             self.spawn_plain_reader(gen, parts.reader)
         };
         *self.current_reader_abort.lock().unwrap() = Some((gen, reader_task.abort_handle()));
+        self.debug.transport_attaches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(super) fn spawn_recovery_writer(
@@ -78,10 +79,13 @@ impl ConnectionInner {
                             write_frame(connection.config(), w, frame.stream_id, frame.seq, &frame.payload).await
                         };
                         if let Err(err) = result {
+                            connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_LIVE_WRITE, err.to_string());
                             warn!("recovery live write failed: {err}");
                             connection.detach_transport(current_gen, true);
                             writer = None;
                         } else {
+                            connection.debug.frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            connection.debug.bytes_written.fetch_add(frame.payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                             last_sent_seq = frame.seq;
                         }
                     }
@@ -144,11 +148,13 @@ impl ConnectionInner {
                     )
                     .await;
                     if let Err(err) = result {
+                        connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_ACK_WRITE, err.to_string());
                         warn!("recovery ack write failed: {err}");
                         connection.detach_transport(current_gen, true);
                         writer = None;
                         continue;
                     }
+                    connection.debug.control_frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // Batch: also write any pending live frame before flushing
                     if let Ok(frame) = live_rx.try_recv() {
                         if frame.seq > last_sent_seq {
@@ -162,11 +168,14 @@ impl ConnectionInner {
                             )
                             .await;
                             if let Err(err) = result {
+                                connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_LIVE_WRITE, err.to_string());
                                 warn!("recovery live write failed: {err}");
                                 connection.detach_transport(current_gen, true);
                                 writer = None;
                                 continue;
                             }
+                            connection.debug.frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            connection.debug.bytes_written.fetch_add(frame.payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                             last_sent_seq = frame.seq;
                         }
                     }
@@ -201,10 +210,12 @@ impl ConnectionInner {
                             .await
                         };
                         if let Err(err) = result {
+                            connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_RESUME_WRITE, err.to_string());
                             warn!("recovery resume write failed: {err}");
                             connection.detach_transport(current_gen, true);
                             writer = None;
                         } else {
+                            connection.debug.frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             last_sent_seq = frame.seq;
                         }
                         continue;
@@ -263,9 +274,12 @@ impl ConnectionInner {
                                 write_frame(connection.config(), w, CONTROL_STREAM_ID, 0, &payload).await
                             };
                             if let Err(err) = result {
+                                connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_PING_WRITE, err.to_string());
                                 warn!("recovery ping write failed: {err}");
                                 connection.detach_transport(current_gen, true);
                                 writer = None;
+                            } else {
+                                connection.debug.control_frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                     }
@@ -302,9 +316,13 @@ impl ConnectionInner {
                 };
                 match frame {
                     Ok((stream_id, seq, payload)) => {
+                        connection.debug.frames_read.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        connection.debug.bytes_read.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         recovery.touch_activity();
                         if stream_id == CONTROL_STREAM_ID {
+                            connection.debug.control_frames_read.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if let Err(err) = connection.handle_control_frame(&payload) {
+                                connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_CONTROL, err.to_string());
                                 warn!("recovery control frame failed: {err}");
                                 connection.mark_closed();
                                 return;
@@ -315,12 +333,14 @@ impl ConnectionInner {
                             .handle_recovery_data_frame(stream_id, seq, payload)
                             .await
                         {
+                            connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_DATA, err.to_string());
                             warn!("recovery data frame failed: {err}");
                             connection.mark_closed();
                             return;
                         }
                     }
                     Err(err) => {
+                        connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_READ, err.to_string());
                         debug!("recovery reader ended: {err}");
                         connection.detach_transport(gen, false);
                         return;
@@ -346,6 +366,7 @@ impl ConnectionInner {
         {
             return;
         }
+        self.debug.transport_detaches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if abort_reader {
             if let Some((current_gen, handle)) = self.current_reader_abort.lock().unwrap().take() {
                 if current_gen == gen {
@@ -416,14 +437,20 @@ impl ConnectionInner {
                 if connection.closed.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
+                connection.debug.reconnect_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match connection.resume_client_transport().await {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        connection.debug.reconnect_successes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
                     Err(err) => {
+                        connection.debug.reconnect_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!("resume failed: {err}");
                         if matches!(
                             err,
                             Error::ResumeRejected(_) | Error::UnsupportedFrameVersion(_)
                         ) {
+                            connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_RECONNECT_TERMINAL, err.to_string());
                             connection.mark_closed();
                             break;
                         }

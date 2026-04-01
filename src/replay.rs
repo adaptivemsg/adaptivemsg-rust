@@ -120,6 +120,14 @@ impl ReplayBuffer {
     pub(crate) fn last_acked_seq(&self) -> u64 {
         self.last_acked.load(Ordering::Relaxed)
     }
+
+    pub(crate) fn queued_count(&self) -> usize {
+        self.inner.lock().unwrap().replay_queue.len()
+    }
+
+    pub(crate) fn used_bytes(&self) -> i64 {
+        self.inner.lock().unwrap().used_bytes
+    }
 }
 
 fn replay_entry_size(version: u8, payload_len: usize) -> Result<i64, Error> {

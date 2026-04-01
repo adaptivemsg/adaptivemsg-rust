@@ -16,6 +16,7 @@ mod codec_postcard;
 mod codec_registry;
 mod connection;
 mod context;
+pub mod debug;
 mod error;
 mod frame;
 mod frame_queue;
@@ -47,6 +48,7 @@ pub use crate::codec_registry::{
 };
 pub use crate::connection::{Connection, Netconn};
 pub use crate::context::{Context, StreamContext};
+pub use crate::debug::{ConnectionDebugState, StreamDebugState, RecoveryDebugState, ConnectionCounters, StreamCounters};
 pub use crate::error::{Error, Result};
 pub use crate::message::{ErrorReply, Message, MessageHandler, OkReply};
 pub use crate::recovery::{ClientRecoveryOptions, ServerRecoveryOptions};
