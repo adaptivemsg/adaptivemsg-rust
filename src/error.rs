@@ -94,3 +94,45 @@ impl From<postcard::Error> for Error {
         Self::Codec(err.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_display_messages() {
+        assert_eq!(Error::Closed.to_string(), "connection closed");
+        assert_eq!(Error::RecvTimeout.to_string(), "recv timeout");
+        assert_eq!(Error::ConnectTimeout.to_string(), "connect timeout");
+        assert_eq!(Error::HandlerTaskBusy.to_string(), "only one handler task allowed per stream");
+        assert_eq!(Error::ConcurrentRecv.to_string(), "concurrent recv on stream");
+        assert_eq!(Error::NoCommonCodec.to_string(), "no common codec");
+        assert_eq!(Error::BadHandshakeMagic.to_string(), "invalid handshake magic");
+        assert_eq!(Error::HandshakeRejected.to_string(), "handshake rejected");
+    }
+
+    #[test]
+    fn error_display_with_fields() {
+        let e = Error::FrameTooLarge(9999);
+        assert!(e.to_string().contains("9999"));
+
+        let e = Error::TypeMismatch { expected: "Foo".into(), got: "Bar".into() };
+        assert!(e.to_string().contains("Foo"));
+        assert!(e.to_string().contains("Bar"));
+
+        let e = Error::Remote { code: "handler.error".into(), message: "boom".into() };
+        assert!(e.to_string().contains("handler.error"));
+        assert!(e.to_string().contains("boom"));
+
+        let e = Error::NoCommonVersion { client_min: 2, client_max: 3, server_min: 4, server_max: 5 };
+        assert!(e.to_string().contains("2-3"));
+        assert!(e.to_string().contains("4-5"));
+    }
+
+    #[test]
+    fn from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken");
+        let err: Error = io_err.into();
+        assert!(matches!(err, Error::Io(_)));
+    }
+}

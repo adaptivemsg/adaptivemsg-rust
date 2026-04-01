@@ -227,3 +227,112 @@ fn select_codec(client_codecs: &[u8], supported: &[CodecID]) -> Option<CodecID> 
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec_msgpack::{CodecMsgpackCompact, CodecMsgpackMap};
+
+    #[tokio::test]
+    async fn handshake_v2_success() {
+        let (client_r, server_w) = tokio::io::duplex(1024);
+        let (server_r, client_w) = tokio::io::duplex(1024);
+        let (mut cr, mut cw) = (client_r, client_w);
+        let (mut sr, mut sw) = (server_r, server_w);
+
+        let server_codecs = vec![CodecMsgpackCompact, CodecMsgpackMap];
+        let client_codecs = vec![CodecMsgpackMap, CodecMsgpackCompact];
+
+        let server_handle = tokio::spawn(async move {
+            handshake_server(&mut sr, &mut sw, &server_codecs, 1024, false).await
+        });
+
+        let client_cfg = handshake_client(&mut cr, &mut cw, &client_codecs, 2048, PROTOCOL_VERSION_V2).await.unwrap();
+        let server_cfg = server_handle.await.unwrap().unwrap();
+
+        assert_eq!(client_cfg.codec_id, CodecMsgpackMap);
+        assert_eq!(server_cfg.codec_id, CodecMsgpackMap);
+        assert_eq!(client_cfg.max_frame, 1024);
+        assert_eq!(server_cfg.max_frame, 1024);
+    }
+
+    #[tokio::test]
+    async fn handshake_no_common_codec() {
+        let (client_r, server_w) = tokio::io::duplex(1024);
+        let (server_r, client_w) = tokio::io::duplex(1024);
+        let (mut cr, mut cw) = (client_r, client_w);
+        let (mut sr, mut sw) = (server_r, server_w);
+
+        let server_codecs = vec![CodecMsgpackMap];
+        let client_codecs = vec![crate::codec_postcard::CodecPostcard];
+
+        let server_handle = tokio::spawn(async move {
+            handshake_server(&mut sr, &mut sw, &server_codecs, 1024, false).await
+        });
+
+        let client_result = handshake_client(&mut cr, &mut cw, &client_codecs, 2048, PROTOCOL_VERSION_V2).await;
+        let _server_result = server_handle.await.unwrap();
+
+        assert!(matches!(client_result, Err(Error::NoCommonCodec)));
+    }
+
+    #[tokio::test]
+    async fn handshake_v3_success() {
+        let (client_r, server_w) = tokio::io::duplex(1024);
+        let (server_r, client_w) = tokio::io::duplex(1024);
+        let (mut cr, mut cw) = (client_r, client_w);
+        let (mut sr, mut sw) = (server_r, server_w);
+
+        let server_codecs = vec![CodecMsgpackCompact];
+        let client_codecs = vec![CodecMsgpackCompact];
+
+        let server_handle = tokio::spawn(async move {
+            handshake_server(&mut sr, &mut sw, &server_codecs, 4096, true).await
+        });
+
+        let client_cfg = handshake_client(&mut cr, &mut cw, &client_codecs, 4096, PROTOCOL_VERSION_V3).await.unwrap();
+        let server_cfg = server_handle.await.unwrap().unwrap();
+
+        assert_eq!(client_cfg.version, PROTOCOL_VERSION_V3);
+        assert_eq!(server_cfg.version, PROTOCOL_VERSION_V3);
+    }
+
+    #[tokio::test]
+    async fn handshake_v3_rejected_by_legacy_server() {
+        let (client_r, server_w) = tokio::io::duplex(1024);
+        let (server_r, client_w) = tokio::io::duplex(1024);
+        let (mut cr, mut cw) = (client_r, client_w);
+        let (mut sr, mut sw) = (server_r, server_w);
+
+        let server_codecs = vec![CodecMsgpackCompact];
+        let client_codecs = vec![CodecMsgpackCompact];
+
+        let server_handle = tokio::spawn(async move {
+            handshake_server(&mut sr, &mut sw, &server_codecs, 4096, false).await
+        });
+
+        let result = handshake_client(&mut cr, &mut cw, &client_codecs, 4096, PROTOCOL_VERSION_V3).await;
+        let _server_result = server_handle.await.unwrap();
+
+        assert!(matches!(result, Err(Error::UnsupportedFrameVersion(_))));
+    }
+
+    #[test]
+    fn validate_codec_list_rejects_empty() {
+        assert!(validate_codec_list(&[]).is_err());
+    }
+
+    #[test]
+    fn validate_codec_list_rejects_too_many() {
+        // Use valid registered codec IDs repeated, but > MAX_CODEC_COUNT
+        let codecs: Vec<CodecID> = (0..17).map(|_| CodecMsgpackCompact).collect();
+        assert!(matches!(validate_codec_list(&codecs), Err(Error::TooManyCodecs(_))));
+    }
+
+    #[test]
+    fn negotiate_max_frame_picks_min() {
+        assert_eq!(negotiate_max_frame(1024, 2048), 1024);
+        assert_eq!(negotiate_max_frame(2048, 1024), 1024);
+        assert_eq!(negotiate_max_frame(0, 1024), 0);
+    }
+}

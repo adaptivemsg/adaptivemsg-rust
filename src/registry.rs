@@ -156,3 +156,28 @@ where
         Ok(Box::new(msg))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_inventory_includes_builtins() {
+        let reg = Registry::from_inventory();
+        assert!(reg.message("am.message.OkReply").is_some());
+        assert!(reg.message("am.message.ErrorReply").is_some());
+    }
+
+    #[test]
+    fn has_handlers_false_for_empty() {
+        let reg = Registry::new();
+        assert!(!reg.has_handlers());
+    }
+
+    #[test]
+    fn unknown_wire_returns_none() {
+        let reg = Registry::from_inventory();
+        assert!(reg.message("nonexistent.Type").is_none());
+        assert!(reg.handler("nonexistent.Type").is_none());
+    }
+}

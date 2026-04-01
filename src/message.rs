@@ -3,8 +3,8 @@ use std::any::Any;
 use async_trait::async_trait;
 use rmpv::Value;
 
-use crate::error::{Error, Result};
 use crate::context::StreamContext;
+use crate::error::{Error, Result};
 
 /// Application message that can be encoded and decoded by codecs.
 ///
@@ -95,8 +95,32 @@ pub trait MessageHandler: Message {
     /// Handled messages must be sent using `send_recv()`. `Ok(Some(msg))` sends
     /// `msg`, `Ok(None)` sends `OkReply`, and `Err(e)` sends `ErrorReply`.
     /// Use `adaptivemsg::Result` (anyhow) for application errors.
-    async fn handle(
-        self: Box<Self>,
-        stream_ctx: StreamContext,
-    ) -> Result<Option<Box<dyn Message>>>;
+    async fn handle(self: Box<Self>, stream_ctx: StreamContext)
+        -> Result<Option<Box<dyn Message>>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ok_reply_wire_name() {
+        let msg = OkReply {};
+        assert_eq!(msg.wire_name(), OkReply::wire_name_static());
+        assert!(!msg.wire_name().is_empty());
+    }
+
+    #[test]
+    fn error_reply_wire_name() {
+        let msg = ErrorReply::new("test", "fail");
+        assert_eq!(msg.wire_name(), ErrorReply::wire_name_static());
+        assert!(!msg.wire_name().is_empty());
+    }
+
+    #[test]
+    fn error_reply_fields() {
+        let msg = ErrorReply::new("codec_error", "bad data");
+        assert_eq!(msg.code(), "codec_error");
+        assert_eq!(msg.message(), "bad data");
+    }
 }

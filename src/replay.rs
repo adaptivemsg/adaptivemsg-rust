@@ -137,6 +137,7 @@ fn replay_entry_size(version: u8, payload_len: usize) -> Result<i64, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::PROTOCOL_VERSION_V3;
 
     #[test]
     fn replay_ack_drops_acked_frames() {
@@ -155,5 +156,51 @@ mod tests {
         let snapshot = buffer.snapshot_from(0);
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].seq, 2);
+    }
+
+    #[test]
+    fn add_and_snapshot() {
+        let buf = ReplayBuffer::new(PROTOCOL_VERSION_V3, 1_000_000);
+        buf.add(0, 1, vec![1, 2, 3]).unwrap();
+        buf.add(0, 2, vec![4, 5]).unwrap();
+        buf.add(0, 3, vec![6]).unwrap();
+        assert_eq!(buf.queued_count(), 3);
+        assert!(buf.used_bytes() > 0);
+
+        let snap = buf.snapshot_from(0);
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].seq, 1);
+        assert_eq!(snap[2].seq, 3);
+
+        let snap2 = buf.snapshot_from(2);
+        assert_eq!(snap2.len(), 1);
+        assert_eq!(snap2[0].seq, 3);
+    }
+
+    #[test]
+    fn byte_limit_rejects_overflow() {
+        let buf = ReplayBuffer::new(PROTOCOL_VERSION_V3, 30);
+        buf.add(0, 1, vec![0; 10]).unwrap();
+        let result = buf.add(0, 2, vec![0; 100]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ack_frees_bytes() {
+        let buf = ReplayBuffer::new(PROTOCOL_VERSION_V3, 1_000_000);
+        buf.add(0, 1, vec![0; 100]).unwrap();
+        buf.add(0, 2, vec![0; 100]).unwrap();
+        let bytes_before = buf.used_bytes();
+        buf.ack(1);
+        assert!(buf.used_bytes() < bytes_before);
+        assert_eq!(buf.queued_count(), 1);
+        assert_eq!(buf.last_acked_seq(), 1);
+    }
+
+    #[test]
+    fn snapshot_from_empty() {
+        let buf = ReplayBuffer::new(PROTOCOL_VERSION_V3, 1_000_000);
+        let snap = buf.snapshot_from(0);
+        assert!(snap.is_empty());
     }
 }

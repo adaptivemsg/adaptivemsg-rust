@@ -394,3 +394,118 @@ impl StreamDebugCounters {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_codes_are_nonempty() {
+        let codes = [
+            FAILURE_STREAM_RECV_TIMEOUT,
+            FAILURE_STREAM_ENCODE,
+            FAILURE_STREAM_ENQUEUE,
+            FAILURE_STREAM_DECODE,
+            FAILURE_STREAM_PROTOCOL,
+            FAILURE_STREAM_PROTOCOL_REPLY_SEND,
+            FAILURE_CONNECTION_READER,
+            FAILURE_CONNECTION_WRITER,
+            FAILURE_CONNECTION_READER_ENQUEUE,
+            FAILURE_HANDLER_ERROR,
+            FAILURE_RECOVERY_RESUME,
+            FAILURE_RECOVERY_RECONNECT_TERMINAL,
+            FAILURE_RECOVERY_READ,
+            FAILURE_RECOVERY_CONTROL,
+            FAILURE_RECOVERY_DATA,
+            FAILURE_RECOVERY_ACK_WRITE,
+            FAILURE_RECOVERY_RESUME_WRITE,
+            FAILURE_RECOVERY_LIVE_WRITE,
+            FAILURE_RECOVERY_PING_WRITE,
+        ];
+        for code in &codes {
+            assert!(!code.is_empty(), "failure code should not be empty");
+            assert!(
+                code.contains('.'),
+                "failure code {code} should contain a dot separator"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_counters_start_at_zero() {
+        let c = ConnectionDebugCounters::new();
+        let snap = c.snapshot();
+        assert_eq!(snap.streams_opened, 0);
+        assert_eq!(snap.data_messages_sent, 0);
+        assert_eq!(snap.frames_written, 0);
+        assert_eq!(snap.bytes_read, 0);
+        assert_eq!(snap.handler_calls, 0);
+        assert_eq!(snap.reconnect_attempts, 0);
+    }
+
+    #[test]
+    fn stream_counters_start_at_zero() {
+        let c = StreamDebugCounters::new();
+        let snap = c.snapshot();
+        assert_eq!(snap.data_messages_sent, 0);
+        assert_eq!(snap.data_messages_received, 0);
+        assert_eq!(snap.protocol_errors, 0);
+        assert_eq!(snap.handler_calls, 0);
+    }
+
+    #[test]
+    fn note_failure_records_code_and_reason() {
+        let c = ConnectionDebugCounters::new();
+        c.note_failure(FAILURE_STREAM_DECODE, "bad data".to_string());
+        let (code, reason, at) = c.last_failure();
+        assert_eq!(code, FAILURE_STREAM_DECODE);
+        assert_eq!(reason, "bad data");
+        assert!(at.is_some());
+    }
+
+    #[test]
+    fn stream_failure_promotes_to_connection() {
+        let stream = StreamDebugCounters::new();
+        let conn = ConnectionDebugCounters::new();
+        stream.note_failure(FAILURE_STREAM_ENCODE, "encode failed".to_string());
+        stream.promote_failure_to(&conn);
+        let (code, reason, _) = conn.last_failure();
+        assert_eq!(code, FAILURE_STREAM_ENCODE);
+        assert_eq!(reason, "encode failed");
+    }
+
+    #[test]
+    fn connection_build_state_populates_fields() {
+        let c = ConnectionDebugCounters::new();
+        let state = c.build_state(
+            false,
+            2,
+            1,
+            "compact".to_string(),
+            65535,
+            3,
+            0,
+            vec![],
+            None,
+        );
+        assert!(!state.closed);
+        assert_eq!(state.protocol, 2);
+        assert_eq!(state.codec_id, 1);
+        assert_eq!(state.codec_name, "compact");
+        assert_eq!(state.max_frame, 65535);
+        assert_eq!(state.stream_count, 3);
+        assert!(state.recovery.is_none());
+    }
+
+    #[test]
+    fn stream_build_state_populates_fields() {
+        let c = StreamDebugCounters::new();
+        let state = c.build_state(7, false, Duration::from_secs(5), 10, 20, 5);
+        assert_eq!(state.id, 7);
+        assert!(!state.closed);
+        assert_eq!(state.recv_timeout, Duration::from_secs(5));
+        assert_eq!(state.inbox_depth, 10);
+        assert_eq!(state.incoming_depth, 20);
+        assert_eq!(state.handler_q_depth, 5);
+    }
+}

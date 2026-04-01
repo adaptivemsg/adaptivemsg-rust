@@ -56,3 +56,22 @@ pub fn codec_by_id(id: CodecID) -> Option<Arc<dyn CodecImpl>> {
     let guard = registry().read().unwrap();
     guard.get(&id).cloned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec_msgpack::CodecMsgpackCompact;
+    use crate::codec_postcard::CodecPostcard;
+
+    #[test]
+    fn builtin_codecs_are_available() {
+        assert!(codec_by_id(CodecMsgpackCompact).is_some());
+        assert!(codec_by_id(crate::codec_msgpack::CodecMsgpackMap).is_some());
+        assert!(codec_by_id(CodecPostcard).is_some());
+    }
+
+    #[test]
+    fn unknown_codec_returns_none() {
+        assert!(codec_by_id(CodecID(200)).is_none());
+    }
+}

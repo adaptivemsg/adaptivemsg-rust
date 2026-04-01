@@ -54,3 +54,50 @@ fn abstract_uds(_name: &str) -> Result<PathBuf, Error> {
         "abstract UDS is only supported on linux",
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_uds_path_strips_prefix() {
+        let p = to_uds_path("uds:///tmp/test.sock").unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/test.sock"));
+
+        let p = to_uds_path("unix:///tmp/test.sock").unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/test.sock"));
+
+        let p = to_uds_path("/tmp/plain.sock").unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/plain.sock"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn abstract_socket_path() {
+        let p = to_uds_path("@myabstract").unwrap();
+        let bytes = p.as_os_str().as_encoded_bytes();
+        assert_eq!(bytes[0], 0);
+    }
+
+    #[tokio::test]
+    async fn listen_and_connect_filesystem() {
+        let dir = std::env::temp_dir().join(format!("am_test_{}", std::process::id()));
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_file(&sock_path);
+
+        let path_str = sock_path.to_str().unwrap().to_string();
+        let listener = listen(&path_str).await.unwrap();
+
+        let path_clone = path_str.clone();
+        let connect_handle = tokio::spawn(async move {
+            dial(&path_clone).await
+        });
+
+        let (_stream, _peer) = accept_stream(&listener).await.unwrap();
+        let _client = connect_handle.await.unwrap().unwrap();
+
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+}
