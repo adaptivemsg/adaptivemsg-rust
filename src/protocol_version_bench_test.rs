@@ -104,17 +104,27 @@ async fn run_protocol_send_recv_perf_case_with_codec(
         .expect("warmup send_recv");
     assert_eq!(warmup.text, "warmup");
 
-    let start = Instant::now();
-    for _ in 0..iterations {
-        let reply: BenchEchoReply = conn
-            .send_recv(BenchEchoRequest {
-                text: "x".to_string(),
-            })
-            .await
-            .expect("bench send_recv");
-        assert_eq!(reply.text, "x");
-    }
-    let elapsed = start.elapsed();
+    // Run the hot loop in a spawned task so it runs on a tokio worker thread.
+    // The #[tokio::test] main task has higher scheduling overhead (~2.5x) because
+    // it runs outside the normal work-stealing pool. Using tokio::spawn ensures
+    // the same runtime characteristics as the scaling benchmark and real-world
+    // server workloads.
+    let stream = conn.new_stream();
+    stream.set_recv_timeout(Duration::from_secs(2));
+    let handle = tokio::spawn(async move {
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let reply: BenchEchoReply = stream
+                .send_recv(BenchEchoRequest {
+                    text: "x".to_string(),
+                })
+                .await
+                .expect("bench send_recv");
+            assert_eq!(reply.text, "x");
+        }
+        start.elapsed()
+    });
+    let elapsed = handle.await.unwrap();
     let ns_per_op = elapsed.as_nanos() as f64 / iterations as f64;
 
     conn.close();
@@ -153,26 +163,30 @@ async fn run_bench_median(name: &str, recovery: bool, codecs: Option<Vec<crate::
     println!("{name}\t{median:.2} ns/op  (median of {runs} runs x {iterations} ops)");
 }
 
-#[tokio::test]
+// All protocol benchmarks use multi_thread to match Go's default multi-goroutine
+// runtime. Using current_thread would serialize the server and client onto one OS
+// thread, doubling measured latency and making the numbers incomparable with Go.
+
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "manual benchmark test; run with -- --ignored --nocapture"]
 async fn benchmark_protocol_v2_send_recv() {
     run_bench_median("BenchmarkProtocolV2SendRecv", false, None).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "manual benchmark test; run with -- --ignored --nocapture"]
 async fn benchmark_protocol_v3_recovery_send_recv() {
     run_bench_median("BenchmarkProtocolV3RecoverySendRecv", true, None).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "manual benchmark test; run with -- --ignored --nocapture"]
 async fn benchmark_protocol_v2_send_recv_msgpack() {
     let codecs = vec![crate::codec_msgpack::CodecMsgpackCompact];
     run_bench_median("BenchmarkProtocolV2SendRecv_Msgpack", false, Some(codecs)).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "manual benchmark test; run with -- --ignored --nocapture"]
 async fn benchmark_protocol_v3_recovery_send_recv_msgpack() {
     let codecs = vec![crate::codec_msgpack::CodecMsgpackCompact];

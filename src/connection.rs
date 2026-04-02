@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{debug, warn};
 
@@ -63,7 +63,17 @@ pub struct ConnConfig {
 }
 
 type InboundFrame = (u32, u64, Vec<u8>);
-type OutboundFrame = (u32, Vec<u8>);
+pub(crate) enum OutboundFrame {
+    Plain {
+        stream_id: u32,
+        payload: Vec<u8>,
+    },
+    Recovery {
+        stream_id: u32,
+        payload: Vec<u8>,
+        queued_tx: oneshot::Sender<Result<(), Error>>,
+    },
+}
 pub(crate) type HandlerJob = (Arc<dyn Handler>, RawMessage);
 
 enum WriterCommand {
@@ -448,9 +458,7 @@ impl ConnectionInner {
         writer_cmd_rx: mpsc::UnboundedReceiver<WriterCommand>,
     ) -> Connection {
         let writer_task = if self.is_recovery_enabled() {
-            let live_rx = self.recovery().unwrap().take_live_rx()
-                .expect("live_rx already taken");
-            self.spawn_recovery_writer(writer_cmd_rx, live_rx)
+            self.spawn_recovery_writer(writer_cmd_rx, outbound_rx)
         } else {
             self.spawn_plain_writer(writer_cmd_rx, outbound_rx)
         };
@@ -602,13 +610,24 @@ impl ConnectionInner {
     }
 
     pub(crate) async fn enqueue_frame(&self, frame: OutboundFrame) -> Result<(), Error> {
-        if let Some(recovery) = self.recovery() {
-            let seq = self.next_outbound_seq();
-            let stored = recovery.replay.add(frame.0, seq, frame.1)?;
-            recovery.enqueue_live(stored);
+        if self.recovery().is_some() {
+            let (stream_id, payload) = match frame {
+                OutboundFrame::Plain { stream_id, payload } => (stream_id, payload),
+                OutboundFrame::Recovery {
+                    stream_id, payload, ..
+                } => (stream_id, payload),
+            };
+            let (queued_tx, queued_rx) = oneshot::channel();
+            self.outbound_tx
+                .send(OutboundFrame::Recovery {
+                    stream_id,
+                    payload,
+                    queued_tx,
+                })
+                .await
+                .map_err(|_| Error::Closed)?;
             self.signal_send();
-            self.debug.data_messages_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(());
+            return Ok(queued_rx.await.map_err(|_| Error::Closed)??);
         }
         self.outbound_tx
             .send(frame)
@@ -656,7 +675,24 @@ impl ConnectionInner {
                         None => return,
                     },
                     maybe_frame = outbound_rx.recv(), if writer.is_some() => match maybe_frame {
-                        Some((stream_id, payload)) => {
+                        Some(OutboundFrame::Plain { stream_id, payload }) => {
+                            let result = {
+                                let writer_ref = writer.as_mut().expect("writer missing");
+                                write_frame(connection.config(), writer_ref, stream_id, 0, &payload).await
+                            };
+                            if result.is_ok() {
+                                connection.debug.frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                connection.debug.bytes_written.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if let Err(err) = result {
+                                connection.debug.note_failure(crate::debug::FAILURE_CONNECTION_WRITER, err.to_string());
+                                warn!("write failed: {err}");
+                                connection.mark_closed();
+                                return;
+                            }
+                        }
+                        Some(OutboundFrame::Recovery { stream_id, payload, queued_tx }) => {
+                            let _ = queued_tx.send(Ok(()));
                             let result = {
                                 let writer_ref = writer.as_mut().expect("writer missing");
                                 write_frame(connection.config(), writer_ref, stream_id, 0, &payload).await

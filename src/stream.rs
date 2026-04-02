@@ -178,7 +178,10 @@ impl StreamInner {
 
     pub(crate) async fn send_boxed(&self, msg: Box<dyn Message>) -> Result<(), Error> {
         let payload = self.connection.encode_message(msg.as_ref())?;
-        let frame = (self.id, payload);
+        let frame = crate::connection::OutboundFrame::Plain {
+            stream_id: self.id,
+            payload,
+        };
         self.connection.enqueue_frame(frame).await?;
         self.debug.data_messages_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())

@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
 use tokio::sync::Notify;
 
 use crate::connection::Connection;
@@ -71,8 +70,6 @@ pub(crate) struct RecoveryState {
     pub connection_id: RecoveryToken,
     pub resume_secret: RecoveryToken,
     pub replay: Arc<ReplayBuffer>,
-    pub live_tx: mpsc::UnboundedSender<Arc<crate::replay::FrameRecord>>,
-    live_rx: Mutex<Option<mpsc::UnboundedReceiver<Arc<crate::replay::FrameRecord>>>>,
     pub resume_queue: Arc<FrameDeque>,
     pub reconnect_min_backoff: Duration,
     pub reconnect_max_backoff: Duration,
@@ -210,7 +207,6 @@ impl RecoveryState {
     ) -> Arc<Self> {
         let normalized = opts.normalized();
         let neg = negotiated.normalized();
-        let (live_tx, live_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             role: RecoveryRole::Client,
             connection_id,
@@ -219,8 +215,6 @@ impl RecoveryState {
                 crate::protocol::PROTOCOL_VERSION_V3,
                 normalized.max_replay_bytes,
             )),
-            live_tx,
-            live_rx: Mutex::new(Some(live_rx)),
             resume_queue: Arc::new(FrameDeque::new()),
             reconnect_min_backoff: normalized.reconnect_min_backoff,
             reconnect_max_backoff: normalized.reconnect_max_backoff,
@@ -255,7 +249,6 @@ impl RecoveryState {
     ) -> Arc<Self> {
         let normalized = opts.normalized();
         let negotiated = normalized.negotiated();
-        let (live_tx, live_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             role: RecoveryRole::Server,
             connection_id,
@@ -264,8 +257,6 @@ impl RecoveryState {
                 crate::protocol::PROTOCOL_VERSION_V3,
                 normalized.max_replay_bytes,
             )),
-            live_tx,
-            live_rx: Mutex::new(Some(live_rx)),
             resume_queue: Arc::new(FrameDeque::new()),
             reconnect_min_backoff: Duration::ZERO,
             reconnect_max_backoff: Duration::ZERO,
@@ -326,10 +317,6 @@ impl RecoveryState {
         );
     }
 
-    pub(crate) fn enqueue_live(&self, frame: Arc<crate::replay::FrameRecord>) {
-        let _ = self.live_tx.send(frame);
-    }
-
     pub(crate) fn prepare_resume(&self, last_seq: u64) {
         let frames = self.replay.snapshot_from(last_seq);
         let has_frames = !frames.is_empty();
@@ -343,12 +330,6 @@ impl RecoveryState {
             self.resume_active.store(false, Ordering::Release);
         }
         frame
-    }
-
-    pub(crate) fn take_live_rx(
-        &self,
-    ) -> Option<mpsc::UnboundedReceiver<Arc<crate::replay::FrameRecord>>> {
-        self.live_rx.lock().unwrap().take()
     }
 
     pub(crate) fn note_received(&self, seq: u64) -> bool {

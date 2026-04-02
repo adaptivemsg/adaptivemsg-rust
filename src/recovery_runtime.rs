@@ -15,7 +15,7 @@ use crate::recovery_protocol::{
 
 use super::{
     read_frame, write_frame, write_frame_no_flush, Connection, ConnectionInner, InboundFrame,
-    TransportParts, TransportReader, TransportWriter, WriterCommand,
+    OutboundFrame, TransportParts, TransportReader, TransportWriter, WriterCommand,
 };
 use std::sync::Arc;
 use crate::replay::FrameRecord;
@@ -57,7 +57,7 @@ impl ConnectionInner {
     pub(super) fn spawn_recovery_writer(
         self: &Connection,
         mut writer_cmd_rx: mpsc::UnboundedReceiver<WriterCommand>,
-        mut live_rx: mpsc::UnboundedReceiver<Arc<FrameRecord>>,
+        mut outbound_rx: mpsc::Receiver<OutboundFrame>,
     ) -> JoinHandle<()> {
         let connection = self.clone();
         tokio::spawn(async move {
@@ -68,6 +68,32 @@ impl ConnectionInner {
             let mut writer: Option<TransportWriter> = None;
             let mut current_gen = 0;
             let mut last_sent_seq = 0;
+
+            let stage_live = |frame: OutboundFrame| -> Option<Arc<FrameRecord>> {
+                match frame {
+                    OutboundFrame::Plain { stream_id, payload } => {
+                        let seq = connection.next_outbound_seq();
+                        recovery.replay.add(stream_id, seq, payload).ok()
+                    }
+                    OutboundFrame::Recovery {
+                        stream_id,
+                        payload,
+                        queued_tx,
+                    } => {
+                        let seq = connection.next_outbound_seq();
+                        match recovery.replay.add(stream_id, seq, payload) {
+                            Ok(record) => {
+                                let _ = queued_tx.send(Ok(()));
+                                Some(record)
+                            }
+                            Err(err) => {
+                                let _ = queued_tx.send(Err(err));
+                                None
+                            }
+                        }
+                    }
+                }
+            };
 
             // Write a live frame; returns true if writer was lost.
             macro_rules! write_live {
@@ -109,8 +135,12 @@ impl ConnectionInner {
                             Some(WriterCommand::Detach { .. }) => {}
                             None => return,
                         },
-                        // Drain live frames while detached (they'll be replayed on resume)
-                        _ = live_rx.recv() => {}
+                        maybe_frame = outbound_rx.recv() => match maybe_frame {
+                            Some(frame) => {
+                                let _ = stage_live(frame);
+                            }
+                            None => return,
+                        }
                     }
                     continue;
                 }
@@ -155,28 +185,30 @@ impl ConnectionInner {
                         continue;
                     }
                     connection.debug.control_frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // Batch: also write any pending live frame before flushing
-                    if let Ok(frame) = live_rx.try_recv() {
-                        if frame.seq > last_sent_seq {
-                            let writer_ref = writer.as_mut().expect("writer missing");
-                            let result = write_frame_no_flush(
-                                connection.config(),
-                                writer_ref,
-                                frame.stream_id,
-                                frame.seq,
-                                &frame.payload,
-                            )
-                            .await;
-                            if let Err(err) = result {
-                                connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_LIVE_WRITE, err.to_string());
-                                warn!("recovery live write failed: {err}");
-                                connection.detach_transport(current_gen, true);
-                                writer = None;
-                                continue;
+                    // Batch: also write one pending live frame before flushing.
+                    if let Ok(frame) = outbound_rx.try_recv() {
+                        if let Some(frame) = stage_live(frame) {
+                            if frame.seq > last_sent_seq {
+                                let writer_ref = writer.as_mut().expect("writer missing");
+                                let result = write_frame_no_flush(
+                                    connection.config(),
+                                    writer_ref,
+                                    frame.stream_id,
+                                    frame.seq,
+                                    &frame.payload,
+                                )
+                                .await;
+                                if let Err(err) = result {
+                                    connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_LIVE_WRITE, err.to_string());
+                                    warn!("recovery live write failed: {err}");
+                                    connection.detach_transport(current_gen, true);
+                                    writer = None;
+                                    continue;
+                                }
+                                connection.debug.frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                connection.debug.bytes_written.fetch_add(frame.payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                                last_sent_seq = frame.seq;
                             }
-                            connection.debug.frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            connection.debug.bytes_written.fetch_add(frame.payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                            last_sent_seq = frame.seq;
                         }
                     }
                     // Single flush for ACK + optional data
@@ -222,8 +254,10 @@ impl ConnectionInner {
                     }
                 }
 
-                if let Ok(frame) = live_rx.try_recv() {
-                    write_live!(frame);
+                if let Ok(frame) = outbound_rx.try_recv() {
+                    if let Some(frame) = stage_live(frame) {
+                        write_live!(frame);
+                    }
                     continue;
                 }
 
@@ -245,7 +279,11 @@ impl ConnectionInner {
                             Some(WriterCommand::Detach { gen }) if gen == current_gen => writer = None,
                             _ => {}
                         },
-                        Some(frame) = live_rx.recv() => { write_live!(frame); },
+                        Some(frame) = outbound_rx.recv() => {
+                            if let Some(frame) = stage_live(frame) {
+                                write_live!(frame);
+                            }
+                        },
                     }
                     continue;
                 }
@@ -265,7 +303,11 @@ impl ConnectionInner {
                         Some(WriterCommand::Detach { gen }) if gen == current_gen => writer = None,
                         _ => {}
                     },
-                    Some(frame) = live_rx.recv() => { write_live!(frame); },
+                    Some(frame) = outbound_rx.recv() => {
+                        if let Some(frame) = stage_live(frame) {
+                            write_live!(frame);
+                        }
+                    },
                     _ = &mut sleep => {
                         if heartbeat_tick {
                             let payload = build_ping_control_payload();

@@ -38,6 +38,8 @@ mod protocol_version_bench_test;
 mod recovery_integration_test;
 #[cfg(test)]
 mod recovery_runtime_bench_test;
+#[cfg(test)]
+mod scaling_bench_test;
 
 pub use crate::client::Client;
 pub use crate::codec::{CodecID, CodecImpl};
@@ -48,7 +50,9 @@ pub use crate::codec_registry::{
 };
 pub use crate::connection::{Connection, Netconn};
 pub use crate::context::{Context, StreamContext};
-pub use crate::debug::{ConnectionDebugState, StreamDebugState, RecoveryDebugState, ConnectionCounters, StreamCounters};
+pub use crate::debug::{
+    ConnectionCounters, ConnectionDebugState, RecoveryDebugState, StreamCounters, StreamDebugState,
+};
 pub use crate::error::{Error, Result};
 pub use crate::message::{ErrorReply, Message, MessageHandler, OkReply};
 pub use crate::recovery::{ClientRecoveryOptions, ServerRecoveryOptions};
