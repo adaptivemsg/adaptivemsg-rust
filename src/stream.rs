@@ -194,10 +194,10 @@ impl StreamInner {
     pub(crate) async fn handler_q(
         &self,
         handler: Arc<dyn crate::registry::Handler>,
-        raw: RawMessage,
+        msg: Box<dyn crate::message::Message>,
     ) -> Result<(), Error> {
         match self.handler_tx.as_ref() {
-            Some(tx) => tx.send((handler, raw)).await.map_err(|_| Error::Closed),
+            Some(tx) => tx.send((handler, msg)).await.map_err(|_| Error::Closed),
             None => Err(Error::Closed),
         }
     }
