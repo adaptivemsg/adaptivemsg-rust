@@ -74,7 +74,7 @@ pub(crate) enum OutboundFrame {
         queued_tx: oneshot::Sender<Result<(), Error>>,
     },
 }
-pub(crate) type HandlerJob = (Arc<dyn Handler>, RawMessage);
+pub(crate) type HandlerJob = (Arc<dyn Handler>, Box<dyn crate::message::Message>);
 
 enum WriterCommand {
     Attach {
@@ -537,7 +537,7 @@ impl ConnectionInner {
         let stream = Arc::clone(&stream_ctx.stream);
         tokio::spawn(async move {
             loop {
-                let (handler, raw) = match stream.recv_handler_job().await {
+                let (handler, msg) = match stream.recv_handler_job().await {
                     Ok(job) => {
                         stream.debug.handler_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         job
@@ -546,18 +546,6 @@ impl ConnectionInner {
                     Err(err) => {
                         warn!("handler recv error: {err}");
                         break;
-                    }
-                };
-                let msg = match crate::raw_message::decode_raw_with_registry(
-                    raw,
-                    &stream.connection.registry,
-                ) {
-                    Ok(msg) => msg,
-                    Err(err) => {
-                        stream.debug.decode_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        warn!("handler decode error: {err}");
-                        stream.protocol_error("codec_error", err.to_string()).await;
-                        continue;
                     }
                 };
                 match handler.handle(msg, Arc::clone(&stream_ctx)).await {
@@ -586,7 +574,16 @@ impl ConnectionInner {
 
     async fn dispatch_raw(&self, stream: &Stream, raw: RawMessage) {
         if let Some(handler) = self.registry.handler(&raw.wire) {
-            let _ = stream.handler_q(handler, raw).await;
+            match crate::raw_message::decode_raw_with_registry(raw, &self.registry) {
+                Ok(msg) => {
+                    let _ = stream.handler_q(handler, msg).await;
+                }
+                Err(err) => {
+                    stream.debug.decode_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!("handler decode error: {err}");
+                    let _ = stream.protocol_error("codec_error", err.to_string()).await;
+                }
+            }
         } else {
             let _ = stream.inbox_q(raw).await;
         }
@@ -675,35 +672,28 @@ impl ConnectionInner {
                         None => return,
                     },
                     maybe_frame = outbound_rx.recv(), if writer.is_some() => match maybe_frame {
-                        Some(OutboundFrame::Plain { stream_id, payload }) => {
-                            let result = {
-                                let writer_ref = writer.as_mut().expect("writer missing");
-                                write_frame(connection.config(), writer_ref, stream_id, 0, &payload).await
-                            };
-                            if result.is_ok() {
-                                connection.debug.frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                connection.debug.bytes_written.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            if let Err(err) = result {
+                        Some(frame) => {
+                            let writer_ref = writer.as_mut().expect("writer missing");
+                            // Write first frame without flushing.
+                            if let Err(err) = Self::write_plain_frame_no_flush(&connection, writer_ref, frame).await {
                                 connection.debug.note_failure(crate::debug::FAILURE_CONNECTION_WRITER, err.to_string());
                                 warn!("write failed: {err}");
                                 connection.mark_closed();
                                 return;
                             }
-                        }
-                        Some(OutboundFrame::Recovery { stream_id, payload, queued_tx }) => {
-                            let _ = queued_tx.send(Ok(()));
-                            let result = {
-                                let writer_ref = writer.as_mut().expect("writer missing");
-                                write_frame(connection.config(), writer_ref, stream_id, 0, &payload).await
-                            };
-                            if result.is_ok() {
-                                connection.debug.frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                connection.debug.bytes_written.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                            // Drain any queued frames without blocking.
+                            while let Ok(frame) = outbound_rx.try_recv() {
+                                if let Err(err) = Self::write_plain_frame_no_flush(&connection, writer_ref, frame).await {
+                                    connection.debug.note_failure(crate::debug::FAILURE_CONNECTION_WRITER, err.to_string());
+                                    warn!("write failed: {err}");
+                                    connection.mark_closed();
+                                    return;
+                                }
                             }
-                            if let Err(err) = result {
+                            // Flush once for the entire batch.
+                            if let Err(err) = writer_ref.flush().await {
                                 connection.debug.note_failure(crate::debug::FAILURE_CONNECTION_WRITER, err.to_string());
-                                warn!("write failed: {err}");
+                                warn!("flush failed: {err}");
                                 connection.mark_closed();
                                 return;
                             }
@@ -713,6 +703,24 @@ impl ConnectionInner {
                 }
             }
         })
+    }
+
+    async fn write_plain_frame_no_flush(
+        connection: &Connection,
+        writer: &mut TransportWriter,
+        frame: OutboundFrame,
+    ) -> Result<(), Error> {
+        let (stream_id, payload) = match frame {
+            OutboundFrame::Plain { stream_id, payload } => (stream_id, payload),
+            OutboundFrame::Recovery { stream_id, payload, queued_tx } => {
+                let _ = queued_tx.send(Ok(()));
+                (stream_id, payload)
+            }
+        };
+        write_frame_no_flush(connection.config(), writer, stream_id, 0, &payload).await?;
+        connection.debug.frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        connection.debug.bytes_written.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     fn spawn_plain_reader(
