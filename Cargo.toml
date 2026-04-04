@@ -22,7 +22,7 @@ thiserror = "1.0"
 inventory = "0.3"
 async-trait = "0.1"
 anyhow = "1.0"
-adaptivemsg-macros = { path = "../adaptivemsg-macros" }
+adaptivemsg-macros = { path = "macros" }
 
 quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23", optional = true }
@@ -30,6 +30,7 @@ rand = "0.8"
 
 [workspace]
 members = [
+    "macros",
     "cmd/amgen",
     "examples/hello/server",
     "examples/hello/client",
