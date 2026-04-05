@@ -356,7 +356,12 @@ impl ConnectionInner {
     pub fn debug_state(&self) -> ConnectionDebugState {
         let config = self.config.get();
         let (protocol, codec_id, codec_name, max_frame) = match config {
-            Some(c) => (c.version, c.codec_id.0, c.codec_id.name().to_string(), c.max_frame),
+            Some(c) => (
+                c.version,
+                c.codec_id.0,
+                c.codec_id.name().to_string(),
+                c.max_frame,
+            ),
             None => (0, 0, String::new(), 0),
         };
         let streams_map = self.stream_contexts.lock().unwrap();
@@ -413,7 +418,9 @@ impl ConnectionInner {
             // Promote stream failure to connection so it survives stream removal.
             ctx.stream.debug.promote_failure_to(&self.debug);
             ctx.stream.close_channels();
-            self.debug.streams_closed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.debug
+                .streams_closed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         stream_ctx
     }
@@ -497,7 +504,9 @@ impl ConnectionInner {
         if stream_id == DEFAULT_STREAM_ID {
             let _ = self.default_stream.set(Arc::clone(&stream_ctx));
         }
-        self.debug.streams_opened.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.debug
+            .streams_opened
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.spawn_handler_task(Arc::clone(&stream_ctx));
         let _ = tokio::spawn({
             let stream = stream.clone();
@@ -512,12 +521,20 @@ impl ConnectionInner {
                     };
                     let raw = match stream.connection.decode_envelope(&payload) {
                         Ok(raw) => {
-                            stream.debug.data_messages_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            stream
+                                .debug
+                                .data_messages_received
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             raw
                         }
                         Err(err) => {
-                            stream.debug.decode_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            stream.debug.note_failure(crate::debug::FAILURE_STREAM_DECODE, err.to_string());
+                            stream
+                                .debug
+                                .decode_errors
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            stream
+                                .debug
+                                .note_failure(crate::debug::FAILURE_STREAM_DECODE, err.to_string());
                             warn!("decode failed: {err}");
                             stream.protocol_error("codec_error", err.to_string()).await;
                             break;
@@ -539,7 +556,10 @@ impl ConnectionInner {
             loop {
                 let (handler, msg) = match stream.recv_handler_job().await {
                     Ok(job) => {
-                        stream.debug.handler_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        stream
+                            .debug
+                            .handler_calls
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         job
                     }
                     Err(Error::Closed) => break,
@@ -558,7 +578,10 @@ impl ConnectionInner {
                             .await;
                     }
                     Err(err) => {
-                        stream.debug.handler_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        stream
+                            .debug
+                            .handler_errors
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!("handler error: {err}");
                         let _ = stream
                             .send_boxed(Box::new(crate::message::ErrorReply::new(
@@ -579,7 +602,10 @@ impl ConnectionInner {
                     let _ = stream.handler_q(handler, msg).await;
                 }
                 Err(err) => {
-                    stream.debug.decode_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    stream
+                        .debug
+                        .decode_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     warn!("handler decode error: {err}");
                     let _ = stream.protocol_error("codec_error", err.to_string()).await;
                 }
@@ -630,7 +656,9 @@ impl ConnectionInner {
             .send(frame)
             .await
             .map_err(|_| Error::Closed)?;
-        self.debug.data_messages_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.debug
+            .data_messages_sent
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -712,14 +740,24 @@ impl ConnectionInner {
     ) -> Result<(), Error> {
         let (stream_id, payload) = match frame {
             OutboundFrame::Plain { stream_id, payload } => (stream_id, payload),
-            OutboundFrame::Recovery { stream_id, payload, queued_tx } => {
+            OutboundFrame::Recovery {
+                stream_id,
+                payload,
+                queued_tx,
+            } => {
                 let _ = queued_tx.send(Ok(()));
                 (stream_id, payload)
             }
         };
         write_frame_no_flush(connection.config(), writer, stream_id, 0, &payload).await?;
-        connection.debug.frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        connection.debug.bytes_written.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        connection
+            .debug
+            .frames_written
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        connection
+            .debug
+            .bytes_written
+            .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -733,13 +771,21 @@ impl ConnectionInner {
             loop {
                 match read_frame(connection.config(), &mut reader).await {
                     Ok((stream_id, _, payload)) => {
-                        connection.debug.frames_read.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        connection.debug.bytes_read.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        connection
+                            .debug
+                            .frames_read
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        connection
+                            .debug
+                            .bytes_read
+                            .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         let stream = connection.get_stream(stream_id);
                         let _ = stream.incoming_tx.send(payload).await;
                     }
                     Err(err) => {
-                        connection.debug.note_failure(crate::debug::FAILURE_CONNECTION_READER, err.to_string());
+                        connection
+                            .debug
+                            .note_failure(crate::debug::FAILURE_CONNECTION_READER, err.to_string());
                         debug!("read loop ended: {err}");
                         connection.detach_transport(gen, false);
                         connection.mark_closed();
