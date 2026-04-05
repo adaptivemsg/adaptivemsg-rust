@@ -2,7 +2,9 @@
 name = "adaptivemsg"
 version = "0.1.0"
 edition = "2021"
+description = "Adaptive message framework for Rust"
 license = "MIT"
+repository = "https://github.com/adaptivemsg/adaptivemsg-rust"
 
 [features]
 default = ["tcp", "uds"]
@@ -22,7 +24,7 @@ thiserror = "1.0"
 inventory = "0.3"
 async-trait = "0.1"
 anyhow = "1.0"
-adaptivemsg-macros = { path = "macros" }
+adaptivemsg-macros = { version = "0.1.0", path = "macros" }
 
 quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23", optional = true }

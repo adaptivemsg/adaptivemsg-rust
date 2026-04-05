@@ -2,6 +2,9 @@
 name = "adaptivemsg-amgen"
 version = "0.1.0"
 edition = "2021"
+description = "Go code generator for adaptivemsg message types"
+license = "MIT"
+repository = "https://github.com/adaptivemsg/adaptivemsg-rust"
 
 [[bin]]
 name = "amgen-rs"
