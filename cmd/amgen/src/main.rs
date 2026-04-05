@@ -85,7 +85,11 @@ fn print_usage() {
     println!("Usage: amgen-rs --in <message.rs>");
 }
 
-fn find_message_scope(file: &syn::File, input: &Path, output: &Path) -> Result<(String, Vec<Item>)> {
+fn find_message_scope(
+    file: &syn::File,
+    input: &Path,
+    output: &Path,
+) -> Result<(String, Vec<Item>)> {
     let mut modules: Vec<(String, Vec<Item>)> = Vec::new();
     for item in &file.items {
         if let Item::Mod(item_mod) = item {
@@ -151,7 +155,11 @@ fn module_name_from_lib(input: &Path) -> Result<Option<String>> {
             if !meta.path.is_ident("path") {
                 continue;
             }
-            let Expr::Lit(ExprLit { lit: Lit::Str(path_lit), .. }) = &meta.value else {
+            let Expr::Lit(ExprLit {
+                lit: Lit::Str(path_lit),
+                ..
+            }) = &meta.value
+            else {
                 continue;
             };
             let attr_path = PathBuf::from(path_lit.value());
@@ -193,6 +201,15 @@ fn repo_root_for_input(input: &Path) -> Option<PathBuf> {
 }
 
 fn default_go_module(go_mod: &Path) -> Result<String> {
+    // Respect existing go.mod module name.
+    if let Some(module) = parse_existing_go_mod(go_mod) {
+        return Ok(module);
+    }
+    // Try to derive from .git/config origin URL.
+    if let Some(module) = module_from_git_config(go_mod) {
+        return Ok(module);
+    }
+    // Fallback to directory name.
     if let Some(parent) = go_mod.parent() {
         if let Some(name) = parent.file_name().and_then(|name| name.to_str()) {
             if !name.is_empty() {
@@ -210,6 +227,49 @@ fn default_go_module(go_mod: &Path) -> Result<String> {
     bail!("cannot infer module name for go.mod")
 }
 
+/// Read an existing go.mod and return its module name.
+fn parse_existing_go_mod(go_mod: &Path) -> Option<String> {
+    let content = fs::read_to_string(go_mod).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(module) = trimmed.strip_prefix("module ") {
+            let module = module.trim();
+            if !module.is_empty() {
+                return Some(module.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Parse `[remote "origin"]` url from `.git/config` and convert to a Go module path.
+fn module_from_git_config(go_mod: &Path) -> Option<String> {
+    let root = go_mod.parent()?;
+    let config = fs::read_to_string(root.join(".git/config")).ok()?;
+    let mut in_origin = false;
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_origin = trimmed == r#"[remote "origin"]"#;
+            continue;
+        }
+        if in_origin {
+            if let Some(url) = trimmed.strip_prefix("url = ") {
+                let url = url.trim();
+                let module = url
+                    .strip_prefix("https://")
+                    .or_else(|| url.strip_prefix("http://"))
+                    .unwrap_or(url);
+                let module = module.strip_suffix(".git").unwrap_or(module);
+                if !module.is_empty() {
+                    return Some(module.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn collect_messages(
     module_name: &str,
     items: &[Item],
@@ -224,8 +284,12 @@ fn collect_messages(
             continue;
         };
         let attrs = parse_message_attr(attr)?;
-        let wire_name =
-            compute_wire_name(module_name, &item_struct.ident.to_string(), &attrs, force_wire_name);
+        let wire_name = compute_wire_name(
+            module_name,
+            &item_struct.ident.to_string(),
+            &attrs,
+            force_wire_name,
+        );
         let fields = parse_fields(&item_struct.fields)?;
         out.push(MessageDef {
             name: item_struct.ident.to_string(),
@@ -275,7 +339,8 @@ fn parse_message_attr(attr: &Attribute) -> Result<MessageAttr> {
         if meta.path.is_ident("register") {
             return Ok(());
         }
-        Err(meta.error("unsupported am::message attribute; use ns=\"...\", name=\"...\", or register"))
+        Err(meta
+            .error("unsupported am::message attribute; use ns=\"...\", name=\"...\", or register"))
     })?;
     Ok(out)
 }
@@ -517,7 +582,11 @@ fn two_generic_types(segment: &syn::PathSegment) -> Result<(Type, Type)> {
 }
 
 fn array_len(expr: &Expr) -> Result<String> {
-    let Expr::Lit(ExprLit { lit: Lit::Int(value), .. }) = expr else {
+    let Expr::Lit(ExprLit {
+        lit: Lit::Int(value),
+        ..
+    }) = expr
+    else {
         bail!("array length must be an integer literal")
     };
     Ok(value.base10_digits().to_string())
@@ -545,7 +614,10 @@ fn render_go(package_name: &str, messages: &[MessageDef]) -> String {
         push_line(&mut out, "}");
         if let Some(wire) = &msg.wire_name {
             push_line(&mut out, "");
-            push_line(&mut out, &format!("func (*{}) WireName() string {{", msg.name));
+            push_line(
+                &mut out,
+                &format!("func (*{}) WireName() string {{", msg.name),
+            );
             push_line(&mut out, &format!("\treturn {}", format_go_string(wire)));
             push_line(&mut out, "}");
         }
