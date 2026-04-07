@@ -21,6 +21,7 @@ mod error;
 mod frame;
 mod frame_queue;
 mod message;
+mod once;
 mod protocol;
 mod raw_message;
 mod recovery;
@@ -55,6 +56,7 @@ pub use crate::debug::{
 };
 pub use crate::error::{Error, Result};
 pub use crate::message::{ErrorReply, Message, MessageHandler, OkReply};
+pub use crate::once::{once, OnceConn};
 pub use crate::recovery::{ClientRecoveryOptions, ServerRecoveryOptions};
 pub use crate::registry::Registry;
 pub use crate::server::Server;
