@@ -17,6 +17,21 @@ use crate::registry::Registry;
 
 #[derive(Clone)]
 /// Client configuration for connecting to a server.
+///
+/// Uses a builder pattern to configure timeouts, codecs, and recovery before
+/// connecting.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use adaptivemsg::Client;
+/// use std::time::Duration;
+///
+/// let conn = Client::new()
+///     .with_timeout(Duration::from_secs(5))
+///     .connect("tcp://127.0.0.1:9000")
+///     .await?;
+/// ```
 pub struct Client {
     timeout: Option<Duration>,
     max_frame: u32,
@@ -86,7 +101,8 @@ impl Client {
             match result {
                 Ok(connection) => return Ok(connection),
                 Err(err) => {
-                    let fallback = matches!(err, Error::UnsupportedFrameVersion(PROTOCOL_VERSION_V2));
+                    let fallback =
+                        matches!(err, Error::UnsupportedFrameVersion(PROTOCOL_VERSION_V2));
                     last_err = Some(err);
                     if version == PROTOCOL_VERSION_V3 && fallback {
                         continue;
@@ -140,7 +156,10 @@ impl Client {
     }
 }
 
-async fn dial_pending(addr: &str, registry: Registry) -> Result<crate::connection::PendingConnection, Error> {
+async fn dial_pending(
+    addr: &str,
+    registry: Registry,
+) -> Result<crate::connection::PendingConnection, Error> {
     if let Some(stripped) = addr.strip_prefix("uds://") {
         return Ok(crate::connection::ConnectionInner::new_pending(
             crate::transport::uds::dial(stripped).await?,
@@ -176,16 +195,40 @@ async fn dial_pending(addr: &str, registry: Registry) -> Result<crate::connectio
 async fn dial_transport(addr: &str) -> Result<crate::connection::TransportParts, Error> {
     if let Some(stripped) = addr.strip_prefix("uds://") {
         let stream = crate::transport::uds::dial(stripped).await?;
-        return Ok(crate::connection::ConnectionInner::new_pending(stream, Registry::from_inventory(), None, None).into_transport_parts());
+        return Ok(crate::connection::ConnectionInner::new_pending(
+            stream,
+            Registry::from_inventory(),
+            None,
+            None,
+        )
+        .into_transport_parts());
     }
     if let Some(stripped) = addr.strip_prefix("unix://") {
         let stream = crate::transport::uds::dial(stripped).await?;
-        return Ok(crate::connection::ConnectionInner::new_pending(stream, Registry::from_inventory(), None, None).into_transport_parts());
+        return Ok(crate::connection::ConnectionInner::new_pending(
+            stream,
+            Registry::from_inventory(),
+            None,
+            None,
+        )
+        .into_transport_parts());
     }
     if let Some(stripped) = addr.strip_prefix("tcp://") {
         let stream = crate::transport::tcp::dial(stripped).await?;
-        return Ok(crate::connection::ConnectionInner::new_pending(stream, Registry::from_inventory(), None, None).into_transport_parts());
+        return Ok(crate::connection::ConnectionInner::new_pending(
+            stream,
+            Registry::from_inventory(),
+            None,
+            None,
+        )
+        .into_transport_parts());
     }
     let stream = crate::transport::tcp::dial(addr).await?;
-    Ok(crate::connection::ConnectionInner::new_pending(stream, Registry::from_inventory(), None, None).into_transport_parts())
+    Ok(crate::connection::ConnectionInner::new_pending(
+        stream,
+        Registry::from_inventory(),
+        None,
+        None,
+    )
+    .into_transport_parts())
 }

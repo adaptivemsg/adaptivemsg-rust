@@ -1,11 +1,60 @@
-//! Adaptive message protocol runtime.
+//! Wire protocol runtime for Rust/Go interop messaging.
 //!
-//! Define messages with `#[message]`, optionally attach handlers with
-//! `#[message_handler]`, then use `Server` to accept connections and `Client`
-//! to connect and exchange messages.
+//! `adaptivemsg` provides a framed, multiplexed, codec-negotiated message
+//! protocol that is wire-compatible with its Go counterpart. Define messages
+//! with [`#[message]`](macro@message), attach server-side handlers with
+//! [`#[message_handler]`](macro@message_handler), then use [`Server`] and
+//! [`Client`] to exchange them.
 //!
-//! Built-in codecs include `CodecMsgpackCompact`, `CodecMsgpackMap`, and
-//! `CodecPostcard`; register custom codecs with `RegisterCodec`.
+//! # Quick start
+//!
+//! ```rust,ignore
+//! use adaptivemsg::*;
+//! use std::time::Duration;
+//!
+//! #[message]
+//! struct Ping { value: u32 }
+//!
+//! #[message]
+//! struct Pong { value: u32 }
+//!
+//! #[message_handler]
+//! impl Ping {
+//!     async fn handle(self: Box<Self>, _ctx: StreamContext) -> Result<Option<Box<dyn Message>>> {
+//!         Ok(Some(Box::new(Pong { value: self.value })))
+//!     }
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     // Server
+//!     tokio::spawn(async { Server::new().serve("tcp://127.0.0.1:9000").await.unwrap() });
+//!
+//!     // Client
+//!     let conn = Client::new()
+//!         .with_timeout(Duration::from_secs(5))
+//!         .connect("tcp://127.0.0.1:9000")
+//!         .await
+//!         .unwrap();
+//!     let pong: Pong = conn.send_recv(Ping { value: 42 }).await.unwrap();
+//!     assert_eq!(pong.value, 42);
+//! }
+//! ```
+//!
+//! For one-shot request/reply without managing a connection, see [`once()`].
+//!
+//! # Codecs
+//!
+//! Built-in codecs: [`CodecMsgpackCompact`] (smallest wire size, cross-language),
+//! [`CodecMsgpackMap`] (flexible field names, cross-language), and
+//! [`CodecPostcard`] (fastest, Rust-only). Register custom codecs with
+//! [`RegisterCodec`](MustRegisterCodec).
+//!
+//! # Recovery
+//!
+//! Enable [`ClientRecoveryOptions`] and [`ServerRecoveryOptions`] for automatic
+//! reconnect, replay of unacknowledged frames, and heartbeat-based liveness
+//! detection over protocol v3.
 
 extern crate self as adaptivemsg;
 

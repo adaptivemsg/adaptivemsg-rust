@@ -12,7 +12,11 @@ use crate::message::{ErrorReply, Message, MessageDecode};
 use crate::type_info::expected_wire_name;
 use crate::raw_message::{decode_raw_as, RawMessage};
 
-/// Shared handle to a logical stream within a connection.
+/// Shared handle to a logical stream within a connection (`Arc<StreamInner>`).
+///
+/// Each stream has independent send/recv channels, its own recv timeout, and
+/// can carry a separate conversation. Obtained via `Connection::new_stream()`
+/// or implicitly through the connection's default stream methods.
 pub type Stream = Arc<StreamInner>;
 
 const RECV_TIMEOUT_NONE: u64 = 0;
@@ -122,11 +126,21 @@ impl StreamInner {
     }
 
     /// Send a message without waiting for a reply.
+    ///
+    /// The message is encoded with the connection's negotiated codec and
+    /// enqueued for transmission on this stream. Returns [`Error::Closed`]
+    /// if the stream or connection has been closed, or an [`Error::Codec`]
+    /// if encoding fails.
     pub async fn send<M: Message>(&self, msg: M) -> Result<(), Error> {
         self.send_boxed(Box::new(msg)).await
     }
 
     /// Receive the next message and decode it as `T`.
+    ///
+    /// Blocks until a message arrives, the recv timeout expires
+    /// ([`Error::RecvTimeout`]), or the stream/connection closes
+    /// ([`Error::Closed`]). Returns [`Error::TypeMismatch`] if the received
+    /// wire name does not match `T`, or [`Error::Codec`] on decode failure.
     pub async fn recv<T: MessageDecode + 'static>(&self) -> Result<T, Error> {
         let raw = self.recv_raw().await?;
         let result = decode_raw_as::<T>(raw);

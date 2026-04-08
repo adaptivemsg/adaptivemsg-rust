@@ -79,6 +79,10 @@ impl StreamContextInner {
     }
 
     /// Spawn a background task tied to this stream; only one active task is allowed.
+    ///
+    /// Returns [`Error::HandlerTaskBusy`] if a task is already running. The
+    /// task is automatically marked inactive when the returned future
+    /// completes (guard pattern), allowing a new task to be spawned.
     pub fn new_task<F, Fut>(self: &Arc<Self>, f: F) -> Result<JoinHandle<()>, Error>
     where
         F: FnOnce(Stream) -> Fut + Send + 'static,

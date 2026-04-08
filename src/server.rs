@@ -19,6 +19,21 @@ use crate::recovery_protocol::{
 use crate::registry::Registry;
 
 /// Message server that accepts connections and dispatches handlers.
+///
+/// Automatically discovers handlers registered via `#[message_handler]` through
+/// the inventory system. Use lifecycle callbacks (`on_connect`, `on_disconnect`,
+/// etc.) to hook into connection and stream events.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use adaptivemsg::Server;
+///
+/// Server::new()
+///     .on_connect(|netconn| { println!("connected"); Ok(()) })
+///     .serve("tcp://0.0.0.0:9000")
+///     .await?;
+/// ```
 pub struct Server {
     registry: Registry,
     codecs: Vec<CodecID>,
@@ -171,7 +186,8 @@ impl Server {
                     DEFAULT_MAX_FRAME,
                     server.recovery.enable,
                 )
-                .await {
+                .await
+                {
                     Ok(config) => config,
                     Err(err) => {
                         warn!("handshake failed for {peer_label}: {err}");
@@ -277,22 +293,50 @@ impl Server {
                                     .cloned()
                             };
                             let Some(existing) = existing else {
-                                let _ = write_attach_response(writer, &AttachResponse { status: ATTACH_STATUS_REJECTED, ..AttachResponse::default() }).await;
+                                let _ = write_attach_response(
+                                    writer,
+                                    &AttachResponse {
+                                        status: ATTACH_STATUS_REJECTED,
+                                        ..AttachResponse::default()
+                                    },
+                                )
+                                .await;
                                 conn_handle.close();
                                 return;
                             };
                             let Some(existing_recovery) = existing.recovery_state() else {
-                                let _ = write_attach_response(writer, &AttachResponse { status: ATTACH_STATUS_REJECTED, ..AttachResponse::default() }).await;
+                                let _ = write_attach_response(
+                                    writer,
+                                    &AttachResponse {
+                                        status: ATTACH_STATUS_REJECTED,
+                                        ..AttachResponse::default()
+                                    },
+                                )
+                                .await;
                                 conn_handle.close();
                                 return;
                             };
                             if existing.is_closed() || existing.codec_id() != config.codec_id {
-                                let _ = write_attach_response(writer, &AttachResponse { status: ATTACH_STATUS_REJECTED, ..AttachResponse::default() }).await;
+                                let _ = write_attach_response(
+                                    writer,
+                                    &AttachResponse {
+                                        status: ATTACH_STATUS_REJECTED,
+                                        ..AttachResponse::default()
+                                    },
+                                )
+                                .await;
                                 conn_handle.close();
                                 return;
                             }
                             if existing_recovery.resume_secret != request.resume_secret {
-                                let _ = write_attach_response(writer, &AttachResponse { status: ATTACH_STATUS_REJECTED, ..AttachResponse::default() }).await;
+                                let _ = write_attach_response(
+                                    writer,
+                                    &AttachResponse {
+                                        status: ATTACH_STATUS_REJECTED,
+                                        ..AttachResponse::default()
+                                    },
+                                )
+                                .await;
                                 conn_handle.close();
                                 return;
                             }
@@ -308,11 +352,21 @@ impl Server {
                                 conn_handle.close();
                                 return;
                             }
-                            existing.attach_transport_parts(pending.into_transport_parts(), request.last_recv_seq);
+                            existing.attach_transport_parts(
+                                pending.into_transport_parts(),
+                                request.last_recv_seq,
+                            );
                             existing
                         }
                         _ => {
-                            let _ = write_attach_response(writer, &AttachResponse { status: ATTACH_STATUS_REJECTED, ..AttachResponse::default() }).await;
+                            let _ = write_attach_response(
+                                writer,
+                                &AttachResponse {
+                                    status: ATTACH_STATUS_REJECTED,
+                                    ..AttachResponse::default()
+                                },
+                            )
+                            .await;
                             conn_handle.close();
                             return;
                         }

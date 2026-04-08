@@ -23,8 +23,13 @@ pub(crate) trait MessageFactory: Send + Sync + 'static {
     fn decode_postcard(&self, payload: &[u8]) -> std::result::Result<Box<dyn Message>, Error>;
 }
 
+/// Registry of message handlers and message decoders.
+///
+/// Built automatically from `inventory` submissions when using
+/// [`#[message]`](macro@crate::message) and
+/// [`#[message_handler]`](macro@crate::message_handler) macros. Use
+/// [`Registry::from_inventory`] to create one with all registered types.
 #[derive(Default, Clone)]
-/// Registry of message handlers and decoders.
 pub struct Registry {
     handlers: Arc<HashMap<&'static str, Arc<dyn Handler>>>,
     messages: Arc<HashMap<&'static str, Arc<dyn MessageFactory>>>,

@@ -9,9 +9,30 @@ const DEFAULT_ONCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Builder for a short-lived connection.
 ///
-/// Created by [`once()`], configured with builder methods, and executed by
-/// [`send_recv()`](OnceConn::send_recv). The connection is closed automatically
-/// after the reply is received.
+/// Created by [`once()`], configured with optional builder methods, and
+/// executed by [`send_recv()`](OnceConn::send_recv). The connection is opened,
+/// one request-reply exchange is performed, and the connection is closed
+/// automatically.
+///
+/// This is a thin convenience layer over [`Client`] + [`Connection`](crate::Connection).
+/// Each call pays the cost of TCP connect, handshake, and close. For repeated
+/// calls to the same server, use a persistent connection instead.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Minimal — default timeout (5s), default codecs
+/// let reply: EchoReply = am::once("tcp://127.0.0.1:8080")
+///     .send_recv(EchoReq { text: "hello".into() })
+///     .await?;
+///
+/// // With options
+/// let reply: EchoReply = am::once("tcp://127.0.0.1:8080")
+///     .with_timeout(Duration::from_secs(10))
+///     .with_codecs(&[CodecMsgpackCompact])
+///     .send_recv(EchoReq { text: "hello".into() })
+///     .await?;
+/// ```
 pub struct OnceConn {
     addr: String,
     timeout: Duration,
@@ -19,6 +40,9 @@ pub struct OnceConn {
 }
 
 /// Create a builder for a short-lived connection to `addr`.
+///
+/// The address format follows [`Client::connect`] — `tcp://host:port`,
+/// `uds://path`, or `unix://path`.
 ///
 /// # Examples
 ///
@@ -36,19 +60,38 @@ pub fn once(addr: &str) -> OnceConn {
 }
 
 impl OnceConn {
-    /// Set the dial and receive timeout.
+    /// Set the dial and receive timeout. Default is 5 seconds.
+    ///
+    /// The timeout applies to both the initial TCP connect / handshake and the
+    /// receive wait for the reply.
     pub fn with_timeout(mut self, d: Duration) -> Self {
         self.timeout = d;
         self
     }
 
     /// Set the preferred codec list for the short-lived connection.
+    ///
+    /// When not set, the client default codec list is used
+    /// (`CodecPostcard`, `CodecMsgpackCompact`, `CodecMsgpackMap`).
     pub fn with_codecs(mut self, codecs: &[CodecID]) -> Self {
         self.codecs = Some(codecs.to_vec());
         self
     }
 
     /// Dial, send one request, receive one reply, and close the connection.
+    ///
+    /// This method consumes `self` — the builder cannot be reused, enforcing
+    /// one-shot semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Client::connect`] and `Connection::send_recv`:
+    ///
+    /// - Connect failure — server unreachable or connection refused.
+    /// - Handshake failure — no common codec or version mismatch.
+    /// - Timeout — connect or recv exceeded the configured timeout.
+    /// - Decode error — reply cannot be deserialized into `Rep`.
+    /// - [`Error::Remote`] — server handler returned an error.
     pub async fn send_recv<Req: Message, Rep: MessageDecode + 'static>(
         self,
         req: Req,

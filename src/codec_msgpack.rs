@@ -14,10 +14,16 @@ pub const CODEC_MSGPACK_COMPACT: CodecID = CodecID(1);
 pub const CODEC_MSGPACK_MAP: CodecID = CodecID(2);
 
 #[allow(non_upper_case_globals)]
-/// MessagePack compact array codec ID.
+/// MessagePack compact array codec (`CodecID(1)`).
+///
+/// Fields are order-dependent. Produces the smallest wire size of the
+/// MessagePack codecs. Cross-language compatible with Go.
 pub const CodecMsgpackCompact: CodecID = CODEC_MSGPACK_COMPACT;
 #[allow(non_upper_case_globals)]
-/// MessagePack map codec ID.
+/// MessagePack map codec (`CodecID(2)`).
+///
+/// Fields are named and order-independent. Larger than compact but more
+/// flexible for schema evolution. Cross-language compatible with Go.
 pub const CodecMsgpackMap: CodecID = CODEC_MSGPACK_MAP;
 
 struct MsgpackMapCodec;
@@ -220,10 +226,7 @@ mod tests {
 
         let wire_value = items.remove(0);
         let wire = match wire_value {
-            Value::String(s) => s
-                .as_str()
-                .expect("wire name must be utf-8")
-                .to_string(),
+            Value::String(s) => s.as_str().expect("wire name must be utf-8").to_string(),
             other => panic!("expected wire string, got {other:?}"),
         };
         let raw = crate::raw_message::RawMessage {
@@ -231,8 +234,7 @@ mod tests {
             codec: CODEC_MSGPACK_COMPACT,
             body: Box::new(items),
         };
-        let decoded: CompactCustom =
-            crate::raw_message::decode_raw_as(raw).expect("decode_raw_as");
+        let decoded: CompactCustom = crate::raw_message::decode_raw_as(raw).expect("decode_raw_as");
         assert_eq!(decoded.name, "hello");
         assert_eq!(decoded.inner.value, "ok");
     }

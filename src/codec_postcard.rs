@@ -10,7 +10,9 @@ use crate::message::Message;
 pub const CODEC_POSTCARD: CodecID = CodecID(64);
 
 #[allow(non_upper_case_globals)]
-/// Postcard codec ID.
+/// Postcard binary codec (`CodecID(64)`).
+///
+/// Rust-only; fastest encode/decode but not cross-language compatible.
 pub const CodecPostcard: CodecID = CODEC_POSTCARD;
 
 struct PostcardCodec;

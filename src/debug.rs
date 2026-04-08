@@ -242,94 +242,163 @@ impl StreamDebugCounters {
 /// Point-in-time counters for a connection.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectionCounters {
+    /// Number of streams opened on this connection.
     pub streams_opened: u64,
+    /// Number of streams closed on this connection.
     pub streams_closed: u64,
+    /// Total data messages sent.
     pub data_messages_sent: u64,
+    /// Total data messages received.
     pub data_messages_received: u64,
+    /// Total frames written to the transport.
     pub frames_written: u64,
+    /// Total frames read from the transport.
     pub frames_read: u64,
+    /// Total bytes written to the transport.
     pub bytes_written: u64,
+    /// Total bytes read from the transport.
     pub bytes_read: u64,
+    /// Control frames written (e.g. ACK, heartbeat).
     pub control_frames_written: u64,
+    /// Control frames read.
     pub control_frames_read: u64,
+    /// Protocol errors detected.
     pub protocol_errors: u64,
+    /// Failed attempts to send a protocol error reply.
     pub protocol_error_reply_send_failure: u64,
+    /// Errors received from the remote peer.
     pub remote_errors: u64,
+    /// Message decode errors.
     pub decode_errors: u64,
+    /// Total handler invocations.
     pub handler_calls: u64,
+    /// Handler invocations that returned an error.
     pub handler_errors: u64,
+    /// Recovery reconnect attempts.
     pub reconnect_attempts: u64,
+    /// Successful recovery reconnects.
     pub reconnect_successes: u64,
+    /// Failed recovery reconnects.
     pub reconnect_failures: u64,
+    /// Transport attach events (initial + resume).
     pub transport_attaches: u64,
+    /// Transport detach events.
     pub transport_detaches: u64,
 }
 
 /// Point-in-time counters for a stream.
 #[derive(Debug, Clone, Default)]
 pub struct StreamCounters {
+    /// Data messages sent on this stream.
     pub data_messages_sent: u64,
+    /// Data messages received on this stream.
     pub data_messages_received: u64,
+    /// Protocol errors detected on this stream.
     pub protocol_errors: u64,
+    /// Failed attempts to send a protocol error reply on this stream.
     pub protocol_error_reply_send_failure: u64,
+    /// Remote errors received on this stream.
     pub remote_errors: u64,
+    /// Decode errors on this stream.
     pub decode_errors: u64,
+    /// Handler invocations on this stream.
     pub handler_calls: u64,
+    /// Handler errors on this stream.
     pub handler_errors: u64,
 }
 
 /// Point-in-time diagnostic snapshot of a stream.
 #[derive(Debug, Clone)]
 pub struct StreamDebugState {
+    /// Stream identifier within the connection.
     pub id: u32,
+    /// Whether this stream has been closed.
     pub closed: bool,
+    /// Machine-readable code of the last failure, if any.
     pub last_failure_code: String,
+    /// Human-readable description of the last failure.
     pub last_failure: String,
+    /// Timestamp of the last failure.
     pub last_failure_at: Option<SystemTime>,
+    /// Current recv timeout for this stream.
     pub recv_timeout: Duration,
+    /// Number of decoded messages queued in the inbox.
     pub inbox_depth: usize,
+    /// Number of raw frames queued for decoding.
     pub incoming_depth: usize,
+    /// Number of handler jobs queued.
     pub handler_q_depth: usize,
+    /// Aggregated counters for this stream.
     pub counters: StreamCounters,
 }
 
 /// Point-in-time diagnostic snapshot of recovery state.
 #[derive(Debug, Clone)]
 pub struct RecoveryDebugState {
+    /// Recovery role: `"client"` or `"server"`.
     pub role: String,
+    /// Hex-encoded connection identifier token.
     pub connection_id: String,
+    /// Whether a transport is currently attached.
     pub transport_attached: bool,
+    /// Monotonically increasing transport generation counter.
     pub transport_gen: u64,
+    /// Whether a reconnect attempt is in progress.
     pub reconnect_active: bool,
+    /// Highest sequence number received from the peer.
     pub last_recv_seq: u64,
+    /// Highest sequence number acknowledged to the peer.
     pub last_acked_seq: u64,
+    /// Number of received frames not yet acknowledged.
     pub ack_pending: u32,
+    /// Whether an ACK is due to be sent.
     pub ack_due: bool,
+    /// Send an ACK every N data frames.
     pub ack_every: u32,
+    /// Delay before flushing a pending ACK.
     pub ack_delay: Duration,
+    /// Interval between heartbeat pings.
     pub heartbeat_interval: Duration,
+    /// Timeout for heartbeat liveness.
     pub heartbeat_timeout: Duration,
+    /// Number of frames buffered for replay.
     pub replay_queued: usize,
+    /// Bytes used by the replay buffer.
     pub replay_bytes: i64,
+    /// Depth of the live outbound queue.
     pub live_queue_depth: usize,
+    /// Depth of the resume replay queue.
     pub resume_queue_depth: usize,
 }
 
 /// Point-in-time diagnostic snapshot of a connection.
 #[derive(Debug, Clone)]
 pub struct ConnectionDebugState {
+    /// Whether the connection has been closed.
     pub closed: bool,
+    /// Machine-readable code of the last failure, if any.
     pub last_failure_code: String,
+    /// Human-readable description of the last failure.
     pub last_failure: String,
+    /// Timestamp of the last failure.
     pub last_failure_at: Option<SystemTime>,
+    /// Negotiated protocol version.
     pub protocol: u8,
+    /// Negotiated codec ID.
     pub codec_id: u8,
+    /// Human-readable codec name.
     pub codec_name: String,
+    /// Negotiated maximum frame size in bytes.
     pub max_frame: u32,
+    /// Number of currently open streams.
     pub stream_count: usize,
+    /// Next outbound sequence number.
     pub next_send_seq: u64,
+    /// Aggregated connection counters.
     pub counters: ConnectionCounters,
+    /// Per-stream diagnostic snapshots.
     pub streams: Vec<StreamDebugState>,
+    /// Recovery state snapshot, if recovery is enabled.
     pub recovery: Option<RecoveryDebugState>,
 }
 

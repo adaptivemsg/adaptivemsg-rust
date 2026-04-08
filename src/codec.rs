@@ -7,7 +7,10 @@ use crate::error::Error;
 use crate::message::Message;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-/// Identifier for a negotiated codec.
+/// Numeric identifier for a negotiated codec.
+///
+/// Assigned during the connection handshake. IDs 1–15 are reserved for core
+/// shared codecs; 64–127 for implementation-specific codecs.
 pub struct CodecID(pub u8);
 
 impl CodecID {

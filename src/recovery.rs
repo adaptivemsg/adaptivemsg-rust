@@ -17,22 +17,41 @@ pub type ResumeFuture =
 pub type ResumeConnector = Arc<dyn Fn() -> ResumeFuture + Send + Sync>;
 pub type RecoveryRegistry = Arc<Mutex<std::collections::HashMap<RecoveryToken, Connection>>>;
 
+/// Client-side recovery configuration for automatic reconnect and replay.
+///
+/// When `enable` is true, the client negotiates protocol v3 and will
+/// automatically reconnect and replay unacknowledged frames on transport failure.
 #[derive(Clone, Debug)]
 pub struct ClientRecoveryOptions {
+    /// Enable recovery mode. Default: `false`.
     pub enable: bool,
+    /// Minimum backoff between reconnect attempts. Default: 100 ms.
     pub reconnect_min_backoff: Duration,
+    /// Maximum backoff between reconnect attempts. Default: 2 s.
     pub reconnect_max_backoff: Duration,
+    /// Maximum bytes to buffer for replay. Default: 8 MiB.
     pub max_replay_bytes: i64,
 }
 
+/// Server-side recovery configuration for detached connection retention and ACK policy.
+///
+/// When `enable` is true, the server supports v3 protocol with attach/resume,
+/// cumulative ACKs, and heartbeat-based liveness detection.
 #[derive(Clone, Debug)]
 pub struct ServerRecoveryOptions {
+    /// Enable recovery mode. Default: `false`.
     pub enable: bool,
+    /// How long to retain a detached connection before discarding it. Default: 30 s.
     pub detached_ttl: Duration,
+    /// Maximum bytes to buffer for replay. Default: 8 MiB.
     pub max_replay_bytes: i64,
+    /// Send a cumulative ACK every N received data frames. Default: 64.
     pub ack_every: u32,
+    /// Delay before flushing a pending ACK. Default: 20 ms.
     pub ack_delay: Duration,
+    /// Interval between heartbeat pings when idle. Default: 30 s.
     pub heartbeat_interval: Duration,
+    /// Close connection if no inbound frame received within this duration. Default: 90 s.
     pub heartbeat_timeout: Duration,
 }
 

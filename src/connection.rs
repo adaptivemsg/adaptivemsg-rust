@@ -34,7 +34,12 @@ pub(crate) struct TransportParts {
     pub writer: TransportWriter,
 }
 
-/// Shared handle to a negotiated connection.
+/// Shared handle to a negotiated connection (`Arc<ConnectionInner>`).
+///
+/// Obtained from [`Client::connect`](crate::Client::connect) or passed to
+/// [`Server`](crate::Server) callbacks. Provides send/recv on a built-in
+/// default stream, or call `new_stream()` to multiplex additional logical
+/// streams. All methods are safe to call from multiple tasks concurrently.
 pub type Connection = Arc<ConnectionInner>;
 
 #[derive(Clone, Debug)]
@@ -296,24 +301,41 @@ impl ConnectionInner {
     }
 
     /// Open a new logical stream on this connection.
+    ///
+    /// Each stream has its own send/recv queues and can carry an independent
+    /// conversation. The returned [`Stream`] is an `Arc` and can be shared
+    /// across tasks. Streams are automatically cleaned up when dropped or when
+    /// the connection closes.
     pub fn new_stream(self: &Arc<Self>) -> Stream {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         Arc::clone(&self.make_stream(stream_id).stream)
     }
 
-    /// Send a message on the default stream.
+    /// Send a message on the default stream (fire-and-forget).
+    ///
+    /// The message is encoded with the negotiated codec and enqueued for
+    /// transmission. Returns once the frame is queued, not when the peer
+    /// receives it.
     pub async fn send<M: crate::message::Message>(self: &Arc<Self>, msg: M) -> Result<(), Error> {
         self.default_stream().send(msg).await
     }
 
-    /// Receive the next message on the default stream.
+    /// Receive the next message on the default stream and decode it as `T`.
+    ///
+    /// Blocks until a message arrives, the recv timeout expires
+    /// ([`Error::RecvTimeout`]), or the connection closes ([`Error::Closed`]).
+    /// Returns [`Error::TypeMismatch`] if the received message is not `T`.
     pub async fn recv<T: crate::message::MessageDecode + 'static>(
         self: &Arc<Self>,
     ) -> Result<T, Error> {
         self.default_stream().recv::<T>().await
     }
 
-    /// Send a request and wait for a response on the default stream.
+    /// Send a request and wait for a typed response on the default stream.
+    ///
+    /// Combines [`send`](Self::send) and [`recv`](Self::recv) into a single
+    /// request-reply exchange. If the remote handler returns an error, this
+    /// returns [`Error::Remote`] with the code and message from [`ErrorReply`].
     pub async fn send_recv<
         TReq: crate::message::Message,
         TResp: crate::message::MessageDecode + 'static,
@@ -324,12 +346,19 @@ impl ConnectionInner {
         self.default_stream().send_recv::<TReq, TResp>(msg).await
     }
 
-    /// Peek the next wire name on the default stream without consuming it.
+    /// Peek the wire name of the next message on the default stream without
+    /// consuming it.
+    ///
+    /// Useful for branching on message type before calling [`recv`](Self::recv).
+    /// The peeked message remains available for the next `recv` call.
     pub async fn peek_wire(self: &Arc<Self>) -> Result<String, Error> {
         self.default_stream().peek_wire().await
     }
 
     /// Set the receive timeout on the default stream.
+    ///
+    /// Applies to subsequent [`recv`](Self::recv) and [`send_recv`](Self::send_recv)
+    /// calls. Pass `Duration::ZERO` to disable the timeout (wait indefinitely).
     pub fn set_recv_timeout(self: &Arc<Self>, timeout: Duration) {
         self.default_stream().set_recv_timeout(timeout);
     }
@@ -348,11 +377,20 @@ impl ConnectionInner {
     }
 
     /// Close the connection and all streams.
+    ///
+    /// Pending send operations are drained on a best-effort basis. All open
+    /// streams are closed and their close callbacks are invoked. Subsequent
+    /// send/recv calls return [`Error::Closed`].
     pub fn close(self: &Arc<Self>) {
         self.close_internal();
     }
 
     /// Returns a point-in-time diagnostic snapshot of this connection.
+    ///
+    /// Includes counters, stream states, and recovery state. Useful for
+    /// dashboards, health checks, and debugging. The snapshot is not
+    /// transactionally consistent — individual fields may reflect slightly
+    /// different instants.
     pub fn debug_state(&self) -> ConnectionDebugState {
         let config = self.config.get();
         let (protocol, codec_id, codec_name, max_frame) = match config {

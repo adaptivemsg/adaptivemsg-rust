@@ -8,7 +8,8 @@ use crate::error::{Error, Result};
 
 /// Application message that can be encoded and decoded by codecs.
 ///
-/// Prefer using the `#[message]` macro to implement this trait.
+/// Typically derived via the [`#[message]`](macro@crate::message) attribute
+/// macro. Manual implementation is rarely needed.
 pub trait Message: Any + Send + Sync + 'static {
     /// Wire name used for routing and decoding.
     fn wire_name(&self) -> &'static str;
@@ -89,6 +90,20 @@ impl ErrorReply {
 
 #[async_trait]
 /// Server-side handler for a message type.
+///
+/// Implement via the [`#[message_handler]`](macro@crate::message_handler)
+/// attribute macro:
+///
+/// ```rust,ignore
+/// #[message_handler]
+/// impl MyRequest {
+///     async fn handle(self: Box<Self>, ctx: StreamContext)
+///         -> Result<Option<Box<dyn Message>>>
+///     {
+///         Ok(Some(Box::new(MyResponse { /* ... */ })))
+///     }
+/// }
+/// ```
 pub trait MessageHandler: Message {
     /// Handle a request and optionally return a reply.
     ///
