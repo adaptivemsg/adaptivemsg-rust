@@ -41,7 +41,8 @@
 //! }
 //! ```
 //!
-//! For one-shot request/reply without managing a connection, see [`once()`].
+//! For one-shot request/reply without managing a connection, use
+//! [`Client::send_recv`].
 //!
 //! # Codecs
 //!
@@ -70,7 +71,6 @@ mod error;
 mod frame;
 mod frame_queue;
 mod message;
-mod once;
 mod protocol;
 mod raw_message;
 mod recovery;
@@ -82,6 +82,8 @@ mod stream;
 mod transport;
 mod type_info;
 
+#[cfg(test)]
+mod client_sendrecv_test;
 #[cfg(test)]
 mod protocol_version_bench_test;
 #[cfg(test)]
@@ -105,7 +107,6 @@ pub use crate::debug::{
 };
 pub use crate::error::{Error, Result};
 pub use crate::message::{ErrorReply, Message, MessageHandler, OkReply};
-pub use crate::once::{once, OnceConn};
 pub use crate::recovery::{ClientRecoveryOptions, ServerRecoveryOptions};
 pub use crate::registry::Registry;
 pub use crate::server::Server;

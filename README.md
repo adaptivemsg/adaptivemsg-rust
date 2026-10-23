@@ -66,6 +66,18 @@ let conn = client.connect("tcp://127.0.0.1:5555").await?;
 let reply: HelloReply = conn.send_recv(HelloRequest { who: "alice".into() }).await?;
 ```
 
+For a one-shot connection:
+
+```rust
+let reply: HelloReply = am::Client::new()
+    .with_timeout(std::time::Duration::from_secs(5))
+    .send_recv(
+        "tcp://127.0.0.1:5555",
+        HelloRequest { who: "alice".into() },
+    )
+    .await?;
+```
+
 ## Code generation (amgen-rs)
 
 Install:

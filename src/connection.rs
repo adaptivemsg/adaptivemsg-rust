@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -24,7 +24,9 @@ use crate::stream::{Stream, StreamInner};
 mod recovery_runtime;
 
 pub(crate) const STREAM_QUEUE_SIZE: usize = 1024;
-const DEFAULT_STREAM_ID: u32 = 0;
+pub(crate) const DEFAULT_STREAM_ID: u32 = 0;
+/// Last ID `new_stream` hands out; the only larger value is the control stream.
+const MAX_STREAM_ID: u32 = crate::recovery_protocol::CONTROL_STREAM_ID - 1;
 
 pub(crate) type TransportReader = Box<dyn AsyncRead + Unpin + Send>;
 pub(crate) type TransportWriter = Box<dyn AsyncWrite + Unpin + Send>;
@@ -67,14 +69,16 @@ pub struct ConnConfig {
     pub max_frame: u32,
 }
 
-type InboundFrame = (u32, u64, Vec<u8>);
+type InboundFrame = (u32, u64, u8, Vec<u8>);
 pub(crate) enum OutboundFrame {
     Plain {
         stream_id: u32,
+        flags: u8,
         payload: Vec<u8>,
     },
     Recovery {
         stream_id: u32,
+        flags: u8,
         payload: Vec<u8>,
         queued_tx: oneshot::Sender<Result<(), Error>>,
     },
@@ -113,7 +117,7 @@ pub struct ConnectionInner {
     current_reader_abort: Mutex<Option<(u64, AbortHandle)>>,
     closed_notify: Notify,
     send_notify: Notify,
-    next_stream_id: AtomicU32,
+    next_stream_id: AtomicU64,
     next_send_seq: AtomicU64,
     transport_gen: AtomicU64,
     default_stream: OnceLock<StreamContext>,
@@ -228,7 +232,7 @@ impl ConnectionInner {
                 current_reader_abort: Mutex::new(None),
                 closed_notify: Notify::new(),
                 send_notify: Notify::new(),
-                next_stream_id: AtomicU32::new(1),
+                next_stream_id: AtomicU64::new(1),
                 next_send_seq: AtomicU64::new(0),
                 transport_gen: AtomicU64::new(0),
                 default_stream: OnceLock::new(),
@@ -304,11 +308,25 @@ impl ConnectionInner {
     ///
     /// Each stream has its own send/recv queues and can carry an independent
     /// conversation. The returned [`Stream`] is an `Arc` and can be shared
-    /// across tasks. Streams are automatically cleaned up when dropped or when
-    /// the connection closes.
+    /// across tasks. A stream is released by `close()` or when the connection
+    /// closes; dropping the handle does not release it.
+    ///
+    /// Stream IDs are never reused, so a connection can open at most
+    /// `0xFFFFFFFE` streams. After that, `new_stream` returns a stream whose
+    /// operations return [`Error::Closed`], and
+    /// [`debug_state`](Self::debug_state) reports
+    /// `connection.stream_ids_exhausted`. Open a new connection for further
+    /// streams.
     pub fn new_stream(self: &Arc<Self>) -> Stream {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
-        Arc::clone(&self.make_stream(stream_id).stream)
+        if stream_id > MAX_STREAM_ID as u64 {
+            self.debug.note_failure(
+                crate::debug::FAILURE_STREAM_IDS_EXHAUSTED,
+                "stream IDs exhausted".to_string(),
+            );
+            return Arc::new(StreamInner::new_closed(self.clone()));
+        }
+        Arc::clone(&self.make_stream(stream_id as u32).stream)
     }
 
     /// Send a message on the default stream (fire-and-forget).
@@ -497,6 +515,25 @@ impl ConnectionInner {
         Arc::clone(&self.get_stream_ctx(stream_id).stream)
     }
 
+    /// Whether `new_stream` on this side allocated `stream_id`.
+    pub(crate) fn opened_stream(&self, stream_id: u32) -> bool {
+        stream_id != DEFAULT_STREAM_ID
+            && (stream_id as u64) < self.next_stream_id.load(Ordering::Relaxed)
+    }
+
+    /// Like `get_stream`, but returns `None` for a frame that belongs to a
+    /// stream this side opened and already closed. Stream IDs are never
+    /// reused, so a missing stream that this side opened was closed here.
+    fn inbound_stream(self: &Connection, stream_id: u32) -> Option<Stream> {
+        if let Some(stream_ctx) = self.lookup_stream_ctx(stream_id) {
+            return Some(Arc::clone(&stream_ctx.stream));
+        }
+        if self.opened_stream(stream_id) {
+            return None;
+        }
+        Some(self.get_stream(stream_id))
+    }
+
     fn start(
         self: &Connection,
         outbound_rx: mpsc::Receiver<OutboundFrame>,
@@ -663,6 +700,39 @@ impl ConnectionInner {
         })
     }
 
+    pub(crate) async fn accept_frame(
+        self: &Connection,
+        stream_id: u32,
+        flags: u8,
+        payload: Vec<u8>,
+    ) -> Result<(), Error> {
+        let fin = flags & crate::frame::FRAME_FLAG_FIN != 0
+            && stream_id != DEFAULT_STREAM_ID
+            && stream_id != crate::recovery_protocol::CONTROL_STREAM_ID;
+        if fin && payload.is_empty() {
+            if let Some(stream_ctx) = self.remove_stream(stream_id) {
+                self.notify_close(&stream_ctx);
+            }
+            return Ok(());
+        }
+        let Some(stream) = self.inbound_stream(stream_id) else {
+            return Ok(());
+        };
+        if !payload.is_empty() && stream.incoming_tx.send(payload).await.is_err() {
+            if self.is_closed() {
+                return Err(Error::Closed);
+            }
+            // The stream was closed after the lookup; drop the frame.
+            return Ok(());
+        }
+        if fin {
+            if let Some(stream_ctx) = self.remove_stream(stream_id) {
+                self.notify_close(&stream_ctx);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn encode_message(
         &self,
         msg: &dyn crate::message::Message,
@@ -672,16 +742,24 @@ impl ConnectionInner {
 
     pub(crate) async fn enqueue_frame(&self, frame: OutboundFrame) -> Result<(), Error> {
         if self.recovery().is_some() {
-            let (stream_id, payload) = match frame {
-                OutboundFrame::Plain { stream_id, payload } => (stream_id, payload),
+            let (stream_id, flags, payload) = match frame {
+                OutboundFrame::Plain {
+                    stream_id,
+                    flags,
+                    payload,
+                } => (stream_id, flags, payload),
                 OutboundFrame::Recovery {
-                    stream_id, payload, ..
-                } => (stream_id, payload),
+                    stream_id,
+                    flags,
+                    payload,
+                    ..
+                } => (stream_id, flags, payload),
             };
             let (queued_tx, queued_rx) = oneshot::channel();
             self.outbound_tx
                 .send(OutboundFrame::Recovery {
                     stream_id,
+                    flags,
                     payload,
                     queued_tx,
                 })
@@ -776,18 +854,23 @@ impl ConnectionInner {
         writer: &mut TransportWriter,
         frame: OutboundFrame,
     ) -> Result<(), Error> {
-        let (stream_id, payload) = match frame {
-            OutboundFrame::Plain { stream_id, payload } => (stream_id, payload),
+        let (stream_id, flags, payload) = match frame {
+            OutboundFrame::Plain {
+                stream_id,
+                flags,
+                payload,
+            } => (stream_id, flags, payload),
             OutboundFrame::Recovery {
                 stream_id,
+                flags,
                 payload,
                 queued_tx,
             } => {
                 let _ = queued_tx.send(Ok(()));
-                (stream_id, payload)
+                (stream_id, flags, payload)
             }
         };
-        write_frame_no_flush(connection.config(), writer, stream_id, 0, &payload).await?;
+        write_frame_no_flush(connection.config(), writer, stream_id, 0, flags, &payload).await?;
         connection
             .debug
             .frames_written
@@ -808,7 +891,7 @@ impl ConnectionInner {
         tokio::spawn(async move {
             loop {
                 match read_frame(connection.config(), &mut reader).await {
-                    Ok((stream_id, _, payload)) => {
+                    Ok((stream_id, _, flags, payload)) => {
                         connection
                             .debug
                             .frames_read
@@ -817,8 +900,14 @@ impl ConnectionInner {
                             .debug
                             .bytes_read
                             .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        let stream = connection.get_stream(stream_id);
-                        let _ = stream.incoming_tx.send(payload).await;
+                        if let Err(err) = connection.accept_frame(stream_id, flags, payload).await {
+                            connection.debug.note_failure(
+                                crate::debug::FAILURE_CONNECTION_READER,
+                                err.to_string(),
+                            );
+                            connection.mark_closed();
+                            return;
+                        }
                     }
                     Err(err) => {
                         connection
@@ -846,12 +935,13 @@ async fn write_frame<W>(
     writer: &mut W,
     stream_id: u32,
     seq: u64,
+    flags: u8,
     payload: &[u8],
 ) -> Result<(), Error>
 where
     W: AsyncWrite + Unpin,
 {
-    write_frame_no_flush(config, writer, stream_id, seq, payload).await?;
+    write_frame_no_flush(config, writer, stream_id, seq, flags, payload).await?;
     writer.flush().await?;
     Ok(())
 }
@@ -861,6 +951,7 @@ async fn write_frame_no_flush<W>(
     writer: &mut W,
     stream_id: u32,
     seq: u64,
+    flags: u8,
     payload: &[u8],
 ) -> Result<(), Error>
 where
@@ -870,6 +961,7 @@ where
         config.version,
         stream_id,
         seq,
+        flags,
         payload.len(),
         config.max_frame,
     )?;
@@ -886,11 +978,11 @@ where
     let header_len = frame_header_len_for_version(config.version)?;
     let mut header = [0u8; FRAME_HEADER_LEN_V3];
     reader.read_exact(&mut header[..header_len]).await?;
-    let (stream_id, seq, payload_len) = parse_header(&header[..header_len], config.version)?;
+    let (stream_id, seq, flags, payload_len) = parse_header(&header[..header_len], config.version)?;
     if payload_len as u32 > config.max_frame {
         return Err(Error::FrameTooLarge(payload_len));
     }
     let mut payload = vec![0u8; payload_len];
     reader.read_exact(&mut payload).await?;
-    Ok((stream_id, seq, payload))
+    Ok((stream_id, seq, flags, payload))
 }

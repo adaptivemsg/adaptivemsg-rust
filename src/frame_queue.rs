@@ -41,7 +41,7 @@ mod tests {
     fn push_pop_order_and_growth() {
         let dq = FrameDeque::default();
         for i in 1..=5u64 {
-            dq.push(Arc::new(FrameRecord { stream_id: 0, seq: i, payload: vec![i as u8], size: 10 }));
+            dq.push(Arc::new(FrameRecord { stream_id: 0, seq: i, flags: 0, payload: vec![i as u8], size: 10 }));
         }
         assert_eq!(dq.len(), 5);
         for i in 1..=5u64 {
@@ -55,14 +55,14 @@ mod tests {
     #[test]
     fn reset_replaces_contents() {
         let dq = FrameDeque::default();
-        dq.push(Arc::new(FrameRecord { stream_id: 0, seq: 1, payload: vec![1], size: 10 }));
-        dq.push(Arc::new(FrameRecord { stream_id: 0, seq: 2, payload: vec![2], size: 10 }));
+        dq.push(Arc::new(FrameRecord { stream_id: 0, seq: 1, flags: 0, payload: vec![1], size: 10 }));
+        dq.push(Arc::new(FrameRecord { stream_id: 0, seq: 2, flags: 0, payload: vec![2], size: 10 }));
         assert_eq!(dq.len(), 2);
 
         let replacements = vec![
-            Arc::new(FrameRecord { stream_id: 0, seq: 10, payload: vec![10], size: 10 }),
-            Arc::new(FrameRecord { stream_id: 0, seq: 11, payload: vec![11], size: 10 }),
-            Arc::new(FrameRecord { stream_id: 0, seq: 12, payload: vec![12], size: 10 }),
+            Arc::new(FrameRecord { stream_id: 0, seq: 10, flags: 0, payload: vec![10], size: 10 }),
+            Arc::new(FrameRecord { stream_id: 0, seq: 11, flags: 0, payload: vec![11], size: 10 }),
+            Arc::new(FrameRecord { stream_id: 0, seq: 12, flags: 0, payload: vec![12], size: 10 }),
         ];
         dq.reset(replacements);
         assert_eq!(dq.len(), 3);

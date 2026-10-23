@@ -26,6 +26,7 @@ pub const FAILURE_STREAM_PROTOCOL_REPLY_SEND: DebugFailureCode = "stream.protoco
 pub const FAILURE_CONNECTION_READER: DebugFailureCode = "connection.reader";
 pub const FAILURE_CONNECTION_WRITER: DebugFailureCode = "connection.writer";
 pub const FAILURE_CONNECTION_READER_ENQUEUE: DebugFailureCode = "connection.reader_enqueue";
+pub const FAILURE_STREAM_IDS_EXHAUSTED: DebugFailureCode = "connection.stream_ids_exhausted";
 pub const FAILURE_HANDLER_ERROR: DebugFailureCode = "handler.error";
 
 // Recovery path
@@ -480,6 +481,7 @@ mod tests {
             FAILURE_CONNECTION_READER,
             FAILURE_CONNECTION_WRITER,
             FAILURE_CONNECTION_READER_ENQUEUE,
+            FAILURE_STREAM_IDS_EXHAUSTED,
             FAILURE_HANDLER_ERROR,
             FAILURE_RECOVERY_RESUME,
             FAILURE_RECOVERY_RECONNECT_TERMINAL,

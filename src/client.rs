@@ -8,6 +8,7 @@ use crate::codec_msgpack::{CodecMsgpackCompact, CodecMsgpackMap};
 use crate::codec_postcard::CodecPostcard;
 use crate::connection::Connection;
 use crate::error::Error;
+use crate::message::{Message, MessageDecode};
 use crate::protocol::{DEFAULT_MAX_FRAME, PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
 use crate::recovery::{ClientRecoveryOptions, RecoveryState, ResumeConnector};
 use crate::recovery_protocol::{
@@ -19,7 +20,7 @@ use crate::registry::Registry;
 /// Client configuration for connecting to a server.
 ///
 /// Uses a builder pattern to configure timeouts, codecs, and recovery before
-/// connecting.
+/// connecting or performing a one-shot request-reply exchange.
 ///
 /// # Example
 ///
@@ -59,6 +60,9 @@ impl Client {
     }
 
     /// Set a connect timeout.
+    ///
+    /// For [`send_recv`](Self::send_recv), the same timeout also applies while
+    /// waiting for the reply.
     pub fn with_timeout(mut self, d: Duration) -> Self {
         self.timeout = Some(d);
         self
@@ -112,6 +116,25 @@ impl Client {
             }
         }
         Err(last_err.unwrap_or(Error::Closed))
+    }
+
+    /// Connect, send one request, receive one reply, and close the connection.
+    ///
+    /// This uses the client's codec, frame-size, registry, timeout, and
+    /// recovery configuration. Use [`connect`](Self::connect) when the
+    /// connection should remain open for reuse.
+    pub async fn send_recv<Req: Message, Rep: MessageDecode + 'static>(
+        &self,
+        addr: &str,
+        msg: Req,
+    ) -> Result<Rep, Error> {
+        let conn = self.connect(addr).await?;
+        if let Some(timeout) = self.timeout {
+            conn.set_recv_timeout(timeout);
+        }
+        let result = conn.send_recv(msg).await;
+        conn.close();
+        result
     }
 
     async fn connect_version(&self, addr: &str, version: u8) -> Result<Connection, Error> {

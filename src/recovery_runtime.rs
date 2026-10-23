@@ -71,17 +71,22 @@ impl ConnectionInner {
 
             let stage_live = |frame: OutboundFrame| -> Option<Arc<FrameRecord>> {
                 match frame {
-                    OutboundFrame::Plain { stream_id, payload } => {
+                    OutboundFrame::Plain {
+                        stream_id,
+                        flags,
+                        payload,
+                    } => {
                         let seq = connection.next_outbound_seq();
-                        recovery.replay.add(stream_id, seq, payload).ok()
+                        recovery.replay.add(stream_id, seq, flags, payload).ok()
                     }
                     OutboundFrame::Recovery {
                         stream_id,
+                        flags,
                         payload,
                         queued_tx,
                     } => {
                         let seq = connection.next_outbound_seq();
-                        match recovery.replay.add(stream_id, seq, payload) {
+                        match recovery.replay.add(stream_id, seq, flags, payload) {
                             Ok(record) => {
                                 let _ = queued_tx.send(Ok(()));
                                 Some(record)
@@ -102,7 +107,7 @@ impl ConnectionInner {
                     if frame.seq > last_sent_seq {
                         let result = {
                             let w = writer.as_mut().expect("writer missing");
-                            write_frame(connection.config(), w, frame.stream_id, frame.seq, &frame.payload).await
+                            write_frame(connection.config(), w, frame.stream_id, frame.seq, frame.flags, &frame.payload).await
                         };
                         if let Err(err) = result {
                             connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_LIVE_WRITE, err.to_string());
@@ -174,6 +179,7 @@ impl ConnectionInner {
                         writer_ref,
                         CONTROL_STREAM_ID,
                         0,
+                        0,
                         &ack_payload,
                     )
                     .await;
@@ -195,6 +201,7 @@ impl ConnectionInner {
                                     writer_ref,
                                     frame.stream_id,
                                     frame.seq,
+                                    frame.flags,
                                     &frame.payload,
                                 )
                                 .await;
@@ -237,6 +244,7 @@ impl ConnectionInner {
                                 writer_ref,
                                 frame.stream_id,
                                 frame.seq,
+                                frame.flags,
                                 &frame.payload,
                             )
                             .await
@@ -313,7 +321,7 @@ impl ConnectionInner {
                             let payload = build_ping_control_payload();
                             let result = {
                                 let w = writer.as_mut().expect("writer missing");
-                                write_frame(connection.config(), w, CONTROL_STREAM_ID, 0, &payload).await
+                                write_frame(connection.config(), w, CONTROL_STREAM_ID, 0, 0, &payload).await
                             };
                             if let Err(err) = result {
                                 connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_PING_WRITE, err.to_string());
@@ -357,7 +365,7 @@ impl ConnectionInner {
                     }
                 };
                 match frame {
-                    Ok((stream_id, seq, payload)) => {
+                    Ok((stream_id, seq, flags, payload)) => {
                         connection.debug.frames_read.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         connection.debug.bytes_read.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         recovery.touch_activity();
@@ -372,7 +380,7 @@ impl ConnectionInner {
                             continue;
                         }
                         if let Err(err) = connection
-                            .handle_recovery_data_frame(stream_id, seq, payload)
+                            .handle_recovery_data_frame(stream_id, seq, flags, payload)
                             .await
                         {
                             connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_DATA, err.to_string());
@@ -380,6 +388,17 @@ impl ConnectionInner {
                             connection.mark_closed();
                             return;
                         }
+                    }
+                    // Resuming would replay the same frame, so a malformed frame is terminal.
+                    Err(
+                        err @ (Error::InvalidMessage(_)
+                        | Error::UnsupportedFrameVersion(_)
+                        | Error::FrameTooLarge(_)),
+                    ) => {
+                        connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_DATA, err.to_string());
+                        warn!("recovery frame rejected: {err}");
+                        connection.mark_closed();
+                        return;
                     }
                     Err(err) => {
                         connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_READ, err.to_string());
@@ -562,6 +581,7 @@ impl ConnectionInner {
         &self,
         stream_id: u32,
         seq: u64,
+        flags: u8,
         payload: Vec<u8>,
     ) -> Result<(), Error> {
         let Some(recovery) = self.recovery() else {
@@ -584,12 +604,9 @@ impl ConnectionInner {
                 "recovery frame sequence gap".to_string(),
             ));
         }
-        let stream = self.shared().get_stream(stream_id);
-        stream
-            .incoming_tx
-            .send(payload)
-            .await
-            .map_err(|_| Error::Closed)?;
+        self.shared()
+            .accept_frame(stream_id, flags, payload)
+            .await?;
         if recovery.note_received(seq) {
             self.signal_send();
         }

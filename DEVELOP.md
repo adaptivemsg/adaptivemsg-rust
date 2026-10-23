@@ -137,14 +137,14 @@ Handler errors use `anyhow::Error` (`Result<T> = std::result::Result<T, anyhow::
 
 - Exactly one in-flight `recv()`/`send_recv()` per stream (guarded by `recv_active` AtomicBool).
 - `set_recv_timeout(Duration::ZERO)` disables timeout.
-- `stream.close()` is local only (no on-wire close frame).
+- `stream.close()` sends a `FIN` data frame before releasing the local stream, but only on streams this side opened with `new_stream`. Other streams, including stream 0, are released locally.
 - Stream context uses `Arc<dyn Any + Send + Sync>` for type-erased storage.
 - `new_task()` spawns one background tokio task per stream (guarded by `handler_task_active`).
 
 ## Current Design Gaps
 
 - Registry snapshot is fixed at client/server construction time.
-- No explicit on-wire stream close.
+- Only the side that opened a stream can close it on the wire; the peer cannot signal that a stream has ended.
 - `max_frame == 0` rejects all non-empty frames.
 - Recovery includes heartbeat knobs, but no OS keepalive integration.
 - Only one `unsafe` block: `Box::into_raw`/`Box::from_raw` in message downcast (type-checked).

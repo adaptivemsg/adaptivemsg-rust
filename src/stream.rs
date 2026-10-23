@@ -34,6 +34,8 @@ pub struct StreamInner {
     recv_active: AtomicBool,
     peeked: Mutex<Option<RawMessage>>,
     closed: AtomicBool,
+    fin_started: AtomicBool,
+    send_lock: AsyncMutex<()>,
     closed_notify: Notify,
     pub(crate) debug: StreamDebugCounters,
 }
@@ -60,9 +62,31 @@ impl StreamInner {
             recv_active: AtomicBool::new(false),
             peeked: Mutex::new(None),
             closed: AtomicBool::new(false),
+            fin_started: AtomicBool::new(false),
+            send_lock: AsyncMutex::new(()),
             closed_notify: Notify::new(),
             debug: StreamDebugCounters::new(),
         }
+    }
+
+    /// A stream that is not registered on `connection` and returns
+    /// [`Error::Closed`] from every operation. Its ID is the control stream ID
+    /// rather than 0 because closing stream 0 would remove the default stream.
+    pub(crate) fn new_closed(connection: Connection) -> Self {
+        let (inbox_tx, inbox_rx) = mpsc::channel(1);
+        let (incoming_tx, _) = mpsc::channel(1);
+        let stream = Self::new(
+            crate::recovery_protocol::CONTROL_STREAM_ID,
+            connection,
+            inbox_rx,
+            inbox_tx,
+            incoming_tx,
+            None,
+            None,
+        );
+        stream.closed.store(true, Ordering::Release);
+        stream.fin_started.store(true, Ordering::Release);
+        stream
     }
 
     /// Stream identifier within the connection.
@@ -94,10 +118,38 @@ impl StreamInner {
     }
 
     /// Close this stream and notify close callbacks.
+    ///
+    /// If this side opened the stream with `new_stream`, it first queues a FIN
+    /// frame so the peer can release its copy. Only the opener sends FIN, so a
+    /// stream opened by the peer is removed locally, as is stream 0, whose
+    /// lifetime follows the connection.
     pub fn close(self: &Arc<Self>) {
-        if let Some(stream_ctx) = self.connection.remove_stream(self.id) {
-            self.connection.notify_close(&stream_ctx);
+        if !self.connection.opened_stream(self.id) {
+            if let Some(stream_ctx) = self.connection.remove_stream(self.id) {
+                self.connection.notify_close(&stream_ctx);
+            }
+            return;
         }
+        if self.fin_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let stream = Arc::clone(self);
+        tokio::spawn(async move {
+            stream.send_fin().await;
+            if let Some(stream_ctx) = stream.connection.remove_stream(stream.id) {
+                stream.connection.notify_close(&stream_ctx);
+            }
+        });
+    }
+
+    async fn send_fin(&self) {
+        let _guard = self.send_lock.lock().await;
+        let frame = crate::connection::OutboundFrame::Plain {
+            stream_id: self.id,
+            flags: crate::frame::FRAME_FLAG_FIN,
+            payload: Vec::new(),
+        };
+        let _ = self.connection.enqueue_frame(frame).await;
     }
 
     pub(crate) fn close_channels(&self) {
@@ -191,9 +243,14 @@ impl StreamInner {
     }
 
     pub(crate) async fn send_boxed(&self, msg: Box<dyn Message>) -> Result<(), Error> {
+        let _guard = self.send_lock.lock().await;
+        if self.fin_started.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
         let payload = self.connection.encode_message(msg.as_ref())?;
         let frame = crate::connection::OutboundFrame::Plain {
             stream_id: self.id,
+            flags: 0,
             payload,
         };
         self.connection.enqueue_frame(frame).await?;
@@ -279,6 +336,11 @@ impl StreamInner {
         let _ = self
             .send_boxed(Box::new(ErrorReply::new(code, message)))
             .await;
+        if self.connection.opened_stream(self.id)
+            && !self.fin_started.swap(true, Ordering::AcqRel)
+        {
+            self.send_fin().await;
+        }
         self.connection.remove_stream(self.id);
     }
 

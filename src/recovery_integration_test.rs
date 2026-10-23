@@ -196,7 +196,7 @@ async fn start_heartbeat_blackhole_server(
                 if first_reader.read_exact(&mut header).await.is_err() {
                     return;
                 }
-                let (_, _, payload_len) = crate::frame::parse_header(&header, PROTOCOL_VERSION_V3)
+                let (_, _, _, payload_len) = crate::frame::parse_header(&header, PROTOCOL_VERSION_V3)
                     .expect("parse frame header");
                 let mut payload = vec![0u8; payload_len];
                 if first_reader.read_exact(&mut payload).await.is_err() {
@@ -254,7 +254,7 @@ async fn start_heartbeat_blackhole_server(
             if second_reader.read_exact(&mut header).await.is_err() {
                 break;
             }
-            let (stream_id, _, payload_len) =
+            let (stream_id, _, _, payload_len) =
                 match crate::frame::parse_header(&header, PROTOCOL_VERSION_V3) {
                     Ok(parsed) => parsed,
                     Err(_) => break,

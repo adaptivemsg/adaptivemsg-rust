@@ -9,6 +9,7 @@ use crate::frame::frame_header_len_for_version;
 pub(crate) struct FrameRecord {
     pub stream_id: u32,
     pub seq: u64,
+    pub flags: u8,
     pub payload: Vec<u8>,
     pub size: i64,
 }
@@ -40,12 +41,14 @@ impl ReplayBuffer {
         &self,
         stream_id: u32,
         seq: u64,
+        flags: u8,
         payload: Vec<u8>,
     ) -> Result<Arc<FrameRecord>, Error> {
         if seq == 0 {
             return Ok(Arc::new(FrameRecord {
                 stream_id,
                 seq,
+                flags,
                 size: payload.len() as i64,
                 payload,
             }));
@@ -78,6 +81,7 @@ impl ReplayBuffer {
         let record = Arc::new(FrameRecord {
             stream_id,
             seq,
+            flags,
             payload,
             size,
         });
