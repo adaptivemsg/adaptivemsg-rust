@@ -159,10 +159,13 @@ impl StreamInner {
     }
 
     pub(crate) async fn wait_closed(&self) {
-        if self.closed.load(Ordering::Relaxed) {
+        // notify_waiters only wakes futures that already exist, so create the
+        // future before checking the flag.
+        let notified = self.closed_notify.notified();
+        if self.closed.load(Ordering::Acquire) {
             return;
         }
-        self.closed_notify.notified().await;
+        notified.await;
     }
 
     /// Set the receive timeout for `recv` and `send_recv`.
@@ -280,7 +283,7 @@ impl StreamInner {
         let mut handler_rx = handler_rx.lock().await;
         tokio::select! {
             job = handler_rx.recv() => job.ok_or(Error::Closed),
-            _ = self.closed_notify.notified() => Err(Error::Closed),
+            _ = self.wait_closed() => Err(Error::Closed),
         }
     }
 
@@ -318,14 +321,14 @@ impl StreamInner {
             tokio::select! {
                 msg = inbox.recv() => msg.ok_or(Error::Closed),
                 _ = self.connection.wait_closed() => Err(Error::Closed),
-                _ = self.closed_notify.notified() => Err(Error::Closed),
+                _ = self.wait_closed() => Err(Error::Closed),
             }
         } else {
             let timeout = Duration::from_nanos(timeout_nanos);
             tokio::select! {
                 msg = inbox.recv() => msg.ok_or(Error::Closed),
                 _ = self.connection.wait_closed() => Err(Error::Closed),
-                _ = self.closed_notify.notified() => Err(Error::Closed),
+                _ = self.wait_closed() => Err(Error::Closed),
                 _ = tokio::time::sleep(timeout) => Err(Error::RecvTimeout),
             }
         }

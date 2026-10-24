@@ -120,7 +120,7 @@ pub struct ConnectionInner {
     next_stream_id: AtomicU64,
     next_send_seq: AtomicU64,
     transport_gen: AtomicU64,
-    default_stream: OnceLock<StreamContext>,
+    default_stream: Mutex<Option<StreamContext>>,
     config: OnceLock<ConnConfig>,
     recovery: OnceLock<Arc<RecoveryState>>,
     writer_cmd_tx: mpsc::UnboundedSender<WriterCommand>,
@@ -235,7 +235,7 @@ impl ConnectionInner {
                 next_stream_id: AtomicU64::new(1),
                 next_send_seq: AtomicU64::new(0),
                 transport_gen: AtomicU64::new(0),
-                default_stream: OnceLock::new(),
+                default_stream: Mutex::new(None),
                 config: OnceLock::new(),
                 recovery: OnceLock::new(),
                 writer_cmd_tx,
@@ -290,14 +290,20 @@ impl ConnectionInner {
 
     /// Wait until the connection is closed.
     pub async fn wait_closed(&self) {
-        if self.closed.load(Ordering::Relaxed) {
+        // notify_waiters only wakes futures that already exist, so create the
+        // future before checking the flag.
+        let notified = self.closed_notify.notified();
+        if self.closed.load(Ordering::Acquire) {
             return;
         }
-        self.closed_notify.notified().await;
+        notified.await;
     }
 
     pub(crate) fn close_all_streams(&self) {
         let stream_contexts = std::mem::take(&mut *self.stream_contexts.lock().unwrap());
+        // The default stream holds the connection, so keeping it would keep
+        // the connection alive forever.
+        let _default_stream = self.default_stream.lock().unwrap().take();
         for stream_ctx in stream_contexts.values() {
             stream_ctx.stream.close_channels();
             self.notify_close(stream_ctx);
@@ -309,7 +315,9 @@ impl ConnectionInner {
     /// Each stream has its own send/recv queues and can carry an independent
     /// conversation. The returned [`Stream`] is an `Arc` and can be shared
     /// across tasks. A stream is released by `close()` or when the connection
-    /// closes; dropping the handle does not release it.
+    /// closes; dropping the handle does not release it. On a closed
+    /// connection, `new_stream` returns a stream whose operations return
+    /// [`Error::Closed`].
     ///
     /// Stream IDs are never reused, so a connection can open at most
     /// `0xFFFFFFFE` streams. After that, `new_stream` returns a stream whose
@@ -326,7 +334,10 @@ impl ConnectionInner {
             );
             return Arc::new(StreamInner::new_closed(self.clone()));
         }
-        Arc::clone(&self.make_stream(stream_id as u32).stream)
+        match self.make_stream(stream_id as u32) {
+            Some(stream_ctx) => Arc::clone(&stream_ctx.stream),
+            None => Arc::new(StreamInner::new_closed(self.clone())),
+        }
     }
 
     /// Send a message on the default stream (fire-and-forget).
@@ -396,9 +407,13 @@ impl ConnectionInner {
 
     /// Close the connection and all streams.
     ///
-    /// Pending send operations are drained on a best-effort basis. All open
-    /// streams are closed and their close callbacks are invoked. Subsequent
-    /// send/recv calls return [`Error::Closed`].
+    /// Frames still waiting to be written are discarded, so a message sent
+    /// just before `close` may never reach the peer. All open streams are
+    /// closed and their close callbacks are invoked. Subsequent send/recv
+    /// calls return [`Error::Closed`].
+    ///
+    /// Dropping the last handle does not close the connection; call `close`
+    /// when done with it.
     pub fn close(self: &Arc<Self>) {
         self.close_internal();
     }
@@ -489,7 +504,7 @@ impl ConnectionInner {
 
     fn lookup_stream_ctx(self: &Connection, stream_id: u32) -> Option<StreamContext> {
         if stream_id == DEFAULT_STREAM_ID {
-            if let Some(handle) = self.default_stream.get() {
+            if let Some(handle) = self.default_stream.lock().unwrap().as_ref() {
                 return Some(handle.clone());
             }
         }
@@ -504,11 +519,19 @@ impl ConnectionInner {
         if let Some(stream_ctx) = self.lookup_stream_ctx(stream_id) {
             return stream_ctx;
         }
-        let stream_ctx = self.make_stream(stream_id);
-        if let Some(ref f) = self.on_new_stream {
-            f(Arc::clone(&stream_ctx.context));
+        if let Some(stream_ctx) = self.make_stream(stream_id) {
+            if let Some(ref f) = self.on_new_stream {
+                f(Arc::clone(&stream_ctx.context));
+            }
+            return stream_ctx;
         }
-        stream_ctx
+        // Another task registered the stream first, or the connection closed.
+        self.lookup_stream_ctx(stream_id).unwrap_or_else(|| {
+            Arc::new(StreamContextInner::new(
+                Arc::new(StreamInner::new_closed(self.clone())),
+                Arc::new(ContextInner::new()),
+            ))
+        })
     }
 
     fn get_stream(self: &Connection, stream_id: u32) -> Stream {
@@ -548,7 +571,9 @@ impl ConnectionInner {
         self.clone()
     }
 
-    fn make_stream(self: &Connection, stream_id: u32) -> StreamContext {
+    /// Registers and starts a stream. Returns `None` if the connection is
+    /// closed or `stream_id` is already registered.
+    fn make_stream(self: &Connection, stream_id: u32) -> Option<StreamContext> {
         let (inbox_tx, inbox_rx) = mpsc::channel::<RawMessage>(STREAM_QUEUE_SIZE);
         let (incoming_tx, mut incoming_rx) = mpsc::channel::<Vec<u8>>(STREAM_QUEUE_SIZE);
         let (handler_tx, handler_rx) = if self.registry.has_handlers() {
@@ -572,12 +597,17 @@ impl ConnectionInner {
             Arc::clone(&stream),
             Arc::clone(&context),
         ));
-        self.stream_contexts
-            .lock()
-            .unwrap()
-            .insert(stream_id, Arc::clone(&stream_ctx));
-        if stream_id == DEFAULT_STREAM_ID {
-            let _ = self.default_stream.set(Arc::clone(&stream_ctx));
+        {
+            let mut stream_contexts = self.stream_contexts.lock().unwrap();
+            // Checked under the lock so that no stream is registered after
+            // close_all_streams has taken the map.
+            if self.is_closed() || stream_contexts.contains_key(&stream_id) {
+                return None;
+            }
+            stream_contexts.insert(stream_id, Arc::clone(&stream_ctx));
+            if stream_id == DEFAULT_STREAM_ID {
+                *self.default_stream.lock().unwrap() = Some(Arc::clone(&stream_ctx));
+            }
         }
         self.debug
             .streams_opened
@@ -619,7 +649,7 @@ impl ConnectionInner {
                 }
             }
         });
-        stream_ctx
+        Some(stream_ctx)
     }
 
     fn spawn_handler_task(self: &Connection, stream_ctx: StreamContext) {

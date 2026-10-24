@@ -42,22 +42,26 @@ async fn main() -> anyhow::Result<()> {
     let client = am::Client::new();
     let conn = client.connect(&args.addr).await?;
 
-    match args.cmd.as_str() {
-        "timeout" => timeout_demo(&conn).await?,
-        "whoelse" => whoelse_query_demo(&conn).await?,
-        "whoelse_sub" => {
-            let event_task = whoelse_subscribe_demo(&conn).await?;
-            match event_task.await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => warn!("event task failed: {err}"),
-                Err(err) if err.is_cancelled() => {}
-                Err(err) => warn!("event task join error: {err}"),
+    let result: anyhow::Result<()> = async {
+        match args.cmd.as_str() {
+            "timeout" => timeout_demo(&conn).await?,
+            "whoelse" => whoelse_query_demo(&conn).await?,
+            "whoelse_sub" => {
+                let event_task = whoelse_subscribe_demo(&conn).await?;
+                match event_task.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => warn!("event task failed: {err}"),
+                    Err(err) if err.is_cancelled() => {}
+                    Err(err) => warn!("event task join error: {err}"),
+                }
             }
+            _ => echo_demo(&conn, &args.addr).await?,
         }
-        _ => echo_demo(&conn, &args.addr).await?,
+        Ok(())
     }
-
-    Ok(())
+    .await;
+    conn.close();
+    result
 }
 
 async fn timeout_demo(conn: &am::Connection) -> anyhow::Result<()> {
@@ -85,6 +89,7 @@ async fn timeout_demo(conn: &am::Connection) -> anyhow::Result<()> {
     stream.set_recv_timeout(Duration::ZERO);
     let _: OkReply = stream.send_recv(MessageTimeout { secs: 10 }).await?;
     info!("Recv OK");
+    stream.close();
     Ok(())
 }
 
@@ -100,6 +105,7 @@ async fn whoelse_subscribe_demo(
                 Ok(evt) => info!("event: new client {}", evt.addr),
                 Err(err) => {
                     warn!("event recv error: {err}");
+                    event_stream.close();
                     return Err(err.into());
                 }
             }
@@ -160,11 +166,14 @@ async fn concurrent_demo(addr: &str) -> anyhow::Result<()> {
                             anyhow::bail!("wrong number: expected {}, got {}", num + 1, rep.num);
                         }
                     }
+                    stream.close();
                     Ok::<_, anyhow::Error>(())
                 }));
             }
 
-            for result in try_join_all(stream_tasks).await? {
+            let results = try_join_all(stream_tasks).await;
+            conn.close();
+            for result in results? {
                 result?;
             }
             Ok(())

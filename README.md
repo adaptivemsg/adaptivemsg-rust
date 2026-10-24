@@ -64,6 +64,7 @@ am::Server::new().serve("tcp://0.0.0.0:5555").await?;
 let client = am::Client::new();
 let conn = client.connect("tcp://127.0.0.1:5555").await?;
 let reply: HelloReply = conn.send_recv(HelloRequest { who: "alice".into() }).await?;
+conn.close();
 ```
 
 For a one-shot connection:

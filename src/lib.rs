@@ -92,6 +92,8 @@ mod recovery_integration_test;
 mod recovery_runtime_bench_test;
 #[cfg(test)]
 mod scaling_bench_test;
+#[cfg(test)]
+mod stream_close_test;
 
 pub use crate::client::Client;
 pub use crate::codec::{CodecID, CodecImpl};

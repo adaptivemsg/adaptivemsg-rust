@@ -146,8 +146,12 @@ mod tests {
     #[test]
     fn replay_ack_drops_acked_frames() {
         let buffer = ReplayBuffer::new(crate::protocol::PROTOCOL_VERSION_V3, 1024);
-        let first = buffer.add(1, 1, vec![1, 2, 3]).expect("first replay add");
-        let second = buffer.add(1, 2, vec![4, 5, 6]).expect("second replay add");
+        let first = buffer
+            .add(1, 1, 0, vec![1, 2, 3])
+            .expect("first replay add");
+        let second = buffer
+            .add(1, 2, 0, vec![4, 5, 6])
+            .expect("second replay add");
 
         let snapshot = buffer.snapshot_from(0);
         assert_eq!(snapshot.len(), 2);
@@ -165,9 +169,9 @@ mod tests {
     #[test]
     fn add_and_snapshot() {
         let buf = ReplayBuffer::new(PROTOCOL_VERSION_V3, 1_000_000);
-        buf.add(0, 1, vec![1, 2, 3]).unwrap();
-        buf.add(0, 2, vec![4, 5]).unwrap();
-        buf.add(0, 3, vec![6]).unwrap();
+        buf.add(0, 1, 0, vec![1, 2, 3]).unwrap();
+        buf.add(0, 2, 0, vec![4, 5]).unwrap();
+        buf.add(0, 3, 0, vec![6]).unwrap();
         assert_eq!(buf.queued_count(), 3);
         assert!(buf.used_bytes() > 0);
 
@@ -184,16 +188,16 @@ mod tests {
     #[test]
     fn byte_limit_rejects_overflow() {
         let buf = ReplayBuffer::new(PROTOCOL_VERSION_V3, 30);
-        buf.add(0, 1, vec![0; 10]).unwrap();
-        let result = buf.add(0, 2, vec![0; 100]);
+        buf.add(0, 1, 0, vec![0; 10]).unwrap();
+        let result = buf.add(0, 2, 0, vec![0; 100]);
         assert!(result.is_err());
     }
 
     #[test]
     fn ack_frees_bytes() {
         let buf = ReplayBuffer::new(PROTOCOL_VERSION_V3, 1_000_000);
-        buf.add(0, 1, vec![0; 100]).unwrap();
-        buf.add(0, 2, vec![0; 100]).unwrap();
+        buf.add(0, 1, 0, vec![0; 100]).unwrap();
+        buf.add(0, 2, 0, vec![0; 100]).unwrap();
         let bytes_before = buf.used_bytes();
         buf.ack(1);
         assert!(buf.used_bytes() < bytes_before);
