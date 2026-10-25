@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-use crate::connection::Connection;
+use crate::connection::ConnectionRef;
 use crate::error::Error;
 use crate::frame_queue::FrameDeque;
 use crate::recovery_protocol::RecoveryToken;
@@ -15,7 +15,7 @@ use crate::replay::ReplayBuffer;
 pub type ResumeFuture =
     Pin<Box<dyn Future<Output = Result<crate::connection::TransportParts, Error>> + Send>>;
 pub type ResumeConnector = Arc<dyn Fn() -> ResumeFuture + Send + Sync>;
-pub type RecoveryRegistry = Arc<Mutex<std::collections::HashMap<RecoveryToken, Connection>>>;
+pub type RecoveryRegistry = Arc<Mutex<std::collections::HashMap<RecoveryToken, ConnectionRef>>>;
 
 /// Client-side recovery configuration for automatic reconnect and replay.
 ///
@@ -92,6 +92,9 @@ pub(crate) struct RecoveryState {
     pub resume_queue: Arc<FrameDeque>,
     pub reconnect_min_backoff: Duration,
     pub reconnect_max_backoff: Duration,
+    /// Limit for each client reconnect attempt, from the client's connect
+    /// timeout.
+    pub reconnect_timeout: Option<Duration>,
     pub detached_ttl: Duration,
     pub reconnect_active: AtomicBool,
     pub resume_active: AtomicBool,
@@ -223,6 +226,7 @@ impl RecoveryState {
         connection_id: RecoveryToken,
         resume_secret: RecoveryToken,
         resume_connector: ResumeConnector,
+        reconnect_timeout: Option<Duration>,
     ) -> Arc<Self> {
         let normalized = opts.normalized();
         let neg = negotiated.normalized();
@@ -237,6 +241,7 @@ impl RecoveryState {
             resume_queue: Arc::new(FrameDeque::new()),
             reconnect_min_backoff: normalized.reconnect_min_backoff,
             reconnect_max_backoff: normalized.reconnect_max_backoff,
+            reconnect_timeout,
             detached_ttl: Duration::ZERO,
             reconnect_active: AtomicBool::new(false),
             resume_active: AtomicBool::new(false),
@@ -279,6 +284,7 @@ impl RecoveryState {
             resume_queue: Arc::new(FrameDeque::new()),
             reconnect_min_backoff: Duration::ZERO,
             reconnect_max_backoff: Duration::ZERO,
+            reconnect_timeout: None,
             detached_ttl: normalized.detached_ttl,
             reconnect_active: AtomicBool::new(false),
             resume_active: AtomicBool::new(false),
@@ -430,7 +436,7 @@ impl RecoveryState {
         self.expire_notify.notify_waiters();
     }
 
-    pub(crate) fn on_closed(&self, connection: &Connection) {
+    pub(crate) fn on_closed(&self, connection: &ConnectionRef) {
         if let Some(registry) = &self.registry {
             let mut registry = registry.lock().unwrap();
             if let Some(current) = registry.get(&self.connection_id) {

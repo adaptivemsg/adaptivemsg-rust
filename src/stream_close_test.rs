@@ -1,5 +1,5 @@
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -28,6 +28,22 @@ impl MessageHandler for CloseTestSlowRequest {
         while !RELEASE_SLOW_HANDLER.load(Ordering::Acquire) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        Ok(None)
+    }
+}
+
+#[crate::message(register)]
+struct CloseTestRecord {}
+
+static RECORDED: AtomicUsize = AtomicUsize::new(0);
+
+#[crate::message_handler]
+impl MessageHandler for CloseTestRecord {
+    async fn handle(
+        self: Box<Self>,
+        _stream_ctx: crate::StreamContext,
+    ) -> crate::Result<Option<Box<dyn Message>>> {
+        RECORDED.fetch_add(1, Ordering::SeqCst);
         Ok(None)
     }
 }
@@ -95,7 +111,7 @@ async fn handler_task_exits_when_connection_closes_during_handler() {
     );
     let server_stream = SLOW_HANDLER_STREAM.lock().unwrap().clone().unwrap();
 
-    conn.close();
+    conn.close().await;
     assert!(
         wait_until(Duration::from_secs(2), || match server_stream.upgrade() {
             Some(stream) => stream.connection.is_closed(),
@@ -110,6 +126,29 @@ async fn handler_task_exits_when_connection_closes_during_handler() {
         wait_until(Duration::from_secs(2), || server_stream.upgrade().is_none()).await,
         "handler task still holds the stream after the connection closed"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn messages_sent_before_close_are_delivered() {
+    let conn = connect_test_server().await;
+    const STREAMS: usize = 200;
+    RECORDED.store(0, Ordering::SeqCst);
+    for _ in 0..STREAMS {
+        let stream = conn.new_stream();
+        stream.send(CloseTestRecord {}).await.expect("send");
+        stream.close();
+    }
+
+    wait_until(Duration::from_secs(2), || {
+        RECORDED.load(Ordering::SeqCst) == STREAMS
+    })
+    .await;
+    assert_eq!(
+        RECORDED.load(Ordering::SeqCst),
+        STREAMS,
+        "messages sent before close were not all handled"
+    );
+    conn.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -132,7 +171,7 @@ async fn recv_returns_closed_when_stream_is_closed_while_waiting() {
         "got {:?}",
         result.err()
     );
-    conn.close();
+    conn.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -148,7 +187,7 @@ async fn connection_is_freed_after_close() {
                 .expect("send");
         }
 
-        conn.close();
+        conn.close().await;
         assert!(matches!(
             conn.send(CloseTestNote {}).await,
             Err(Error::Closed)
@@ -176,7 +215,7 @@ async fn wait_closed_returns_when_connection_is_closed() {
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    conn.close();
+    conn.close().await;
     tokio::time::timeout(Duration::from_secs(2), waiter)
         .await
         .expect("wait_closed still blocked after close")

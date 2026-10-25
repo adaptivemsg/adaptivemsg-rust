@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -18,7 +18,7 @@ use crate::protocol::{HandshakeConfig, PROTOCOL_VERSION_V3};
 use crate::raw_message::RawMessage;
 use crate::recovery::RecoveryState;
 use crate::registry::{Handler, Registry};
-use crate::stream::{Stream, StreamInner};
+use crate::stream::{Stream, StreamInner, StreamRef};
 
 #[path = "recovery_runtime.rs"]
 mod recovery_runtime;
@@ -27,6 +27,10 @@ pub(crate) const STREAM_QUEUE_SIZE: usize = 1024;
 pub(crate) const DEFAULT_STREAM_ID: u32 = 0;
 /// Last ID `new_stream` hands out; the only larger value is the control stream.
 const MAX_STREAM_ID: u32 = crate::recovery_protocol::CONTROL_STREAM_ID - 1;
+/// Bounds how long `close` waits for queued frames to be delivered, and how
+/// long a clean close by the peer waits for the frames received before it to
+/// be delivered.
+const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) type TransportReader = Box<dyn AsyncRead + Unpin + Send>;
 pub(crate) type TransportWriter = Box<dyn AsyncWrite + Unpin + Send>;
@@ -36,13 +40,116 @@ pub(crate) struct TransportParts {
     pub writer: TransportWriter,
 }
 
-/// Shared handle to a negotiated connection (`Arc<ConnectionInner>`).
+pub(crate) type ConnectionRef = Arc<ConnectionInner>;
+
+/// Handle to a negotiated connection.
 ///
-/// Obtained from [`Client::connect`](crate::Client::connect) or passed to
-/// [`Server`](crate::Server) callbacks. Provides send/recv on a built-in
-/// default stream, or call `new_stream()` to multiplex additional logical
-/// streams. All methods are safe to call from multiple tasks concurrently.
-pub type Connection = Arc<ConnectionInner>;
+/// Obtained from [`Client::connect`](crate::Client::connect). Provides
+/// send/recv on a built-in default stream, or call `new_stream()` to
+/// multiplex additional logical streams. All methods are safe to call from
+/// multiple tasks concurrently, except that the default stream, like any
+/// [`Stream`], runs one `recv`, `peek_wire` or `send_recv` at a time; use
+/// `new_stream()` for concurrent request-reply.
+///
+/// Clones share one connection. Once the last handle to it and the last
+/// handle to a stream opened from it are dropped, the connection closes in
+/// the background as `close` would.
+#[derive(Clone)]
+pub struct Connection {
+    inner: ConnectionRef,
+    // The connection drops its own reference to the default stream when it
+    // closes, so the handle keeps one to deliver what was received before.
+    default_stream: StreamRef,
+    _owner: Option<Arc<Owner>>,
+}
+
+impl Connection {
+    /// Wraps a connection owned by the caller, which closes when its last
+    /// handle is dropped.
+    pub(crate) fn new_owned(inner: ConnectionRef) -> Self {
+        let owner = Arc::new(Owner(Arc::clone(&inner)));
+        *inner.owner.lock().unwrap() = Arc::downgrade(&owner);
+        Self {
+            default_stream: inner.default_stream(),
+            inner,
+            _owner: Some(owner),
+        }
+    }
+
+    /// Send a message on the default stream (fire-and-forget).
+    ///
+    /// The message is encoded with the negotiated codec and enqueued for
+    /// transmission. Returns once the frame is queued, not when the peer
+    /// receives it.
+    pub async fn send<M: crate::message::Message>(&self, msg: M) -> Result<(), Error> {
+        self.default_stream.send(msg).await
+    }
+
+    /// Receive the next message on the default stream and decode it as `T`.
+    ///
+    /// Blocks until a message arrives, the recv timeout expires
+    /// ([`Error::RecvTimeout`]), or the connection closes ([`Error::Closed`]).
+    /// Messages received before the connection closed are still returned.
+    /// Returns [`Error::TypeMismatch`] if the received message is not `T`.
+    pub async fn recv<T: crate::message::MessageDecode + 'static>(&self) -> Result<T, Error> {
+        self.default_stream.recv::<T>().await
+    }
+
+    /// Send a request and wait for a typed response on the default stream.
+    ///
+    /// Combines [`send`](Self::send) and [`recv`](Self::recv) into a single
+    /// request-reply exchange. If the remote handler returns an error, this
+    /// returns [`Error::Remote`] with the code and message from
+    /// [`ErrorReply`](crate::ErrorReply). It behaves like `send_recv` on a
+    /// [`Stream`].
+    pub async fn send_recv<TResp: crate::message::MessageDecode + 'static>(
+        &self,
+        msg: impl crate::message::Message,
+    ) -> Result<TResp, Error> {
+        self.default_stream.send_recv(msg).await
+    }
+
+    /// Peek the wire name of the next message on the default stream without
+    /// consuming it.
+    ///
+    /// Useful for branching on message type before calling [`recv`](Self::recv).
+    /// The peeked message remains available for the next `recv` call.
+    pub async fn peek_wire(&self) -> Result<String, Error> {
+        self.default_stream.peek_wire().await
+    }
+
+    /// Set the receive timeout on the default stream.
+    ///
+    /// Applies to subsequent [`recv`](Self::recv) and [`send_recv`](Self::send_recv)
+    /// calls. Pass `Duration::ZERO` to disable the timeout (wait indefinitely).
+    pub fn set_recv_timeout(&self, timeout: Duration) {
+        self.default_stream.set_recv_timeout(timeout);
+    }
+}
+
+impl std::ops::Deref for Connection {
+    type Target = Arc<ConnectionInner>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// Held by every handle to an owned connection, including the handles to its
+/// streams; dropping the last one closes the connection.
+pub(crate) struct Owner(ConnectionRef);
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        let connection = Arc::clone(&self.0);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move { connection.close().await });
+            }
+            Err(_) => connection.close_now(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 /// Connection metadata passed to server callbacks.
@@ -82,6 +189,10 @@ pub(crate) enum OutboundFrame {
         payload: Vec<u8>,
         queued_tx: oneshot::Sender<Result<(), Error>>,
     },
+    /// Marker queued by `close`: the writer writes the frames queued before
+    /// it and, in v3, CLOSE, then shuts down its half of the transport and
+    /// stops. `written` reports whether the writer got that far.
+    Close { written: oneshot::Sender<bool> },
 }
 pub(crate) type HandlerJob = (Arc<dyn Handler>, Box<dyn crate::message::Message>);
 
@@ -97,7 +208,7 @@ enum WriterCommand {
 }
 
 pub(crate) struct PendingConnection {
-    connection: Connection,
+    connection: ConnectionRef,
     reader: TransportReader,
     writer: TransportWriter,
     outbound_rx: mpsc::Receiver<OutboundFrame>,
@@ -109,9 +220,12 @@ pub struct ConnectionInner {
     self_ref: OnceLock<Weak<ConnectionInner>>,
     outbound_tx: mpsc::Sender<OutboundFrame>,
     stream_contexts: Mutex<HashMap<u32, StreamContext>>,
+    closed_peer_streams: Mutex<HashSet<u32>>,
     on_new_stream: Option<Arc<dyn Fn(Context) + Send + Sync>>,
     on_close_stream: Option<Arc<dyn Fn(Context) + Send + Sync>>,
     registry: Registry,
+    /// Set by `close` or a clean close by the peer; sends fail from then on.
+    closing: AtomicBool,
     closed: AtomicBool,
     writer_abort: OnceLock<AbortHandle>,
     current_reader_abort: Mutex<Option<(u64, AbortHandle)>>,
@@ -121,6 +235,9 @@ pub struct ConnectionInner {
     next_send_seq: AtomicU64,
     transport_gen: AtomicU64,
     default_stream: Mutex<Option<StreamContext>>,
+    /// Shared by the caller's handles when the caller owns the connection.
+    owner: Mutex<Weak<Owner>>,
+    default_recv_timeout: OnceLock<Duration>,
     config: OnceLock<ConnConfig>,
     recovery: OnceLock<Arc<RecoveryState>>,
     writer_cmd_tx: mpsc::UnboundedSender<WriterCommand>,
@@ -128,7 +245,7 @@ pub struct ConnectionInner {
 }
 
 impl PendingConnection {
-    pub(crate) fn connection(&self) -> Connection {
+    pub(crate) fn connection(&self) -> ConnectionRef {
         self.connection.clone()
     }
 
@@ -141,7 +258,7 @@ impl PendingConnection {
         config: HandshakeConfig,
         recovery: Option<Arc<RecoveryState>>,
         peer_last_recv_seq: u64,
-    ) -> Result<Connection, Error> {
+    ) -> Result<ConnectionRef, Error> {
         let config = self.connection.build_config(config)?;
         let _ = self.connection.config.set(config);
         if let Some(recovery) = recovery {
@@ -208,13 +325,13 @@ impl ConnectionInner {
         on_new_stream: Option<Arc<dyn Fn(Context) + Send + Sync>>,
         on_close_stream: Option<Arc<dyn Fn(Context) + Send + Sync>>,
     ) -> (
-        Connection,
+        ConnectionRef,
         mpsc::Receiver<OutboundFrame>,
         mpsc::UnboundedReceiver<WriterCommand>,
     ) {
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(STREAM_QUEUE_SIZE);
         let (writer_cmd_tx, writer_cmd_rx) = mpsc::unbounded_channel();
-        let connection: Connection = Arc::new_cyclic(|weak| {
+        let connection: ConnectionRef = Arc::new_cyclic(|weak| {
             let self_ref = {
                 let lock = OnceLock::new();
                 let _ = lock.set(weak.clone());
@@ -224,9 +341,11 @@ impl ConnectionInner {
                 self_ref,
                 outbound_tx,
                 stream_contexts: Mutex::new(HashMap::new()),
+                closed_peer_streams: Mutex::new(HashSet::new()),
                 on_new_stream,
                 on_close_stream,
                 registry,
+                closing: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 writer_abort: OnceLock::new(),
                 current_reader_abort: Mutex::new(None),
@@ -236,6 +355,8 @@ impl ConnectionInner {
                 next_send_seq: AtomicU64::new(0),
                 transport_gen: AtomicU64::new(0),
                 default_stream: Mutex::new(None),
+                owner: Mutex::new(Weak::new()),
+                default_recv_timeout: OnceLock::new(),
                 config: OnceLock::new(),
                 recovery: OnceLock::new(),
                 writer_cmd_tx,
@@ -245,11 +366,11 @@ impl ConnectionInner {
         (connection, outbound_rx, writer_cmd_rx)
     }
 
-    fn try_shared(&self) -> Option<Connection> {
+    fn try_shared(&self) -> Option<ConnectionRef> {
         self.self_ref.get().and_then(Weak::upgrade)
     }
 
-    fn shared(&self) -> Connection {
+    fn shared(&self) -> ConnectionRef {
         self.try_shared().expect("connection weak ref missing")
     }
 
@@ -280,11 +401,73 @@ impl ConnectionInner {
         self.config().codec_id
     }
 
+    /// Set the recv timeout that streams created afterwards start with.
+    pub(crate) fn set_default_recv_timeout(&self, timeout: Duration) {
+        let _ = self.default_recv_timeout.set(timeout);
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
     }
 
-    fn close_internal(&self) {
+    /// Closes at once, discarding frames not yet written.
+    pub(crate) fn close_now(&self) {
+        self.mark_closed();
+    }
+
+    /// Writes the frames queued so far and waits for the peer to close its
+    /// side, at most `CLOSE_FLUSH_TIMEOUT` in total. Closing a socket that
+    /// still holds unread data makes TCP reset the connection, and the peer
+    /// then loses the frames it has not read yet.
+    async fn close_gracefully(&self) {
+        if self.writer_abort.get().is_none() {
+            return;
+        }
+        let (written_tx, written_rx) = oneshot::channel();
+        let finish = async {
+            let marker = OutboundFrame::Close {
+                written: written_tx,
+            };
+            if self.outbound_tx.send(marker).await.is_err() {
+                return;
+            }
+            self.signal_send();
+            if !written_rx.await.unwrap_or(false) {
+                return;
+            }
+            // The reader sees the peer close its side and closes the connection.
+            self.wait_closed().await;
+        };
+        let _ = tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, finish).await;
+    }
+
+    /// Handles a clean close by the peer. The frames received before it are
+    /// delivered to their streams, waiting at most `CLOSE_FLUSH_TIMEOUT`,
+    /// before the connection closes.
+    pub(crate) async fn close_by_peer(&self) {
+        if self.closing.swap(true, Ordering::AcqRel) {
+            // close is waiting for the peer to finish.
+            self.mark_closed();
+            return;
+        }
+        let streams: Vec<StreamRef> = self
+            .stream_contexts
+            .lock()
+            .unwrap()
+            .values()
+            .map(|stream_ctx| Arc::clone(&stream_ctx.stream))
+            .collect();
+        // An empty payload is the FIN marker: each decode task releases its
+        // stream after delivering the frames queued before it.
+        let deliver = async {
+            for stream in &streams {
+                stream.queue_fin().await;
+            }
+            for stream in &streams {
+                stream.wait_closed().await;
+            }
+        };
+        let _ = tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, deliver).await;
         self.mark_closed();
     }
 
@@ -313,11 +496,11 @@ impl ConnectionInner {
     /// Open a new logical stream on this connection.
     ///
     /// Each stream has its own send/recv queues and can carry an independent
-    /// conversation. The returned [`Stream`] is an `Arc` and can be shared
-    /// across tasks. A stream is released by `close()` or when the connection
-    /// closes; dropping the handle does not release it. On a closed
-    /// connection, `new_stream` returns a stream whose operations return
-    /// [`Error::Closed`].
+    /// conversation. The returned [`Stream`] can be cloned and shared across
+    /// tasks, and keeps the connection open while it exists. A stream is
+    /// released by `close()` or when the connection closes; dropping the
+    /// handle does not release it. On a closed connection, `new_stream`
+    /// returns a stream whose operations return [`Error::Closed`].
     ///
     /// Stream IDs are never reused, so a connection can open at most
     /// `0xFFFFFFFE` streams. After that, `new_stream` returns a stream whose
@@ -332,64 +515,27 @@ impl ConnectionInner {
                 crate::debug::FAILURE_STREAM_IDS_EXHAUSTED,
                 "stream IDs exhausted".to_string(),
             );
-            return Arc::new(StreamInner::new_closed(self.clone()));
+            return self.stream_handle(Arc::new(StreamInner::new_closed(self.clone())));
         }
-        match self.make_stream(stream_id as u32) {
+        let stream = match self.make_stream(stream_id as u32) {
             Some(stream_ctx) => Arc::clone(&stream_ctx.stream),
             None => Arc::new(StreamInner::new_closed(self.clone())),
-        }
+        };
+        self.stream_handle(stream)
     }
 
-    /// Send a message on the default stream (fire-and-forget).
-    ///
-    /// The message is encoded with the negotiated codec and enqueued for
-    /// transmission. Returns once the frame is queued, not when the peer
-    /// receives it.
-    pub async fn send<M: crate::message::Message>(self: &Arc<Self>, msg: M) -> Result<(), Error> {
-        self.default_stream().send(msg).await
+    /// Wraps `stream` in a handle for the caller, which keeps an owned
+    /// connection open.
+    pub(crate) fn stream_handle(&self, stream: StreamRef) -> Stream {
+        Stream::new(stream, self.owner.lock().unwrap().upgrade())
     }
 
-    /// Receive the next message on the default stream and decode it as `T`.
-    ///
-    /// Blocks until a message arrives, the recv timeout expires
-    /// ([`Error::RecvTimeout`]), or the connection closes ([`Error::Closed`]).
-    /// Returns [`Error::TypeMismatch`] if the received message is not `T`.
-    pub async fn recv<T: crate::message::MessageDecode + 'static>(
+    /// Send a request on the default stream and wait for the reply.
+    pub(crate) async fn send_recv<TResp: crate::message::MessageDecode + 'static>(
         self: &Arc<Self>,
-    ) -> Result<T, Error> {
-        self.default_stream().recv::<T>().await
-    }
-
-    /// Send a request and wait for a typed response on the default stream.
-    ///
-    /// Combines [`send`](Self::send) and [`recv`](Self::recv) into a single
-    /// request-reply exchange. If the remote handler returns an error, this
-    /// returns [`Error::Remote`] with the code and message from [`ErrorReply`].
-    pub async fn send_recv<
-        TReq: crate::message::Message,
-        TResp: crate::message::MessageDecode + 'static,
-    >(
-        self: &Arc<Self>,
-        msg: TReq,
+        msg: impl crate::message::Message,
     ) -> Result<TResp, Error> {
-        self.default_stream().send_recv::<TReq, TResp>(msg).await
-    }
-
-    /// Peek the wire name of the next message on the default stream without
-    /// consuming it.
-    ///
-    /// Useful for branching on message type before calling [`recv`](Self::recv).
-    /// The peeked message remains available for the next `recv` call.
-    pub async fn peek_wire(self: &Arc<Self>) -> Result<String, Error> {
-        self.default_stream().peek_wire().await
-    }
-
-    /// Set the receive timeout on the default stream.
-    ///
-    /// Applies to subsequent [`recv`](Self::recv) and [`send_recv`](Self::send_recv)
-    /// calls. Pass `Duration::ZERO` to disable the timeout (wait indefinitely).
-    pub fn set_recv_timeout(self: &Arc<Self>, timeout: Duration) {
-        self.default_stream().set_recv_timeout(timeout);
+        self.default_stream().send_recv(msg).await
     }
 
     #[cfg(test)]
@@ -407,15 +553,21 @@ impl ConnectionInner {
 
     /// Close the connection and all streams.
     ///
-    /// Frames still waiting to be written are discarded, so a message sent
-    /// just before `close` may never reach the peer. All open streams are
-    /// closed and their close callbacks are invoked. Subsequent send/recv
-    /// calls return [`Error::Closed`].
+    /// The messages already queued by `send` are delivered first: they are
+    /// written, the peer is told that nothing more follows, and `close` waits
+    /// for the peer to close its side, at most 5 seconds in total. In v3 the
+    /// peer then releases the connection at once instead of keeping it for a
+    /// reconnect. Sends fail with [`Error::Closed`] once `close` has begun.
+    /// All open streams are closed and their close callbacks are invoked.
     ///
-    /// Dropping the last handle does not close the connection; call `close`
-    /// when done with it.
-    pub fn close(self: &Arc<Self>) {
-        self.close_internal();
+    /// Dropping the last [`Connection`] handle, counting the handles to the
+    /// streams opened from it, closes the connection the same way in the
+    /// background.
+    pub async fn close(self: &Arc<Self>) {
+        if !self.closing.swap(true, Ordering::AcqRel) {
+            self.close_gracefully().await;
+        }
+        self.mark_closed();
     }
 
     /// Returns a point-in-time diagnostic snapshot of this connection.
@@ -460,7 +612,7 @@ impl ConnectionInner {
         )
     }
 
-    fn default_stream(self: &Connection) -> Stream {
+    fn default_stream(self: &ConnectionRef) -> StreamRef {
         Arc::clone(&self.get_stream_ctx(DEFAULT_STREAM_ID).stream)
     }
 
@@ -496,13 +648,25 @@ impl ConnectionInner {
         stream_ctx
     }
 
+    /// Releases a stream that the peer opened. The peer is not told, so the ID
+    /// stays reserved until the peer's FIN: later frames on it are dropped
+    /// instead of opening the stream again.
+    pub(crate) fn remove_peer_stream(&self, stream_id: u32) -> Option<StreamContext> {
+        if stream_id != DEFAULT_STREAM_ID
+            && self.stream_contexts.lock().unwrap().contains_key(&stream_id)
+        {
+            self.closed_peer_streams.lock().unwrap().insert(stream_id);
+        }
+        self.remove_stream(stream_id)
+    }
+
     pub(crate) fn notify_close(&self, stream_ctx: &StreamContext) {
         if let Some(ref f) = self.on_close_stream {
             f(Arc::clone(&stream_ctx.context));
         }
     }
 
-    fn lookup_stream_ctx(self: &Connection, stream_id: u32) -> Option<StreamContext> {
+    fn lookup_stream_ctx(self: &ConnectionRef, stream_id: u32) -> Option<StreamContext> {
         if stream_id == DEFAULT_STREAM_ID {
             if let Some(handle) = self.default_stream.lock().unwrap().as_ref() {
                 return Some(handle.clone());
@@ -515,7 +679,7 @@ impl ConnectionInner {
             .cloned()
     }
 
-    fn get_stream_ctx(self: &Connection, stream_id: u32) -> StreamContext {
+    fn get_stream_ctx(self: &ConnectionRef, stream_id: u32) -> StreamContext {
         if let Some(stream_ctx) = self.lookup_stream_ctx(stream_id) {
             return stream_ctx;
         }
@@ -534,7 +698,7 @@ impl ConnectionInner {
         })
     }
 
-    fn get_stream(self: &Connection, stream_id: u32) -> Stream {
+    fn get_stream(self: &ConnectionRef, stream_id: u32) -> StreamRef {
         Arc::clone(&self.get_stream_ctx(stream_id).stream)
     }
 
@@ -545,23 +709,26 @@ impl ConnectionInner {
     }
 
     /// Like `get_stream`, but returns `None` for a frame that belongs to a
-    /// stream this side opened and already closed. Stream IDs are never
-    /// reused, so a missing stream that this side opened was closed here.
-    fn inbound_stream(self: &Connection, stream_id: u32) -> Option<Stream> {
+    /// stream already closed on this side. Stream IDs are never reused, so a
+    /// missing stream that this side opened was closed here, as was one listed
+    /// in `closed_peer_streams`.
+    fn inbound_stream(self: &ConnectionRef, stream_id: u32) -> Option<StreamRef> {
         if let Some(stream_ctx) = self.lookup_stream_ctx(stream_id) {
             return Some(Arc::clone(&stream_ctx.stream));
         }
-        if self.opened_stream(stream_id) {
+        if self.opened_stream(stream_id)
+            || self.closed_peer_streams.lock().unwrap().contains(&stream_id)
+        {
             return None;
         }
         Some(self.get_stream(stream_id))
     }
 
     fn start(
-        self: &Connection,
+        self: &ConnectionRef,
         outbound_rx: mpsc::Receiver<OutboundFrame>,
         writer_cmd_rx: mpsc::UnboundedReceiver<WriterCommand>,
-    ) -> Connection {
+    ) -> ConnectionRef {
         let writer_task = if self.is_recovery_enabled() {
             self.spawn_recovery_writer(writer_cmd_rx, outbound_rx)
         } else {
@@ -573,7 +740,7 @@ impl ConnectionInner {
 
     /// Registers and starts a stream. Returns `None` if the connection is
     /// closed or `stream_id` is already registered.
-    fn make_stream(self: &Connection, stream_id: u32) -> Option<StreamContext> {
+    fn make_stream(self: &ConnectionRef, stream_id: u32) -> Option<StreamContext> {
         let (inbox_tx, inbox_rx) = mpsc::channel::<RawMessage>(STREAM_QUEUE_SIZE);
         let (incoming_tx, mut incoming_rx) = mpsc::channel::<Vec<u8>>(STREAM_QUEUE_SIZE);
         let (handler_tx, handler_rx) = if self.registry.has_handlers() {
@@ -593,6 +760,9 @@ impl ConnectionInner {
             handler_rx,
             handler_tx,
         ));
+        if let Some(timeout) = self.default_recv_timeout.get() {
+            stream.set_recv_timeout(*timeout);
+        }
         let stream_ctx = Arc::new(StreamContextInner::new(
             Arc::clone(&stream),
             Arc::clone(&context),
@@ -624,6 +794,12 @@ impl ConnectionInner {
                         },
                         _ = stream.wait_closed() => break,
                     };
+                    if payload.is_empty() {
+                        if let Some(stream_ctx) = stream.connection.remove_stream(stream.id) {
+                            stream.connection.notify_close(&stream_ctx);
+                        }
+                        break;
+                    }
                     let raw = match stream.connection.decode_envelope(&payload) {
                         Ok(raw) => {
                             stream
@@ -652,7 +828,7 @@ impl ConnectionInner {
         Some(stream_ctx)
     }
 
-    fn spawn_handler_task(self: &Connection, stream_ctx: StreamContext) {
+    fn spawn_handler_task(self: &ConnectionRef, stream_ctx: StreamContext) {
         if !self.registry.has_handlers() {
             return;
         }
@@ -700,7 +876,7 @@ impl ConnectionInner {
         });
     }
 
-    async fn dispatch_raw(&self, stream: &Stream, raw: RawMessage) {
+    async fn dispatch_raw(&self, stream: &StreamRef, raw: RawMessage) {
         if let Some(handler) = self.registry.handler(&raw.wire) {
             match crate::raw_message::decode_raw_with_registry(raw, &self.registry) {
                 Ok(msg) => {
@@ -731,7 +907,7 @@ impl ConnectionInner {
     }
 
     pub(crate) async fn accept_frame(
-        self: &Connection,
+        self: &ConnectionRef,
         stream_id: u32,
         flags: u8,
         payload: Vec<u8>,
@@ -740,12 +916,17 @@ impl ConnectionInner {
             && stream_id != DEFAULT_STREAM_ID
             && stream_id != crate::recovery_protocol::CONTROL_STREAM_ID;
         if fin && payload.is_empty() {
-            if let Some(stream_ctx) = self.remove_stream(stream_id) {
-                self.notify_close(&stream_ctx);
+            // The peer is done with the stream, so its ID need not stay reserved.
+            self.closed_peer_streams.lock().unwrap().remove(&stream_id);
+            if let Some(stream_ctx) = self.lookup_stream_ctx(stream_id) {
+                stream_ctx.stream.queue_fin().await;
             }
             return Ok(());
         }
         let Some(stream) = self.inbound_stream(stream_id) else {
+            if fin {
+                self.closed_peer_streams.lock().unwrap().remove(&stream_id);
+            }
             return Ok(());
         };
         if !payload.is_empty() && stream.incoming_tx.send(payload).await.is_err() {
@@ -756,21 +937,28 @@ impl ConnectionInner {
             return Ok(());
         }
         if fin {
-            if let Some(stream_ctx) = self.remove_stream(stream_id) {
-                self.notify_close(&stream_ctx);
-            }
+            stream.queue_fin().await;
         }
         Ok(())
     }
 
+    /// Encodes `msg`, rejecting a payload above the negotiated max frame so
+    /// that the writer never fails on it.
     pub(crate) fn encode_message(
         &self,
         msg: &dyn crate::message::Message,
     ) -> Result<Vec<u8>, Error> {
-        self.config().codec.encode(msg)
+        let payload = self.config().codec.encode(msg)?;
+        if payload.len() > self.config().max_frame as usize {
+            return Err(Error::FrameTooLarge(payload.len()));
+        }
+        Ok(payload)
     }
 
     pub(crate) async fn enqueue_frame(&self, frame: OutboundFrame) -> Result<(), Error> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
         if self.recovery().is_some() {
             let (stream_id, flags, payload) = match frame {
                 OutboundFrame::Plain {
@@ -784,6 +972,7 @@ impl ConnectionInner {
                     payload,
                     ..
                 } => (stream_id, flags, payload),
+                OutboundFrame::Close { .. } => return Err(Error::Closed),
             };
             let (queued_tx, queued_rx) = oneshot::channel();
             self.outbound_tx
@@ -824,7 +1013,7 @@ impl ConnectionInner {
     }
 
     fn spawn_plain_writer(
-        self: &Connection,
+        self: &ConnectionRef,
         mut writer_cmd_rx: mpsc::UnboundedReceiver<WriterCommand>,
         mut outbound_rx: mpsc::Receiver<OutboundFrame>,
     ) -> JoinHandle<()> {
@@ -848,21 +1037,23 @@ impl ConnectionInner {
                     maybe_frame = outbound_rx.recv(), if writer.is_some() => match maybe_frame {
                         Some(frame) => {
                             let writer_ref = writer.as_mut().expect("writer missing");
-                            // Write first frame without flushing.
-                            if let Err(err) = Self::write_plain_frame_no_flush(&connection, writer_ref, frame).await {
-                                connection.debug.note_failure(crate::debug::FAILURE_CONNECTION_WRITER, err.to_string());
-                                warn!("write failed: {err}");
-                                connection.mark_closed();
-                                return;
-                            }
-                            // Drain any queued frames without blocking.
-                            while let Ok(frame) = outbound_rx.try_recv() {
+                            // Write it and any other queued frames without
+                            // blocking, then flush once for the batch.
+                            let mut next = Some(frame);
+                            while let Some(frame) = next.take() {
+                                if let OutboundFrame::Close { written } = frame {
+                                    // shutdown flushes, then sends FIN.
+                                    let result = writer_ref.shutdown().await;
+                                    let _ = written.send(result.is_ok());
+                                    return;
+                                }
                                 if let Err(err) = Self::write_plain_frame_no_flush(&connection, writer_ref, frame).await {
                                     connection.debug.note_failure(crate::debug::FAILURE_CONNECTION_WRITER, err.to_string());
                                     warn!("write failed: {err}");
                                     connection.mark_closed();
                                     return;
                                 }
+                                next = outbound_rx.try_recv().ok();
                             }
                             // Flush once for the entire batch.
                             if let Err(err) = writer_ref.flush().await {
@@ -880,7 +1071,7 @@ impl ConnectionInner {
     }
 
     async fn write_plain_frame_no_flush(
-        connection: &Connection,
+        connection: &ConnectionRef,
         writer: &mut TransportWriter,
         frame: OutboundFrame,
     ) -> Result<(), Error> {
@@ -899,6 +1090,7 @@ impl ConnectionInner {
                 let _ = queued_tx.send(Ok(()));
                 (stream_id, flags, payload)
             }
+            OutboundFrame::Close { .. } => return Ok(()),
         };
         write_frame_no_flush(connection.config(), writer, stream_id, 0, flags, &payload).await?;
         connection
@@ -913,7 +1105,7 @@ impl ConnectionInner {
     }
 
     fn spawn_plain_reader(
-        self: &Connection,
+        self: &ConnectionRef,
         gen: u64,
         mut reader: TransportReader,
     ) -> JoinHandle<()> {
@@ -921,7 +1113,12 @@ impl ConnectionInner {
         tokio::spawn(async move {
             loop {
                 match read_frame(connection.config(), &mut reader).await {
-                    Ok((stream_id, _, flags, payload)) => {
+                    Ok(None) => {
+                        // The peer closed the transport at a frame boundary.
+                        connection.close_by_peer().await;
+                        return;
+                    }
+                    Ok(Some((stream_id, _, flags, payload))) => {
                         connection
                             .debug
                             .frames_read
@@ -956,7 +1153,7 @@ impl ConnectionInner {
 
 impl Drop for ConnectionInner {
     fn drop(&mut self) {
-        self.close_internal();
+        self.close_now();
     }
 }
 
@@ -1001,18 +1198,24 @@ where
     Ok(())
 }
 
-async fn read_frame<R>(config: &ConnConfig, reader: &mut R) -> Result<InboundFrame, Error>
+/// Reads the next frame, or `None` if the peer closed the transport at a frame
+/// boundary.
+async fn read_frame<R>(config: &ConnConfig, reader: &mut R) -> Result<Option<InboundFrame>, Error>
 where
     R: AsyncRead + Unpin,
 {
     let header_len = frame_header_len_for_version(config.version)?;
     let mut header = [0u8; FRAME_HEADER_LEN_V3];
-    reader.read_exact(&mut header[..header_len]).await?;
+    let read = reader.read(&mut header[..header_len]).await?;
+    if read == 0 {
+        return Ok(None);
+    }
+    reader.read_exact(&mut header[read..header_len]).await?;
     let (stream_id, seq, flags, payload_len) = parse_header(&header[..header_len], config.version)?;
     if payload_len as u32 > config.max_frame {
         return Err(Error::FrameTooLarge(payload_len));
     }
     let mut payload = vec![0u8; payload_len];
     reader.read_exact(&mut payload).await?;
-    Ok((stream_id, seq, flags, payload))
+    Ok(Some((stream_id, seq, flags, payload)))
 }

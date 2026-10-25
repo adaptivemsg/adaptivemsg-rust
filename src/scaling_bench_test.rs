@@ -103,7 +103,7 @@ async fn run_scaling_perf_case(
     let mut all_conns = Vec::with_capacity(conns);
 
     for _ in 0..conns {
-        let mut client = crate::Client::new().with_timeout(Duration::from_secs(5));
+        let mut client = crate::Client::new().with_connect_timeout(Duration::from_secs(5));
         if let Some(ref codecs) = codecs {
             client = client.with_codecs(codecs);
         }
@@ -199,7 +199,7 @@ async fn run_scaling_perf_case(
 
     // Cleanup
     for conn in all_conns {
-        conn.close();
+        conn.close().await;
     }
     server.abort();
 

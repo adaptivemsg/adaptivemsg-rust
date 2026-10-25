@@ -26,7 +26,7 @@ pub async fn connect(
     let mut pending = ConnectionInner::new_pending_from_split(recv, send, registry, None, None);
     let (reader, writer) = pending.io_mut();
     let config = handshake_client(reader, writer, codecs, max_frame, PROTOCOL_VERSION_V2).await?;
-    pending.start_with_config(config, None, 0)
+    pending.start_with_config(config, None, 0).map(Connection::new_owned)
 }
 
 pub async fn accept(
@@ -44,7 +44,7 @@ pub async fn accept(
     let mut pending = ConnectionInner::new_pending_from_split(recv, send, registry, None, None);
     let (reader, writer) = pending.io_mut();
     let config = handshake_server(reader, writer, codecs, max_frame, false).await?;
-    pending.start_with_config(config, None, 0)
+    pending.start_with_config(config, None, 0).map(Connection::new_owned)
 }
 
 fn to_io_err<E: std::error::Error>(err: E) -> io::Error {

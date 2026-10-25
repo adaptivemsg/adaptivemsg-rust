@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::error::Error;
-use crate::stream::Stream;
+use crate::stream::{Stream, StreamRef};
 
 /// Shared handle to a stream and its associated context.
 pub type StreamContext = Arc<StreamContextInner>;
@@ -48,13 +48,13 @@ impl ContextInner {
 
 /// Context wrapper passed to message handlers.
 pub struct StreamContextInner {
-    pub(crate) stream: Stream,
+    pub(crate) stream: StreamRef,
     pub(crate) context: Context,
     handler_task_active: AtomicBool,
 }
 
 impl StreamContextInner {
-    pub(crate) fn new(stream: Stream, context: Context) -> Self {
+    pub(crate) fn new(stream: StreamRef, context: Context) -> Self {
         Self {
             stream,
             context,
@@ -88,7 +88,10 @@ impl StreamContextInner {
         F: FnOnce(Stream) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let stream = Arc::clone(&self.stream);
+        let stream = self
+            .stream
+            .connection
+            .stream_handle(Arc::clone(&self.stream));
         if self
             .handler_task_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

@@ -1,30 +1,58 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::sync::Notify;
 
-use crate::connection::{Connection, HandlerJob};
+use crate::connection::{ConnectionRef, HandlerJob, Owner};
 use crate::debug::{StreamDebugCounters, StreamDebugState};
 use crate::error::Error;
 use crate::message::{ErrorReply, Message, MessageDecode};
 use crate::type_info::expected_wire_name;
 use crate::raw_message::{decode_raw_as, RawMessage};
 
-/// Shared handle to a logical stream within a connection (`Arc<StreamInner>`).
+pub(crate) type StreamRef = Arc<StreamInner>;
+
+/// Handle to a logical stream within a connection.
 ///
 /// Each stream has independent send/recv channels, its own recv timeout, and
-/// can carry a separate conversation. Obtained via `Connection::new_stream()`
-/// or implicitly through the connection's default stream methods.
-pub type Stream = Arc<StreamInner>;
+/// carries one ordered conversation. `send` may be called from several tasks
+/// at once, but `recv`, `peek_wire` and `send_recv` must not run concurrently
+/// on the same stream: the extra call returns [`Error::ConcurrentRecv`], and a
+/// rejected `send_recv` sends nothing. Use one stream per concurrent
+/// conversation. Obtained via `Connection::new_stream()` or implicitly through
+/// the connection's default stream methods. Clones share the stream, and a
+/// handle keeps its connection open.
+#[derive(Clone)]
+pub struct Stream {
+    inner: StreamRef,
+    _owner: Option<Arc<Owner>>,
+}
+
+impl Stream {
+    pub(crate) fn new(inner: StreamRef, owner: Option<Arc<Owner>>) -> Self {
+        Self {
+            inner,
+            _owner: owner,
+        }
+    }
+}
+
+impl std::ops::Deref for Stream {
+    type Target = Arc<StreamInner>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
 
 const RECV_TIMEOUT_NONE: u64 = 0;
 
 /// A logical stream for sending and receiving messages.
 pub struct StreamInner {
     pub(crate) id: u32,
-    pub(crate) connection: Connection,
+    pub(crate) connection: ConnectionRef,
     pub(crate) handler_rx: Option<AsyncMutex<mpsc::Receiver<HandlerJob>>>,
     pub(crate) handler_tx: Option<mpsc::Sender<HandlerJob>>,
     pub(crate) inbox_rx: AsyncMutex<mpsc::Receiver<RawMessage>>,
@@ -33,6 +61,7 @@ pub struct StreamInner {
     recv_timeout_nanos: AtomicU64,
     recv_active: AtomicBool,
     peeked: Mutex<Option<RawMessage>>,
+    stale_replies: AtomicUsize,
     closed: AtomicBool,
     fin_started: AtomicBool,
     send_lock: AsyncMutex<()>,
@@ -43,7 +72,7 @@ pub struct StreamInner {
 impl StreamInner {
     pub(crate) fn new(
         id: u32,
-        connection: Connection,
+        connection: ConnectionRef,
         inbox_rx: mpsc::Receiver<RawMessage>,
         inbox_tx: mpsc::Sender<RawMessage>,
         incoming_tx: mpsc::Sender<Vec<u8>>,
@@ -61,6 +90,7 @@ impl StreamInner {
             recv_timeout_nanos: AtomicU64::new(RECV_TIMEOUT_NONE),
             recv_active: AtomicBool::new(false),
             peeked: Mutex::new(None),
+            stale_replies: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             fin_started: AtomicBool::new(false),
             send_lock: AsyncMutex::new(()),
@@ -72,7 +102,7 @@ impl StreamInner {
     /// A stream that is not registered on `connection` and returns
     /// [`Error::Closed`] from every operation. Its ID is the control stream ID
     /// rather than 0 because closing stream 0 would remove the default stream.
-    pub(crate) fn new_closed(connection: Connection) -> Self {
+    pub(crate) fn new_closed(connection: ConnectionRef) -> Self {
         let (inbox_tx, inbox_rx) = mpsc::channel(1);
         let (incoming_tx, _) = mpsc::channel(1);
         let stream = Self::new(
@@ -120,12 +150,13 @@ impl StreamInner {
     /// Close this stream and notify close callbacks.
     ///
     /// If this side opened the stream with `new_stream`, it first queues a FIN
-    /// frame so the peer can release its copy. Only the opener sends FIN, so a
-    /// stream opened by the peer is removed locally, as is stream 0, whose
-    /// lifetime follows the connection.
+    /// frame; the peer delivers the messages sent before it and then releases
+    /// its copy. Only the opener sends FIN, so a stream opened by the peer is
+    /// removed locally, as is stream 0, whose lifetime follows the connection;
+    /// frames the peer still sends on such a stream are dropped.
     pub fn close(self: &Arc<Self>) {
         if !self.connection.opened_stream(self.id) {
-            if let Some(stream_ctx) = self.connection.remove_stream(self.id) {
+            if let Some(stream_ctx) = self.connection.remove_peer_stream(self.id) {
                 self.connection.notify_close(&stream_ctx);
             }
             return;
@@ -150,6 +181,13 @@ impl StreamInner {
             payload: Vec::new(),
         };
         let _ = self.connection.enqueue_frame(frame).await;
+    }
+
+    /// Queue the peer's FIN as an empty payload behind the frames already
+    /// received, so the decode task closes the stream only after delivering
+    /// them.
+    pub(crate) async fn queue_fin(&self) {
+        let _ = self.incoming_tx.send(Vec::new()).await;
     }
 
     pub(crate) fn close_channels(&self) {
@@ -207,13 +245,25 @@ impl StreamInner {
 
     /// Send a request and wait for a response of type `TResp`.
     ///
-    /// If the remote sends `ErrorReply`, this returns `Error::Remote`.
-    pub async fn send_recv<TReq: Message, TResp: MessageDecode + 'static>(
+    /// If the remote sends `ErrorReply`, this returns `Error::Remote`. After
+    /// [`Error::RecvTimeout`] the stream discards the late reply when it
+    /// arrives, so the next request on this stream receives its own reply.
+    /// Returns [`Error::ConcurrentRecv`] without sending `msg` if a `recv`,
+    /// `peek_wire` or `send_recv` is already in progress on this stream.
+    pub async fn send_recv<TResp: MessageDecode + 'static>(
         &self,
-        msg: TReq,
+        msg: impl Message,
     ) -> Result<TResp, Error> {
+        let _guard = self.recv_guard()?;
         self.send(msg).await?;
-        let raw = self.recv_raw().await?;
+        let raw = match self.take_raw().await {
+            Err(Error::RecvTimeout) => {
+                // The recv guard serializes stale_replies, as it does peeked.
+                self.stale_replies.fetch_add(1, Ordering::Relaxed);
+                return Err(Error::RecvTimeout);
+            }
+            result => result?,
+        };
         if raw.wire == error_reply_wire_name() {
             match decode_raw_as::<ErrorReply>(raw) {
                 Ok(reply) => {
@@ -281,10 +331,17 @@ impl StreamInner {
             return Err(Error::Closed);
         };
         let mut handler_rx = handler_rx.lock().await;
+        // Jobs queued before the stream closed still run.
         tokio::select! {
+            biased;
             job = handler_rx.recv() => job.ok_or(Error::Closed),
             _ = self.wait_closed() => Err(Error::Closed),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recv_in_progress(&self) -> bool {
+        self.recv_active.load(Ordering::Acquire)
     }
 
     fn recv_guard(&self) -> Result<RecvGuard<'_>, Error> {
@@ -302,6 +359,11 @@ impl StreamInner {
 
     async fn recv_raw(&self) -> Result<RawMessage, Error> {
         let _guard = self.recv_guard()?;
+        self.take_raw().await
+    }
+
+    /// Returns the next message. The caller holds the recv guard.
+    async fn take_raw(&self) -> Result<RawMessage, Error> {
         if let Some(msg) = self.peeked.lock().unwrap().take() {
             return Ok(msg);
         }
@@ -310,27 +372,43 @@ impl StreamInner {
 
     async fn read_raw(&self) -> Result<RawMessage, Error> {
         let timeout_nanos = self.recv_timeout_nanos.load(Ordering::Relaxed);
+        let deadline = (timeout_nanos != RECV_TIMEOUT_NONE)
+            .then(|| tokio::time::Instant::now() + Duration::from_nanos(timeout_nanos));
         let mut inbox = self.inbox_rx.lock().await;
+        loop {
+            let msg = self.next_inbox(&mut inbox, deadline).await?;
+            if self.stale_replies.load(Ordering::Relaxed) > 0 {
+                self.stale_replies.fetch_sub(1, Ordering::Relaxed);
+                continue;
+            }
+            return Ok(msg);
+        }
+    }
+
+    async fn next_inbox(
+        &self,
+        inbox: &mut mpsc::Receiver<RawMessage>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<RawMessage, Error> {
         if let Ok(msg) = inbox.try_recv() {
             return Ok(msg);
         }
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(Error::Closed);
+        // Messages delivered before the stream closed are still returned.
+        if self.closed.load(Ordering::Acquire) {
+            return inbox.try_recv().map_err(|_| Error::Closed);
         }
-        if timeout_nanos == RECV_TIMEOUT_NONE {
-            tokio::select! {
-                msg = inbox.recv() => msg.ok_or(Error::Closed),
-                _ = self.connection.wait_closed() => Err(Error::Closed),
-                _ = self.wait_closed() => Err(Error::Closed),
+        let timeout = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
             }
-        } else {
-            let timeout = Duration::from_nanos(timeout_nanos);
-            tokio::select! {
-                msg = inbox.recv() => msg.ok_or(Error::Closed),
-                _ = self.connection.wait_closed() => Err(Error::Closed),
-                _ = self.wait_closed() => Err(Error::Closed),
-                _ = tokio::time::sleep(timeout) => Err(Error::RecvTimeout),
-            }
+        };
+        tokio::select! {
+            biased;
+            msg = inbox.recv() => msg.ok_or(Error::Closed),
+            _ = self.connection.wait_closed() => Err(Error::Closed),
+            _ = self.wait_closed() => Err(Error::Closed),
+            _ = timeout => Err(Error::RecvTimeout),
         }
     }
 
@@ -339,9 +417,11 @@ impl StreamInner {
         let _ = self
             .send_boxed(Box::new(ErrorReply::new(code, message)))
             .await;
-        if self.connection.opened_stream(self.id)
-            && !self.fin_started.swap(true, Ordering::AcqRel)
-        {
+        if !self.connection.opened_stream(self.id) {
+            self.connection.remove_peer_stream(self.id);
+            return;
+        }
+        if !self.fin_started.swap(true, Ordering::AcqRel) {
             self.send_fin().await;
         }
         self.connection.remove_stream(self.id);

@@ -36,7 +36,10 @@ async fn main() -> anyhow::Result<()> {
                 question: "who are you".into(),
             })
             .await?;
-        info!("default stream: {}", reply.answer);
+        info!(
+            "default stream: {} (trace {})",
+            reply.answer, reply.internal.trace_id
+        );
         Ok(())
     });
 
@@ -51,7 +54,10 @@ async fn main() -> anyhow::Result<()> {
             .await;
         stream.close();
         let reply = reply?;
-        info!("stream A: {}", reply.answer);
+        info!(
+            "stream A: {} (trace {})",
+            reply.answer, reply.internal.trace_id
+        );
         Ok(())
     });
 
@@ -77,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
 
     let join = |t: Task| async move { t.await? };
     let (r0, r1, r2) = tokio::join!(join(t_default), join(t1), join(t2));
-    conn.close();
+    conn.close().await;
     for result in [r0, r1, r2] {
         if let Err(err) = result {
             warn!("task error: {err}");

@@ -8,7 +8,8 @@ pub const PROTOCOL_VERSION_V2: u8 = 2;
 pub const PROTOCOL_VERSION_V3: u8 = 3;
 pub const HANDSHAKE_HEADER_LEN: usize = 12;
 pub const MAX_CODEC_COUNT: usize = 16;
-pub const DEFAULT_MAX_FRAME: u32 = u32::MAX;
+/// Also bounds how much memory one frame header can make the receiver allocate.
+pub const DEFAULT_MAX_FRAME: u32 = 16 << 20;
 
 pub const HANDSHAKE_MAGIC: [u8; 2] = *b"AM";
 

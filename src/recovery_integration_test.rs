@@ -422,7 +422,7 @@ async fn recovery_queues_send_while_detached() {
     wait_server_ready(&addr).await;
 
     let client = crate::Client::new()
-        .with_timeout(Duration::from_millis(500))
+        .with_connect_timeout(Duration::from_millis(500))
         .with_recovery(crate::ClientRecoveryOptions {
             enable: true,
             reconnect_min_backoff: Duration::from_millis(5),
@@ -467,7 +467,7 @@ async fn recovery_replays_reply_after_transport_break() {
     wait_server_ready(&addr).await;
 
     let client = crate::Client::new()
-        .with_timeout(Duration::from_millis(500))
+        .with_connect_timeout(Duration::from_millis(500))
         .with_recovery(crate::ClientRecoveryOptions {
             enable: true,
             reconnect_min_backoff: Duration::from_millis(5),
@@ -515,7 +515,7 @@ async fn recovery_heartbeat_detects_idle_blackhole_and_reconnects() {
         start_heartbeat_blackhole_server(&addr, server_opts).await;
 
     let client = crate::Client::new()
-        .with_timeout(Duration::from_millis(500))
+        .with_connect_timeout(Duration::from_millis(500))
         .with_recovery(crate::ClientRecoveryOptions {
             enable: true,
             reconnect_min_backoff: Duration::from_millis(5),
@@ -542,7 +542,7 @@ async fn recovery_send_recv_after_reconnect() {
     wait_server_ready(&addr).await;
 
     let client = crate::Client::new()
-        .with_timeout(Duration::from_millis(500))
+        .with_connect_timeout(Duration::from_millis(500))
         .with_recovery(crate::ClientRecoveryOptions {
             enable: true,
             reconnect_min_backoff: Duration::from_millis(5),
@@ -585,7 +585,7 @@ async fn recovery_heartbeat_keeps_idle_connection_alive() {
     wait_server_ready(&addr).await;
 
     let client = crate::Client::new()
-        .with_timeout(Duration::from_millis(500))
+        .with_connect_timeout(Duration::from_millis(500))
         .with_recovery(crate::ClientRecoveryOptions {
             enable: true,
             reconnect_min_backoff: Duration::from_millis(5),

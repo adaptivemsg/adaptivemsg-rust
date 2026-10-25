@@ -75,8 +75,14 @@ Channel hops per inbound message: 2 (reader → decoder, decoder → inbox/handl
 
 ### Ownership Model
 
-- `Connection = Arc<ConnectionInner>` — shared by all streams and tasks.
-- `Stream = Arc<StreamInner>` — shared by user code and decoder/handler tasks.
+- `ConnectionRef = Arc<ConnectionInner>` — shared by all streams and tasks.
+- `StreamRef = Arc<StreamInner>` — shared by decoder/handler tasks.
+- `Connection` and `Stream` are the handles given to user code. They wrap the
+  `Arc`s above plus a shared `Owner`; when the last user handle to an owned
+  connection is dropped, `Owner` closes it in the background. Server-side
+  connections have no owner. `Connection` also keeps its default stream, which
+  the connection itself drops on close, so `recv` still returns what arrived
+  before.
 - `StreamContext = Arc<StreamContextInner>` — handlers get context, not full I/O.
 - Self-referential via `Arc::new_cyclic()` and `OnceLock<Weak<ConnectionInner>>`.
 - Transport ownership: writer holds `TransportWriter`, reader holds `TransportReader`. Both are `Box<dyn AsyncRead/Write>`.
@@ -115,7 +121,6 @@ Local errors (defined in `error.rs`):
 - `Error::UnsupportedCodec`
 - `Error::UnsupportedFrameVersion`
 - `Error::NoCommonCodec`
-- `Error::HandshakeRejected`
 - `Error::NoCommonVersion`
 - `Error::TooManyCodecs`
 - `Error::RecvTimeout`
@@ -135,9 +140,12 @@ Handler errors use `anyhow::Error` (`Result<T> = std::result::Result<T, anyhow::
 
 ## Concurrency And Lifetimes
 
-- Exactly one in-flight `recv()`/`send_recv()` per stream (guarded by `recv_active` AtomicBool).
+- One conversation per stream: exactly one in-flight `recv()`/`peek_wire()`/`send_recv()` (guarded by `recv_active` AtomicBool). A concurrent call returns `Error::ConcurrentRecv`, and a rejected `send_recv()` sends nothing. Open one stream per concurrent conversation.
+- After `send_recv()` returns `Error::RecvTimeout`, the stream discards the late reply when it arrives, so the next request receives its own reply.
 - `set_recv_timeout(Duration::ZERO)` disables timeout.
-- `stream.close()` sends a `FIN` data frame before releasing the local stream, but only on streams this side opened with `new_stream`. Other streams, including stream 0, are released locally.
+- `stream.close()` sends a `FIN` data frame before releasing the local stream, but only on streams this side opened with `new_stream`. Other streams, including stream 0, are released locally, and frames the peer still sends on them are dropped until its `FIN`.
+- `close().await` stops new sends, writes the queued frames (then, in v3, a `CLOSE` control frame), half-closes the transport and waits for the peer to close its side, at most 5 seconds. A clean close by the peer (v2: EOF at a frame boundary; v3: `CLOSE`) delivers the frames received before it, then closes the connection; a v3 server does not wait for `DetachedTTL`.
+- Frames are limited to 16 MiB by default (`DEFAULT_MAX_FRAME`); `send()` rejects a larger payload with `Error::FrameTooLarge` instead of failing the writer.
 - Stream context uses `Arc<dyn Any + Send + Sync>` for type-erased storage.
 - `new_task()` spawns one background tokio task per stream (guarded by `handler_task_active`).
 
@@ -338,6 +346,9 @@ Control payloads:
   - bytes `1..8`: `last_recv_seq` (`u64`)
 - PING (`type=2`, total 1 byte)
   - byte `0`: `2`
+- CLOSE (`type=3`, total 1 byte)
+  - byte `0`: `3`
+  - sent by `close()` after the queued data frames; the receiver delivers the frames received before it and closes the logical connection permanently instead of detaching
 
 Control frames are not replayed and do not consume sequence numbers.
 
@@ -360,6 +371,7 @@ Control frames are not replayed and do not consume sequence numbers.
 - implement v3 `seq` at bytes `10..17` of frame header
 - encode/decode ACK as exact 9-byte payload
 - encode/decode PING as exact 1-byte payload
+- encode/decode CLOSE as exact 1-byte payload; on CLOSE close the logical connection instead of detaching
 - treat heartbeat timeout as transport failure and trigger resume path
 - do not rely on PONG semantics
 
@@ -546,7 +558,7 @@ Recovery micro-benchmarks (`recovery_runtime_bench_test.rs`):
 - `context.rs`: per-stream context and handler task gating
 - `debug.rs`: observability counters, failure tracking, diagnostic snapshots
 - `recovery.rs`: recovery configuration and state
-- `recovery_protocol.rs`: attach/resume wire protocol, control frames (ACK, PING)
+- `recovery_protocol.rs`: attach/resume wire protocol, control frames (ACK, PING, CLOSE)
 - `recovery_runtime.rs`: recovery reader/writer task implementations
 - `replay.rs`: unacknowledged frame retention and replay
 - `frame_queue.rs`: thread-safe frame deque for replay/resume queues

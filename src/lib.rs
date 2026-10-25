@@ -32,17 +32,18 @@
 //!
 //!     // Client
 //!     let conn = Client::new()
-//!         .with_timeout(Duration::from_secs(5))
+//!         .with_connect_timeout(Duration::from_secs(5))
 //!         .connect("tcp://127.0.0.1:9000")
 //!         .await
 //!         .unwrap();
 //!     let pong: Pong = conn.send_recv(Ping { value: 42 }).await.unwrap();
 //!     assert_eq!(pong.value, 42);
+//!     conn.close().await;
 //! }
 //! ```
 //!
 //! For one-shot request/reply without managing a connection, use
-//! [`Client::send_recv`].
+//! [`Client::connect_once`].
 //!
 //! # Codecs
 //!
@@ -83,7 +84,9 @@ mod transport;
 mod type_info;
 
 #[cfg(test)]
-mod client_sendrecv_test;
+mod client_test;
+#[cfg(test)]
+mod connection_test;
 #[cfg(test)]
 mod protocol_version_bench_test;
 #[cfg(test)]
@@ -95,7 +98,7 @@ mod scaling_bench_test;
 #[cfg(test)]
 mod stream_close_test;
 
-pub use crate::client::Client;
+pub use crate::client::{Client, OnceConn};
 pub use crate::codec::{CodecID, CodecImpl};
 pub use crate::codec_msgpack::{CodecMsgpackCompact, CodecMsgpackMap};
 pub use crate::codec_postcard::CodecPostcard;

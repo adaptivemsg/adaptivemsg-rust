@@ -9,12 +9,13 @@ use crate::error::Error;
 use crate::protocol::{handshake_client, PROTOCOL_VERSION_V3};
 use crate::recovery::RecoveryRole;
 use crate::recovery_protocol::{
-    build_ack_control_payload, build_ping_control_payload, parse_control_payload, AttachRequest,
-    CONTROL_STREAM_ID, CONTROL_TYPE_ACK, CONTROL_TYPE_PING,
+    build_ack_control_payload, build_close_control_payload, build_ping_control_payload,
+    parse_control_payload, AttachRequest, CONTROL_STREAM_ID, CONTROL_TYPE_ACK,
+    CONTROL_TYPE_CLOSE, CONTROL_TYPE_PING,
 };
 
 use super::{
-    read_frame, write_frame, write_frame_no_flush, Connection, ConnectionInner, InboundFrame,
+    read_frame, write_frame, write_frame_no_flush, ConnectionRef, ConnectionInner, InboundFrame,
     OutboundFrame, TransportParts, TransportReader, TransportWriter, WriterCommand,
 };
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use crate::replay::FrameRecord;
 
 impl ConnectionInner {
     pub(crate) fn attach_transport_parts(
-        self: &Connection,
+        self: &ConnectionRef,
         parts: TransportParts,
         peer_last_recv_seq: u64,
     ) {
@@ -55,7 +56,7 @@ impl ConnectionInner {
     }
 
     pub(super) fn spawn_recovery_writer(
-        self: &Connection,
+        self: &ConnectionRef,
         mut writer_cmd_rx: mpsc::UnboundedReceiver<WriterCommand>,
         mut outbound_rx: mpsc::Receiver<OutboundFrame>,
     ) -> JoinHandle<()> {
@@ -97,8 +98,33 @@ impl ConnectionInner {
                             }
                         }
                     }
+                    OutboundFrame::Close { .. } => None,
                 }
             };
+
+            // Passes a data frame through. For the close marker it writes CLOSE
+            // after the frames already written, shuts down the transport and
+            // stops, so the peer releases the connection instead of keeping it
+            // for a reconnect.
+            macro_rules! live_or_finish {
+                ($frame:expr) => {{
+                    match $frame {
+                        OutboundFrame::Close { written } => {
+                            let mut ok = false;
+                            if let Some(w) = writer.as_mut() {
+                                let payload = build_close_control_payload();
+                                ok = write_frame(connection.config(), w, CONTROL_STREAM_ID, 0, 0, &payload)
+                                    .await
+                                    .is_ok()
+                                    && w.shutdown().await.is_ok();
+                            }
+                            let _ = written.send(ok);
+                            return;
+                        }
+                        frame => frame,
+                    }
+                }};
+            }
 
             // Write a live frame; returns true if writer was lost.
             macro_rules! write_live {
@@ -128,7 +154,10 @@ impl ConnectionInner {
                     return;
                 }
                 if writer.is_none() {
+                    // A pending Attach goes first, so that a close marker
+                    // queued right after connecting still gets written.
                     tokio::select! {
+                        biased;
                         _ = connection.closed_notify.notified() => return,
                         cmd = writer_cmd_rx.recv() => match cmd {
                             Some(WriterCommand::Attach { gen, writer: next_writer, resume_seq }) => {
@@ -142,7 +171,7 @@ impl ConnectionInner {
                         },
                         maybe_frame = outbound_rx.recv() => match maybe_frame {
                             Some(frame) => {
-                                let _ = stage_live(frame);
+                                let _ = stage_live(live_or_finish!(frame));
                             }
                             None => return,
                         }
@@ -193,7 +222,7 @@ impl ConnectionInner {
                     connection.debug.control_frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // Batch: also write one pending live frame before flushing.
                     if let Ok(frame) = outbound_rx.try_recv() {
-                        if let Some(frame) = stage_live(frame) {
+                        if let Some(frame) = stage_live(live_or_finish!(frame)) {
                             if frame.seq > last_sent_seq {
                                 let writer_ref = writer.as_mut().expect("writer missing");
                                 let result = write_frame_no_flush(
@@ -263,7 +292,7 @@ impl ConnectionInner {
                 }
 
                 if let Ok(frame) = outbound_rx.try_recv() {
-                    if let Some(frame) = stage_live(frame) {
+                    if let Some(frame) = stage_live(live_or_finish!(frame)) {
                         write_live!(frame);
                     }
                     continue;
@@ -288,7 +317,7 @@ impl ConnectionInner {
                             _ => {}
                         },
                         Some(frame) = outbound_rx.recv() => {
-                            if let Some(frame) = stage_live(frame) {
+                            if let Some(frame) = stage_live(live_or_finish!(frame)) {
                                 write_live!(frame);
                             }
                         },
@@ -312,7 +341,7 @@ impl ConnectionInner {
                         _ => {}
                     },
                     Some(frame) = outbound_rx.recv() => {
-                        if let Some(frame) = stage_live(frame) {
+                        if let Some(frame) = stage_live(live_or_finish!(frame)) {
                             write_live!(frame);
                         }
                     },
@@ -339,7 +368,7 @@ impl ConnectionInner {
     }
 
     pub(super) fn spawn_recovery_reader(
-        self: &Connection,
+        self: &ConnectionRef,
         gen: u64,
         mut reader: TransportReader,
     ) -> JoinHandle<()> {
@@ -351,7 +380,7 @@ impl ConnectionInner {
             };
             loop {
                 let timeout = recovery.heartbeat_timeout();
-                let frame: Result<InboundFrame, Error> = if timeout.is_zero() {
+                let frame: Result<Option<InboundFrame>, Error> = if timeout.is_zero() {
                     read_frame(connection.config(), &mut reader).await
                 } else {
                     match tokio::time::timeout(
@@ -365,19 +394,25 @@ impl ConnectionInner {
                     }
                 };
                 match frame {
-                    Ok((stream_id, seq, flags, payload)) => {
+                    Ok(Some((stream_id, seq, flags, payload))) => {
                         connection.debug.frames_read.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         connection.debug.bytes_read.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         recovery.touch_activity();
                         if stream_id == CONTROL_STREAM_ID {
                             connection.debug.control_frames_read.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if let Err(err) = connection.handle_control_frame(&payload) {
-                                connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_CONTROL, err.to_string());
-                                warn!("recovery control frame failed: {err}");
-                                connection.mark_closed();
-                                return;
+                            match connection.handle_control_frame(&payload) {
+                                Ok(false) => continue,
+                                Ok(true) => {
+                                    connection.close_by_peer().await;
+                                    return;
+                                }
+                                Err(err) => {
+                                    connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_CONTROL, err.to_string());
+                                    warn!("recovery control frame failed: {err}");
+                                    connection.mark_closed();
+                                    return;
+                                }
                             }
-                            continue;
                         }
                         if let Err(err) = connection
                             .handle_recovery_data_frame(stream_id, seq, flags, payload)
@@ -398,6 +433,16 @@ impl ConnectionInner {
                         connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_DATA, err.to_string());
                         warn!("recovery frame rejected: {err}");
                         connection.mark_closed();
+                        return;
+                    }
+                    // close sent CLOSE and waits for the peer to close its side.
+                    _ if connection.closing.load(std::sync::atomic::Ordering::Acquire) => {
+                        connection.mark_closed();
+                        return;
+                    }
+                    Ok(None) => {
+                        debug!("recovery reader ended: peer closed the transport");
+                        connection.detach_transport(gen, false);
                         return;
                     }
                     Err(err) => {
@@ -532,26 +577,36 @@ impl ConnectionInner {
             .resume_connector
             .clone()
             .ok_or_else(|| Error::ResumeRejected("resume connector missing".to_string()))?;
-        let mut parts = connector().await?;
-        let config = handshake_client(
-            &mut parts.reader,
-            &mut parts.writer,
-            &[self.config().codec_id],
-            self.config().max_frame,
-            PROTOCOL_VERSION_V3,
-        )
-        .await?;
-        if config.codec_id != self.config().codec_id {
-            return Err(Error::ResumeRejected("codec changed on resume".to_string()));
-        }
-        let request = AttachRequest {
-            mode: crate::recovery_protocol::ATTACH_MODE_RESUME,
-            connection_id: recovery.connection_id,
-            resume_secret: recovery.resume_secret,
-            last_recv_seq: recovery.last_received(),
+        let attempt = async {
+            let mut parts = connector().await?;
+            let config = handshake_client(
+                &mut parts.reader,
+                &mut parts.writer,
+                &[self.config().codec_id],
+                self.config().max_frame,
+                PROTOCOL_VERSION_V3,
+            )
+            .await?;
+            if config.codec_id != self.config().codec_id {
+                return Err(Error::ResumeRejected("codec changed on resume".to_string()));
+            }
+            let request = AttachRequest {
+                mode: crate::recovery_protocol::ATTACH_MODE_RESUME,
+                connection_id: recovery.connection_id,
+                resume_secret: recovery.resume_secret,
+                last_recv_seq: recovery.last_received(),
+            };
+            crate::recovery_protocol::write_attach_request(&mut parts.writer, &request).await?;
+            let response =
+                crate::recovery_protocol::read_attach_response(&mut parts.reader).await?;
+            Ok::<_, Error>((parts, response))
         };
-        crate::recovery_protocol::write_attach_request(&mut parts.writer, &request).await?;
-        let response = crate::recovery_protocol::read_attach_response(&mut parts.reader).await?;
+        let (parts, response) = match recovery.reconnect_timeout {
+            Some(limit) => tokio::time::timeout(limit, attempt)
+                .await
+                .map_err(|_| Error::ConnectTimeout(None))??,
+            None => attempt.await?,
+        };
         if response.status != crate::recovery_protocol::ATTACH_STATUS_OK {
             return Err(Error::ResumeRejected("resume rejected".to_string()));
         }
@@ -561,16 +616,18 @@ impl ConnectionInner {
         Ok(())
     }
 
-    pub(crate) fn handle_control_frame(&self, payload: &[u8]) -> Result<(), Error> {
+    /// Applies a control frame and reports whether it was CLOSE.
+    pub(crate) fn handle_control_frame(&self, payload: &[u8]) -> Result<bool, Error> {
         let (control_type, value) = parse_control_payload(payload)?;
         match control_type {
             CONTROL_TYPE_ACK => {
                 if let Some(recovery) = self.recovery() {
                     recovery.ack_received(value);
                 }
-                Ok(())
+                Ok(false)
             }
-            CONTROL_TYPE_PING => Ok(()),
+            CONTROL_TYPE_PING => Ok(false),
+            CONTROL_TYPE_CLOSE => Ok(true),
             _ => Err(Error::InvalidMessage(
                 "unknown control frame type".to_string(),
             )),

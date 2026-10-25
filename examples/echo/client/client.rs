@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     }
     .await;
-    conn.close();
+    conn.close().await;
     result
 }
 
@@ -172,7 +172,7 @@ async fn concurrent_demo(addr: &str) -> anyhow::Result<()> {
             }
 
             let results = try_join_all(stream_tasks).await;
-            conn.close();
+            conn.close().await;
             for result in results? {
                 result?;
             }

@@ -10,6 +10,9 @@ pub(crate) const CONTROL_STREAM_ID: u32 = u32::MAX;
 
 pub(crate) const CONTROL_TYPE_ACK: u8 = 1;
 pub(crate) const CONTROL_TYPE_PING: u8 = 2;
+/// Tells the peer that the connection is closed for good, so it is released
+/// without waiting for a reconnect.
+pub(crate) const CONTROL_TYPE_CLOSE: u8 = 3;
 
 pub(crate) const ATTACH_MODE_NEW: u8 = 1;
 pub(crate) const ATTACH_MODE_RESUME: u8 = 2;
@@ -22,6 +25,7 @@ pub(crate) const ATTACH_REQUEST_LEN: usize = 44;
 pub(crate) const ATTACH_RESPONSE_LEN: usize = 60;
 pub(crate) const CONTROL_ACK_FRAME_LEN: usize = 9;
 pub(crate) const CONTROL_PING_LEN: usize = 1;
+pub(crate) const CONTROL_CLOSE_LEN: usize = 1;
 
 pub(crate) type RecoveryToken = [u8; RECOVERY_TOKEN_LEN];
 
@@ -209,6 +213,10 @@ pub(crate) fn build_ping_control_payload() -> Vec<u8> {
     vec![CONTROL_TYPE_PING]
 }
 
+pub(crate) fn build_close_control_payload() -> Vec<u8> {
+    vec![CONTROL_TYPE_CLOSE]
+}
+
 pub(crate) fn parse_control_payload(payload: &[u8]) -> Result<(u8, u64), Error> {
     if payload.is_empty() {
         return Err(Error::InvalidMessage("empty control payload".to_string()));
@@ -229,6 +237,14 @@ pub(crate) fn parse_control_payload(payload: &[u8]) -> Result<(u8, u64), Error> 
             if payload.len() != CONTROL_PING_LEN {
                 return Err(Error::InvalidMessage(
                     "invalid heartbeat control payload length".to_string(),
+                ));
+            }
+            Ok((payload[0], 0))
+        }
+        CONTROL_TYPE_CLOSE => {
+            if payload.len() != CONTROL_CLOSE_LEN {
+                return Err(Error::InvalidMessage(
+                    "invalid close control payload length".to_string(),
                 ));
             }
             Ok((payload[0], 0))

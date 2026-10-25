@@ -78,7 +78,7 @@ async fn run_protocol_send_recv_perf_case_with_codec(
     });
     wait_server_ready(&addr).await;
 
-    let mut client = crate::Client::new().with_timeout(Duration::from_secs(2));
+    let mut client = crate::Client::new().with_connect_timeout(Duration::from_secs(2));
     if let Some(codecs) = codecs {
         client = client.with_codecs(&codecs);
     }
@@ -127,7 +127,7 @@ async fn run_protocol_send_recv_perf_case_with_codec(
     let elapsed = handle.await.unwrap();
     let ns_per_op = elapsed.as_nanos() as f64 / iterations as f64;
 
-    conn.close();
+    conn.close().await;
     server.abort();
 
     ns_per_op

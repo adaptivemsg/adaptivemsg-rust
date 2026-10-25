@@ -27,9 +27,6 @@ pub enum Error {
     /// Client offered more codecs than the protocol allows.
     #[error("too many codecs: {0}")]
     TooManyCodecs(usize),
-    /// Server rejected the handshake.
-    #[error("handshake rejected")]
-    HandshakeRejected,
     /// No protocol version supported by both client and server.
     #[error("no common protocol version: client {client_min}-{client_max}, server {server_min}-{server_max}")]
     NoCommonVersion {
@@ -50,9 +47,10 @@ pub enum Error {
     /// Generic message validation error.
     #[error("invalid message: {0}")]
     InvalidMessage(String),
-    /// TCP connect or handshake exceeded the timeout.
-    #[error("connect timeout")]
-    ConnectTimeout,
+    /// Connecting exceeded the connect timeout. Holds the last failed dial when
+    /// the timeout ended a retry.
+    #[error("connect timeout{}", cause_suffix(.0))]
+    ConnectTimeout(Option<Box<Error>>),
     /// No message received within the stream's recv timeout.
     #[error("recv timeout")]
     RecvTimeout,
@@ -80,6 +78,13 @@ pub enum Error {
     /// Outbound replay buffer exceeded `max_replay_bytes`.
     #[error("replay buffer full: limit {limit}, size {size}")]
     ReplayBufferFull { limit: i64, size: i64 },
+}
+
+fn cause_suffix(cause: &Option<Box<Error>>) -> String {
+    cause
+        .as_ref()
+        .map(|cause| format!(": {cause}"))
+        .unwrap_or_default()
 }
 
 impl From<rmp_serde::encode::Error> for Error {
@@ -126,7 +131,12 @@ mod tests {
     fn error_display_messages() {
         assert_eq!(Error::Closed.to_string(), "connection closed");
         assert_eq!(Error::RecvTimeout.to_string(), "recv timeout");
-        assert_eq!(Error::ConnectTimeout.to_string(), "connect timeout");
+        assert_eq!(Error::ConnectTimeout(None).to_string(), "connect timeout");
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            Error::ConnectTimeout(Some(Box::new(Error::Io(refused)))).to_string(),
+            "connect timeout: io error: connection refused"
+        );
         assert_eq!(
             Error::HandlerTaskBusy.to_string(),
             "only one handler task allowed per stream"
@@ -140,7 +150,6 @@ mod tests {
             Error::BadHandshakeMagic.to_string(),
             "invalid handshake magic"
         );
-        assert_eq!(Error::HandshakeRejected.to_string(), "handshake rejected");
     }
 
     #[test]

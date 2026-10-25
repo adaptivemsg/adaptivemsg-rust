@@ -37,6 +37,7 @@ use crate::registry::Registry;
 pub struct Server {
     registry: Registry,
     codecs: Vec<CodecID>,
+    max_frame: u32,
     recovery: ServerRecoveryOptions,
     recovery_conns: RecoveryRegistry,
     on_connect: Option<Arc<dyn Fn(Netconn) -> Result<(), Error> + Send + Sync>>,
@@ -51,6 +52,7 @@ impl Server {
         Self {
             registry: Registry::from_inventory(),
             codecs: vec![CodecPostcard, CodecMsgpackCompact, CodecMsgpackMap],
+            max_frame: DEFAULT_MAX_FRAME,
             recovery: ServerRecoveryOptions::default(),
             recovery_conns: Arc::new(Mutex::new(std::collections::HashMap::new())),
             on_connect: None,
@@ -99,6 +101,17 @@ impl Server {
     /// Override the codec preference list.
     pub fn with_codecs(mut self, codecs: &[CodecID]) -> Self {
         self.codecs = codecs.to_vec();
+        self
+    }
+
+    /// Set the maximum payload size per frame that the server accepts and
+    /// advertises during the handshake.
+    ///
+    /// The effective limit for a connection is the smaller of the client's
+    /// and the server's values. A larger frame closes the connection. The
+    /// default is 16 MiB.
+    pub fn with_max_frame(mut self, max_frame: u32) -> Self {
+        self.max_frame = max_frame;
         self
     }
 
@@ -183,7 +196,7 @@ impl Server {
                     reader,
                     writer,
                     &codecs,
-                    DEFAULT_MAX_FRAME,
+                    server.max_frame,
                     server.recovery.enable,
                 )
                 .await
@@ -191,7 +204,7 @@ impl Server {
                     Ok(config) => config,
                     Err(err) => {
                         warn!("handshake failed for {peer_label}: {err}");
-                        conn_handle.close();
+                        conn_handle.close_now();
                         return;
                     }
                 };
@@ -200,7 +213,7 @@ impl Server {
                     if let Some(ref f) = server.on_connect {
                         if let Err(err) = f(netconn.clone()) {
                             warn!("on_connect failed for {peer_label}: {err}");
-                            conn_handle.close();
+                            conn_handle.close_now();
                             return;
                         }
                     }
@@ -208,7 +221,7 @@ impl Server {
                         Ok(conn) => conn,
                         Err(err) => {
                             warn!("start failed for {peer_label}: {err}");
-                            conn_handle.close();
+                            conn_handle.close_now();
                             return;
                         }
                     }
@@ -217,7 +230,7 @@ impl Server {
                         Ok(request) => request,
                         Err(err) => {
                             warn!("attach read failed for {peer_label}: {err}");
-                            conn_handle.close();
+                            conn_handle.close_now();
                             return;
                         }
                     };
@@ -227,7 +240,7 @@ impl Server {
                                 Ok(token) => token,
                                 Err(err) => {
                                     warn!("token generation failed for {peer_label}: {err}");
-                                    conn_handle.close();
+                                    conn_handle.close_now();
                                     return;
                                 }
                             };
@@ -235,7 +248,7 @@ impl Server {
                                 Ok(token) => token,
                                 Err(err) => {
                                     warn!("token generation failed for {peer_label}: {err}");
-                                    conn_handle.close();
+                                    conn_handle.close_now();
                                     return;
                                 }
                             };
@@ -262,14 +275,14 @@ impl Server {
                             if let Err(err) = write_attach_response(writer, &response).await {
                                 warn!("attach response failed for {peer_label}: {err}");
                                 server.recovery_conns.lock().unwrap().remove(&connection_id);
-                                conn_handle.close();
+                                conn_handle.close_now();
                                 return;
                             }
                             if let Some(ref f) = server.on_connect {
                                 if let Err(err) = f(netconn.clone()) {
                                     warn!("on_connect failed for {peer_label}: {err}");
                                     server.recovery_conns.lock().unwrap().remove(&connection_id);
-                                    conn_handle.close();
+                                    conn_handle.close_now();
                                     return;
                                 }
                             }
@@ -278,7 +291,7 @@ impl Server {
                                 Err(err) => {
                                     warn!("recovery start failed for {peer_label}: {err}");
                                     server.recovery_conns.lock().unwrap().remove(&connection_id);
-                                    conn_handle.close();
+                                    conn_handle.close_now();
                                     return;
                                 }
                             }
@@ -301,7 +314,7 @@ impl Server {
                                     },
                                 )
                                 .await;
-                                conn_handle.close();
+                                conn_handle.close_now();
                                 return;
                             };
                             let Some(existing_recovery) = existing.recovery_state() else {
@@ -313,7 +326,7 @@ impl Server {
                                     },
                                 )
                                 .await;
-                                conn_handle.close();
+                                conn_handle.close_now();
                                 return;
                             };
                             if existing.is_closed() || existing.codec_id() != config.codec_id {
@@ -325,7 +338,7 @@ impl Server {
                                     },
                                 )
                                 .await;
-                                conn_handle.close();
+                                conn_handle.close_now();
                                 return;
                             }
                             if existing_recovery.resume_secret != request.resume_secret {
@@ -337,7 +350,7 @@ impl Server {
                                     },
                                 )
                                 .await;
-                                conn_handle.close();
+                                conn_handle.close_now();
                                 return;
                             }
                             let response = AttachResponse {
@@ -349,7 +362,7 @@ impl Server {
                             };
                             if let Err(err) = write_attach_response(writer, &response).await {
                                 warn!("resume response failed for {peer_label}: {err}");
-                                conn_handle.close();
+                                conn_handle.close_now();
                                 return;
                             }
                             existing.attach_transport_parts(
@@ -367,7 +380,7 @@ impl Server {
                                 },
                             )
                             .await;
-                            conn_handle.close();
+                            conn_handle.close_now();
                             return;
                         }
                     }

@@ -7,13 +7,14 @@ use tokio::sync::broadcast;
 
 use crate::state::StatMgr;
 
-#[am::message]
+// The names match the Go echo example, whose package is echo.
+#[am::message(name = "echo.MessageRequest")]
 pub struct MessageRequest {
     pub msg: String,
     pub num: i32,
 }
 
-#[am::message]
+#[am::message(name = "echo.MessageReply")]
 pub struct MessageReply {
     pub msg: String,
     pub num: i32,
@@ -43,10 +44,10 @@ impl MessageHandler for MessageRequest {
     }
 }
 
-#[am::message]
+#[am::message(name = "echo.SubWhoElseEvent")]
 pub struct SubWhoElseEvent {}
 
-#[am::message]
+#[am::message(name = "echo.WhoElseEvent")]
 pub struct WhoElseEvent {
     pub addr: String,
 }
@@ -78,10 +79,10 @@ impl MessageHandler for SubWhoElseEvent {
     }
 }
 
-#[am::message]
+#[am::message(name = "echo.WhoElse")]
 pub struct WhoElse {}
 
-#[am::message]
+#[am::message(name = "echo.WhoElseReply")]
 pub struct WhoElseReply {
     pub clients: String,
 }
@@ -99,7 +100,7 @@ impl MessageHandler for WhoElse {
     }
 }
 
-#[am::message]
+#[am::message(name = "echo.MessageTimeout")]
 pub struct MessageTimeout {
     pub secs: u64,
 }

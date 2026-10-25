@@ -4,15 +4,22 @@ use am::{MessageHandler, Result, StreamContext};
 #[cfg(not(feature = "client"))]
 use am::Message;
 
-#[am::message]
+// The names and fields match the Go hello example, whose package is hello.
+#[am::message(name = "hello.HelloRequest")]
 pub struct HelloRequest {
     pub who: String,
     pub question: String,
 }
 
-#[am::message]
+#[am::message(name = "hello.HelloReply")]
 pub struct HelloReply {
     pub answer: String,
+    pub internal: HelloInternal,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct HelloInternal {
+    pub trace_id: String,
 }
 
 #[cfg(not(feature = "client"))]
@@ -32,6 +39,9 @@ impl MessageHandler for HelloRequest {
         };
         let reply = HelloReply {
             answer: format!("{answer}, {}", self.who),
+            internal: HelloInternal {
+                trace_id: format!("trace-{}", self.who),
+            },
         };
         Ok(Some(Box::new(reply)))
     }
