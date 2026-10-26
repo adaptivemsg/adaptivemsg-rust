@@ -221,9 +221,10 @@ impl StreamInner {
     /// Send a message without waiting for a reply.
     ///
     /// The message is encoded with the connection's negotiated codec and
-    /// enqueued for transmission on this stream. Returns [`Error::Closed`]
-    /// if the stream or connection has been closed, or an [`Error::Codec`]
-    /// if encoding fails.
+    /// enqueued for transmission on this stream. With recovery, it waits
+    /// while `max_replay_bytes` of messages await acknowledgement. Returns
+    /// [`Error::Closed`] if the stream or connection has been closed, or an
+    /// [`Error::Codec`] if encoding fails.
     pub async fn send<M: Message>(&self, msg: M) -> Result<(), Error> {
         self.send_boxed(Box::new(msg)).await
     }

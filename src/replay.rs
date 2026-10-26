@@ -72,10 +72,9 @@ impl ReplayBuffer {
 
         let next_used = inner.used_bytes + size;
         if self.max_bytes > 0 && next_used > self.max_bytes {
-            return Err(Error::ReplayBufferFull {
-                limit: self.max_bytes,
-                size: next_used,
-            });
+            // The writer waits for room first (see fits), so this only
+            // rejects a frame larger than the whole buffer.
+            return Err(Error::FrameTooLarge(payload.len()));
         }
 
         let record = Arc::new(FrameRecord {
@@ -88,6 +87,20 @@ impl ReplayBuffer {
         inner.replay_queue.push_back(record.clone());
         inner.used_bytes = next_used;
         Ok(record)
+    }
+
+    /// Reports whether a frame with this payload fits next to the frames
+    /// already kept, and whether it would fit once they are all acknowledged.
+    /// Errors are left to `add`.
+    pub(crate) fn fits(&self, payload_len: usize) -> (bool, bool) {
+        let Ok(size) = replay_entry_size(self.version, payload_len) else {
+            return (true, true);
+        };
+        if self.max_bytes <= 0 {
+            return (true, true);
+        }
+        let used = self.inner.lock().unwrap().used_bytes;
+        (used + size <= self.max_bytes, size <= self.max_bytes)
     }
 
     pub(crate) fn ack(&self, last_seq: u64) -> i64 {
@@ -186,11 +199,21 @@ mod tests {
     }
 
     #[test]
-    fn byte_limit_rejects_overflow() {
+    fn byte_limit_rejects_frame_larger_than_buffer() {
         let buf = ReplayBuffer::new(PROTOCOL_VERSION_V3, 30);
         buf.add(0, 1, 0, vec![0; 10]).unwrap();
+        assert_eq!(buf.fits(100), (false, false));
         let result = buf.add(0, 2, 0, vec![0; 100]);
-        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::FrameTooLarge(100))));
+    }
+
+    #[test]
+    fn fits_after_ack() {
+        let buf = ReplayBuffer::new(PROTOCOL_VERSION_V3, 30);
+        buf.add(0, 1, 0, vec![0; 10]).unwrap();
+        assert_eq!(buf.fits(10), (false, true));
+        buf.ack(1);
+        assert_eq!(buf.fits(10), (true, true));
     }
 
     #[test]

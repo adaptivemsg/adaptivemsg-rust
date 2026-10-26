@@ -80,7 +80,8 @@ impl Connection {
     ///
     /// The message is encoded with the negotiated codec and enqueued for
     /// transmission. Returns once the frame is queued, not when the peer
-    /// receives it.
+    /// receives it. With recovery, it waits while `max_replay_bytes` of
+    /// messages await acknowledgement.
     pub async fn send<M: crate::message::Message>(&self, msg: M) -> Result<(), Error> {
         self.default_stream.send(msg).await
     }

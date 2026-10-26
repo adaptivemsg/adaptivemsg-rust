@@ -69,36 +69,57 @@ impl ConnectionInner {
             let mut writer: Option<TransportWriter> = None;
             let mut current_gen = 0;
             let mut last_sent_seq = 0;
+            // A frame that does not fit in the replay buffer yet. While it is
+            // held no other frame is taken, so its sender, and the senders
+            // queued behind it, wait until an ACK frees room.
+            let mut held: Option<OutboundFrame> = None;
 
-            let stage_live = |frame: OutboundFrame| -> Option<Arc<FrameRecord>> {
-                match frame {
+            let stage_live = |frame: OutboundFrame,
+                              held: &mut Option<OutboundFrame>|
+             -> Option<Arc<FrameRecord>> {
+                let len = match &frame {
+                    OutboundFrame::Plain { payload, .. }
+                    | OutboundFrame::Recovery { payload, .. } => payload.len(),
+                    OutboundFrame::Close { .. } => return None,
+                };
+                if let (false, true) = recovery.replay.fits(len) {
+                    *held = Some(frame);
+                    return None;
+                }
+                let (stream_id, flags, payload, queued_tx) = match frame {
                     OutboundFrame::Plain {
                         stream_id,
                         flags,
                         payload,
-                    } => {
-                        let seq = connection.next_outbound_seq();
-                        recovery.replay.add(stream_id, seq, flags, payload).ok()
-                    }
+                    } => (stream_id, flags, payload, None),
                     OutboundFrame::Recovery {
                         stream_id,
                         flags,
                         payload,
                         queued_tx,
-                    } => {
-                        let seq = connection.next_outbound_seq();
-                        match recovery.replay.add(stream_id, seq, flags, payload) {
-                            Ok(record) => {
-                                let _ = queued_tx.send(Ok(()));
-                                Some(record)
-                            }
-                            Err(err) => {
-                                let _ = queued_tx.send(Err(err));
-                                None
-                            }
+                    } => (stream_id, flags, payload, Some(queued_tx)),
+                    OutboundFrame::Close { .. } => return None,
+                };
+                let seq = connection.next_outbound_seq();
+                match recovery.replay.add(stream_id, seq, flags, payload) {
+                    Ok(record) => {
+                        if let Some(queued_tx) = queued_tx {
+                            let _ = queued_tx.send(Ok(()));
                         }
+                        Some(record)
                     }
-                    OutboundFrame::Close { .. } => None,
+                    Err(err) => {
+                        // Give the unused sequence number back: the peer closes
+                        // the connection when a number is skipped. Only this
+                        // task takes numbers.
+                        connection
+                            .next_send_seq
+                            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                        if let Some(queued_tx) = queued_tx {
+                            let _ = queued_tx.send(Err(err));
+                        }
+                        None
+                    }
                 }
             };
 
@@ -169,11 +190,19 @@ impl ConnectionInner {
                             Some(WriterCommand::Detach { .. }) => {}
                             None => return,
                         },
-                        maybe_frame = outbound_rx.recv() => match maybe_frame {
+                        maybe_frame = outbound_rx.recv(), if held.is_none() => match maybe_frame {
                             Some(frame) => {
-                                let _ = stage_live(live_or_finish!(frame));
+                                let _ = stage_live(live_or_finish!(frame), &mut held);
                             }
                             None => return,
+                        },
+                        // The close marker is queued behind the held frame,
+                        // and nothing can be written while detached: stop, so
+                        // close does not wait for it.
+                        _ = connection.send_notify.notified(), if held.is_some() => {
+                            if connection.closing.load(std::sync::atomic::Ordering::Acquire) {
+                                return;
+                            }
                         }
                     }
                     continue;
@@ -221,8 +250,13 @@ impl ConnectionInner {
                     }
                     connection.debug.control_frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // Batch: also write one pending live frame before flushing.
-                    if let Ok(frame) = outbound_rx.try_recv() {
-                        if let Some(frame) = stage_live(live_or_finish!(frame)) {
+                    let next = if held.is_none() {
+                        outbound_rx.try_recv().ok()
+                    } else {
+                        None
+                    };
+                    if let Some(frame) = next {
+                        if let Some(frame) = stage_live(live_or_finish!(frame), &mut held) {
                             if frame.seq > last_sent_seq {
                                 let writer_ref = writer.as_mut().expect("writer missing");
                                 let result = write_frame_no_flush(
@@ -291,11 +325,14 @@ impl ConnectionInner {
                     }
                 }
 
-                if let Ok(frame) = outbound_rx.try_recv() {
-                    if let Some(frame) = stage_live(live_or_finish!(frame)) {
+                let next = held.take().or_else(|| outbound_rx.try_recv().ok());
+                if let Some(frame) = next {
+                    if let Some(frame) = stage_live(live_or_finish!(frame), &mut held) {
                         write_live!(frame);
                     }
-                    continue;
+                    if held.is_none() {
+                        continue;
+                    }
                 }
 
                 let ack_wait = recovery.next_ack_wait();
@@ -316,8 +353,8 @@ impl ConnectionInner {
                             Some(WriterCommand::Detach { gen }) if gen == current_gen => writer = None,
                             _ => {}
                         },
-                        Some(frame) = outbound_rx.recv() => {
-                            if let Some(frame) = stage_live(live_or_finish!(frame)) {
+                        Some(frame) = outbound_rx.recv(), if held.is_none() => {
+                            if let Some(frame) = stage_live(live_or_finish!(frame), &mut held) {
                                 write_live!(frame);
                             }
                         },
@@ -340,8 +377,8 @@ impl ConnectionInner {
                         Some(WriterCommand::Detach { gen }) if gen == current_gen => writer = None,
                         _ => {}
                     },
-                    Some(frame) = outbound_rx.recv() => {
-                        if let Some(frame) = stage_live(live_or_finish!(frame)) {
+                    Some(frame) = outbound_rx.recv(), if held.is_none() => {
+                        if let Some(frame) = stage_live(live_or_finish!(frame), &mut held) {
                             write_live!(frame);
                         }
                     },
@@ -623,6 +660,9 @@ impl ConnectionInner {
             CONTROL_TYPE_ACK => {
                 if let Some(recovery) = self.recovery() {
                     recovery.ack_received(value);
+                    // The writer may hold a frame waiting for the room this
+                    // frees.
+                    self.signal_send();
                 }
                 Ok(false)
             }

@@ -74,7 +74,13 @@ it, closes it the same way in the background. A stream carries one
 conversation at a time: `recv`, `peek_wire` and `send_recv` on the same
 stream must not run concurrently, so open one stream per concurrent
 request-reply. Frames are limited to 16 MiB by default; the limit is the
-smaller of `Client::with_max_frame` and `Server::with_max_frame`.
+smaller of `Client::with_max_frame` and `Server::with_max_frame`. With
+recovery, messages awaiting acknowledgement are kept in a replay buffer of
+`max_replay_bytes` (32 MiB by default, twice the max frame); raise both
+together. `send` keeps working while the transport is down: the message
+waits in the buffer and is sent after the reconnect. While the buffer is
+full, `send` waits; only a message larger than the whole buffer fails, with
+`Error::FrameTooLarge`.
 
 For a one-shot connection:
 

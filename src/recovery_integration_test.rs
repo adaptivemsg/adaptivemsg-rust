@@ -458,6 +458,81 @@ async fn recovery_queues_send_while_detached() {
     server.abort();
 }
 
+/// Connects, then stops the server and breaks the transport. No reconnect
+/// succeeds, so the connection stays detached.
+async fn detached_recovery_connection(max_replay_bytes: i64) -> crate::Connection {
+    let addr = ephemeral_tcp_addr();
+    let server = start_message_recovery_server(&addr).await;
+    wait_server_ready(&addr).await;
+    let conn = crate::Client::new()
+        .with_recovery(crate::ClientRecoveryOptions {
+            enable: true,
+            reconnect_min_backoff: Duration::from_millis(5),
+            reconnect_max_backoff: Duration::from_millis(20),
+            max_replay_bytes,
+        })
+        .connect(&format!("tcp://{addr}"))
+        .await
+        .expect("client connect");
+    server.abort();
+    let _ = server.await;
+    conn.close_transport_for_test();
+    conn
+}
+
+#[tokio::test]
+async fn recovery_send_returns_while_detached() {
+    let conn = detached_recovery_connection(1 << 20).await;
+
+    const COUNT: usize = 10;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for _ in 0..COUNT {
+            conn.send(RecoveryEchoRequest {
+                text: "queued".to_string(),
+            })
+            .await
+            .expect("send while detached");
+        }
+    })
+    .await
+    .expect("send blocked while detached");
+    let queued = conn
+        .debug_state()
+        .recovery
+        .expect("recovery state")
+        .replay_queued;
+    assert!(
+        queued >= COUNT,
+        "replay buffer holds {queued} frames, want at least {COUNT}"
+    );
+    conn.close().await;
+}
+
+#[tokio::test]
+async fn recovery_close_does_not_wait_for_a_held_frame_while_detached() {
+    let conn = detached_recovery_connection(1 << 10).await;
+    let text = "x".repeat(600);
+    conn.send(RecoveryEchoRequest { text: text.clone() })
+        .await
+        .expect("the first send fits");
+
+    // The second send does not fit until an ACK, which cannot come while
+    // detached.
+    let held = conn.send(RecoveryEchoRequest { text });
+    let close = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        conn.close().await;
+    };
+    let (held, ()) =
+        tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(held, close) })
+            .await
+            .expect("close waited for the held frame");
+    assert!(
+        matches!(held, Err(crate::Error::Closed)),
+        "held send got {held:?}"
+    );
+}
+
 #[tokio::test]
 async fn recovery_replays_reply_after_transport_break() {
     DROP_REPLY_ONCE.store(false, Ordering::Release);

@@ -229,6 +229,8 @@ Minimum replay design in use:
 
 Send acceptance semantics:
 - `send()` means local acceptance into logical outbound path, not peer receipt.
+- v3: `send()` returns once the frame is in the replay buffer, also while detached; the resume writes it.
+- v3: when the next frame does not fit in `max_replay_bytes`, the writer holds it and takes no further frames until an ACK frees room, so `send()` waits and order is kept. Only a frame larger than `max_replay_bytes` fails, with `Error::FrameTooLarge`.
 
 ### Detach Lifecycle
 
@@ -445,10 +447,12 @@ Rules:
 ### Delivery, ACK, And Replay Rules
 
 Outbound data send:
-- allocate next connection sequence (`next_send_seq.fetch_add`)
 - encode frame
-- retain frame in replay storage
 - enqueue frame for writer
+- writer waits until the frame fits in replay storage
+- allocate next connection sequence (`next_send_seq.fetch_add`)
+- retain frame in replay storage
+- write it if a transport is attached; otherwise the resume does
 
 Inbound data receive:
 - if `seq == last_recv_seq + 1`: accept and deliver

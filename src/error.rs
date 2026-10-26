@@ -12,7 +12,10 @@ pub enum Error {
     /// Message encode/decode error.
     #[error("codec error: {0}")]
     Codec(String),
-    /// Payload exceeds negotiated `max_frame`.
+    /// The message is larger than the connection accepts: the negotiated
+    /// `max_frame` or, with recovery, `max_replay_bytes`. It is not sent, and
+    /// the connection stays usable. A received frame above `max_frame` closes
+    /// the connection.
     #[error("frame too large: {0}")]
     FrameTooLarge(usize),
     /// Peer sent a frame with an unknown protocol version.
@@ -75,9 +78,6 @@ pub enum Error {
     /// Server rejected a v3 resume/attach request.
     #[error("resume rejected: {0}")]
     ResumeRejected(String),
-    /// Outbound replay buffer exceeded `max_replay_bytes`.
-    #[error("replay buffer full: limit {limit}, size {size}")]
-    ReplayBufferFull { limit: i64, size: i64 },
 }
 
 fn cause_suffix(cause: &Option<Box<Error>>) -> String {

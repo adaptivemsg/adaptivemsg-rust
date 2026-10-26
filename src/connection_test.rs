@@ -403,6 +403,84 @@ async fn close_delivers_queued_messages() {
 }
 
 #[tokio::test]
+async fn message_larger_than_replay_buffer_fails_only_that_send() {
+    let server = Server::new().with_recovery(ServerRecoveryOptions {
+        enable: true,
+        ..ServerRecoveryOptions::default()
+    });
+    let addr = ephemeral_tcp_addr();
+    let _server = start_test_server(server, &addr).await;
+    let conn = Client::new()
+        .with_recv_timeout(Duration::from_secs(2))
+        .with_recovery(ClientRecoveryOptions {
+            enable: true,
+            max_replay_bytes: 1 << 10,
+            ..ClientRecoveryOptions::default()
+        })
+        .connect(&format!("tcp://{addr}"))
+        .await
+        .expect("connect");
+
+    let big = conn
+        .send(ConnEchoRequest {
+            text: "x".repeat(2 << 10),
+        })
+        .await;
+    assert!(
+        matches!(big, Err(Error::FrameTooLarge(_))),
+        "got {:?}",
+        big.err()
+    );
+    let reply: ConnEchoReply = conn
+        .send_recv(ConnEchoRequest {
+            text: "small".into(),
+        })
+        .await
+        .expect("send_recv after the rejected send");
+    assert_eq!(reply.text, "small");
+    conn.close().await;
+}
+
+#[tokio::test]
+async fn send_waits_while_replay_buffer_is_full() {
+    let server = Server::new().with_recovery(ServerRecoveryOptions {
+        enable: true,
+        ..ServerRecoveryOptions::default()
+    });
+    let addr = ephemeral_tcp_addr();
+    let _server = start_test_server(server, &addr).await;
+    let conn = Client::new()
+        .with_recv_timeout(Duration::from_secs(5))
+        .with_recovery(ClientRecoveryOptions {
+            enable: true,
+            max_replay_bytes: 4 << 10,
+            ..ClientRecoveryOptions::default()
+        })
+        .connect(&format!("tcp://{addr}"))
+        .await
+        .expect("connect");
+
+    // 50 KiB through a 4 KiB buffer: each send waits for room instead of failing.
+    const COUNT: usize = 50;
+    let text = "x".repeat(1 << 10);
+    for i in 0..COUNT {
+        conn.send(ConnEchoRequest {
+            text: format!("{i}{text}"),
+        })
+        .await
+        .unwrap_or_else(|err| panic!("send {i}: {err}"));
+    }
+    for i in 0..COUNT {
+        let reply: ConnEchoReply = conn
+            .recv()
+            .await
+            .unwrap_or_else(|err| panic!("recv {i}: {err}"));
+        assert!(reply.text == format!("{i}{text}"), "reply {i} out of order");
+    }
+    conn.close().await;
+}
+
+#[tokio::test]
 async fn send_after_close_fails() {
     let addr = ephemeral_tcp_addr();
     let _server = start_test_server(Server::new(), &addr).await;

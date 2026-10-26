@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 use crate::connection::ConnectionRef;
 use crate::error::Error;
 use crate::frame_queue::FrameDeque;
+use crate::protocol::DEFAULT_MAX_FRAME;
 use crate::recovery_protocol::RecoveryToken;
 use crate::replay::ReplayBuffer;
 
@@ -29,7 +30,11 @@ pub struct ClientRecoveryOptions {
     pub reconnect_min_backoff: Duration,
     /// Maximum backoff between reconnect attempts. Default: 2 s.
     pub reconnect_max_backoff: Duration,
-    /// Maximum bytes to buffer for replay. Default: 8 MiB.
+    /// Maximum bytes of unacknowledged messages kept for replay; while it is
+    /// reached, sends wait for the peer to acknowledge earlier ones. Default:
+    /// 32 MiB, twice the default max frame, so that a frame of the largest
+    /// size fits while another is still unacknowledged. Raise it together
+    /// with [`Client::with_max_frame`](crate::Client::with_max_frame).
     pub max_replay_bytes: i64,
 }
 
@@ -43,7 +48,11 @@ pub struct ServerRecoveryOptions {
     pub enable: bool,
     /// How long to retain a detached connection before discarding it. Default: 30 s.
     pub detached_ttl: Duration,
-    /// Maximum bytes to buffer for replay. Default: 8 MiB.
+    /// Maximum bytes of unacknowledged messages kept for replay; while it is
+    /// reached, sends wait for the peer to acknowledge earlier ones. Default:
+    /// 32 MiB, twice the default max frame, so that a frame of the largest
+    /// size fits while another is still unacknowledged. Raise it together
+    /// with [`Server::with_max_frame`](crate::Server::with_max_frame).
     pub max_replay_bytes: i64,
     /// Send a cumulative ACK every N received data frames. Default: 64.
     pub ack_every: u32,
@@ -116,7 +125,7 @@ impl Default for ClientRecoveryOptions {
             enable: false,
             reconnect_min_backoff: Duration::from_millis(100),
             reconnect_max_backoff: Duration::from_secs(2),
-            max_replay_bytes: 8 << 20,
+            max_replay_bytes: 2 * DEFAULT_MAX_FRAME as i64,
         }
     }
 }
@@ -126,7 +135,7 @@ impl Default for ServerRecoveryOptions {
         Self {
             enable: false,
             detached_ttl: Duration::from_secs(30),
-            max_replay_bytes: 8 << 20,
+            max_replay_bytes: 2 * DEFAULT_MAX_FRAME as i64,
             ack_every: 64,
             ack_delay: Duration::from_millis(20),
             heartbeat_interval: Duration::from_secs(30),
