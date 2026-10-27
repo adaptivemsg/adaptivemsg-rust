@@ -2,15 +2,14 @@ use std::any::Any;
 
 use rmpv::Value;
 
-use crate::codec::{CodecID, DecodeTarget};
-use crate::codec_registry::codec_by_id;
+use crate::codec::{CodecImpl, DecodeTarget};
 use crate::error::Error;
 use crate::message::{Message, MessageDecode};
 use crate::registry::{MessageFactory, Registry};
 
 pub struct RawMessage {
     pub wire: String,
-    pub codec: CodecID,
+    pub codec: &'static dyn CodecImpl,
     pub body: Box<dyn Any + Send + Sync>,
 }
 
@@ -25,23 +24,17 @@ where
             got: raw.wire,
         });
     }
-    let codec = codec_by_id(raw.codec).ok_or(Error::UnsupportedCodec(raw.codec.0))?;
     let mut target = TypedTarget::<T>::new();
-    codec.decode_into(raw.body.as_ref(), &mut target)?;
+    raw.codec.decode_into(raw.body, &mut target)?;
     target.into_value()
 }
 
 pub fn decode_raw_with_registry(raw: RawMessage, reg: &Registry) -> Result<Box<dyn Message>, Error> {
-    let wire = raw.wire.clone();
-    let factory = reg
-        .message(&wire)
-        .ok_or_else(|| Error::UnknownMessage(wire.clone()))?;
-    let codec = codec_by_id(raw.codec).ok_or(Error::UnsupportedCodec(raw.codec.0))?;
-    let mut target = FactoryTarget {
-        factory: factory.as_ref(),
-        msg: None,
+    let Some(factory) = reg.message(&raw.wire) else {
+        return Err(Error::UnknownMessage(raw.wire));
     };
-    codec.decode_into(raw.body.as_ref(), &mut target)?;
+    let mut target = FactoryTarget { factory, msg: None };
+    raw.codec.decode_into(raw.body, &mut target)?;
     target.into_message()
 }
 

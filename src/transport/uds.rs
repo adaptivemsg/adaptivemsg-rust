@@ -18,9 +18,21 @@ pub(crate) async fn accept_stream<L>(listener: L) -> Result<(UnixStream, Option<
 where
     L: std::ops::Deref<Target = UnixListener>,
 {
-    let (stream, _) = listener.accept().await?;
-    let peer_addr = stream.peer_addr().ok().map(|addr| format!("{addr:?}"));
-    Ok((stream, peer_addr))
+    let (stream, peer) = listener.accept().await?;
+    Ok((stream, peer_name(&peer)))
+}
+
+/// The peer address as the Go runtime reports it: the socket path, `@name`
+/// for an abstract socket, or nothing for an unnamed socket.
+fn peer_name(addr: &tokio::net::unix::SocketAddr) -> Option<String> {
+    if let Some(path) = addr.as_pathname() {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(name) = addr.as_abstract_name() {
+        return Some(format!("@{}", String::from_utf8_lossy(name)));
+    }
+    None
 }
 
 fn to_uds_path(path: &str) -> Result<PathBuf, Error> {
@@ -94,8 +106,10 @@ mod tests {
             dial(&path_clone).await
         });
 
-        let (_stream, _peer) = accept_stream(&listener).await.unwrap();
+        let (_stream, peer) = accept_stream(&listener).await.unwrap();
         let _client = connect_handle.await.unwrap().unwrap();
+        // The client socket is unnamed; Go reports it as an empty address.
+        assert_eq!(peer, None);
 
         let _ = std::fs::remove_file(&sock_path);
         let _ = std::fs::remove_dir(&dir);

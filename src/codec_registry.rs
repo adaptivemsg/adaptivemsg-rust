@@ -1,13 +1,15 @@
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{OnceLock, RwLock};
 
 use crate::codec::{CodecID, CodecImpl};
 use crate::error::Error;
 
-static CODEC_REGISTRY: OnceLock<RwLock<HashMap<CodecID, Arc<dyn CodecImpl>>>> = OnceLock::new();
+/// Codecs stay registered for the life of the process, so connections and the
+/// messages they receive hold plain references to them.
+static CODEC_REGISTRY: OnceLock<RwLock<HashMap<CodecID, &'static dyn CodecImpl>>> = OnceLock::new();
 static BUILTIN_CODECS: OnceLock<()> = OnceLock::new();
 
-fn registry() -> &'static RwLock<HashMap<CodecID, Arc<dyn CodecImpl>>> {
+fn registry() -> &'static RwLock<HashMap<CodecID, &'static dyn CodecImpl>> {
     CODEC_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -28,16 +30,22 @@ where
 {
     let id = codec.id();
     if id.0 == 0 {
-        return Err(Error::InvalidMessage("codec ID must be non-zero".to_string()));
+        return Err(Error::InvalidMessage(
+            "codec ID must be non-zero".to_string(),
+        ));
     }
     if codec.name().is_empty() {
-        return Err(Error::InvalidMessage("codec name must be non-empty".to_string()));
+        return Err(Error::InvalidMessage(
+            "codec name must be non-empty".to_string(),
+        ));
     }
     let mut guard = registry().write().unwrap();
     if guard.contains_key(&id) {
-        return Err(Error::InvalidMessage("codec already registered".to_string()));
+        return Err(Error::InvalidMessage(
+            "codec already registered".to_string(),
+        ));
     }
-    guard.insert(id, Arc::new(codec));
+    guard.insert(id, Box::leak(Box::new(codec)));
     Ok(())
 }
 
@@ -51,10 +59,9 @@ where
     }
 }
 
-pub fn codec_by_id(id: CodecID) -> Option<Arc<dyn CodecImpl>> {
+pub fn codec_by_id(id: CodecID) -> Option<&'static dyn CodecImpl> {
     ensure_builtin_codecs();
-    let guard = registry().read().unwrap();
-    guard.get(&id).cloned()
+    registry().read().unwrap().get(&id).copied()
 }
 
 #[cfg(test)]

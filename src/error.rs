@@ -30,14 +30,6 @@ pub enum Error {
     /// Client offered more codecs than the protocol allows.
     #[error("too many codecs: {0}")]
     TooManyCodecs(usize),
-    /// No protocol version supported by both client and server.
-    #[error("no common protocol version: client {client_min}-{client_max}, server {server_min}-{server_max}")]
-    NoCommonVersion {
-        client_min: u8,
-        client_max: u8,
-        server_min: u8,
-        server_max: u8,
-    },
     /// Connection does not speak the adaptivemsg protocol.
     #[error("invalid handshake magic")]
     BadHandshakeMagic,
@@ -170,15 +162,6 @@ mod tests {
         };
         assert!(e.to_string().contains("handler.error"));
         assert!(e.to_string().contains("boom"));
-
-        let e = Error::NoCommonVersion {
-            client_min: 2,
-            client_max: 3,
-            server_min: 4,
-            server_max: 5,
-        };
-        assert!(e.to_string().contains("2-3"));
-        assert!(e.to_string().contains("4-5"));
     }
 
     #[test]

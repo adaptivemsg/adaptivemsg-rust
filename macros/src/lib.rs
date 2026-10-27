@@ -78,23 +78,6 @@ pub fn message(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
     let field_count = fields.named.len();
-    let encode_fields = fields.named.iter().map(|field| {
-        let ident = field.ident.as_ref().unwrap();
-        quote! {
-            items.push(::adaptivemsg::__private::rmpv::ext::to_value(&self.#ident)?);
-        }
-    });
-    let decode_fields = fields.named.iter().map(|field| {
-        let ident = field.ident.as_ref().unwrap();
-        let ty = &field.ty;
-        quote! {
-            let #ident: #ty = ::adaptivemsg::__private::rmpv::ext::from_value(iter.next().unwrap())?;
-        }
-    });
-    let init_fields = fields.named.iter().map(|field| {
-        let ident = field.ident.as_ref().unwrap();
-        quote! { #ident }
-    });
     let ns_lit = ns.unwrap_or_else(|| LitStr::new("am", Span::call_site()));
     let base_expr = if let Some(base_name) = base_name {
         quote! { #base_name.to_string() }
@@ -143,13 +126,10 @@ pub fn message(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             fn encode_compact(&self) -> ::std::result::Result<Vec<u8>, ::adaptivemsg::Error> {
-                let mut items = Vec::with_capacity(1 + #field_count);
-                items.push(::adaptivemsg::__private::rmpv::Value::String(::adaptivemsg::__private::rmpv::Utf8String::from(Self::wire_name_static())));
-                #(#encode_fields)*
-                let value = ::adaptivemsg::__private::rmpv::Value::Array(items);
-                let mut buf = Vec::new();
-                ::adaptivemsg::__private::rmpv::encode::write_value(&mut buf, &value)?;
-                Ok(buf)
+                ::adaptivemsg::__private::encode_compact_value(
+                    Self::wire_name_static(),
+                    ::adaptivemsg::__private::rmpv::ext::to_value(self)?,
+                )
             }
 
             fn encode_postcard(&self) -> ::std::result::Result<Vec<u8>, ::adaptivemsg::Error> {
@@ -167,15 +147,7 @@ pub fn message(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             fn decode_compact(values: Vec<::adaptivemsg::__private::rmpv::Value>) -> ::std::result::Result<Self, ::adaptivemsg::Error> {
-                if values.len() != #field_count {
-                    return Err(::adaptivemsg::Error::CompactFieldCount {
-                        expected: #field_count,
-                        got: values.len(),
-                    });
-                }
-                let mut iter = values.into_iter();
-                #(#decode_fields)*
-                Ok(Self { #(#init_fields),* })
+                ::adaptivemsg::__private::decode_compact_values(values, #field_count)
             }
 
             fn decode_postcard(payload: &[u8]) -> ::std::result::Result<Self, ::adaptivemsg::Error> {

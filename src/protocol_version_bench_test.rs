@@ -46,10 +46,6 @@ async fn wait_server_ready(addr: &str) {
     panic!("server did not become ready");
 }
 
-async fn run_protocol_send_recv_perf_case(recovery_enabled: bool, iterations: usize) -> f64 {
-    run_protocol_send_recv_perf_case_with_codec(recovery_enabled, iterations, None).await
-}
-
 async fn run_protocol_send_recv_perf_case_with_codec(
     recovery_enabled: bool,
     iterations: usize,

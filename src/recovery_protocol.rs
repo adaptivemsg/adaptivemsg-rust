@@ -46,10 +46,10 @@ pub(crate) struct AttachResponse {
     pub negotiated: NegotiatedRecoveryOptions,
 }
 
-pub(crate) fn new_recovery_token() -> Result<RecoveryToken, Error> {
+pub(crate) fn new_recovery_token() -> RecoveryToken {
     let mut token = [0u8; RECOVERY_TOKEN_LEN];
     rand::thread_rng().fill_bytes(&mut token);
-    Ok(token)
+    token
 }
 
 pub(crate) async fn write_attach_request<W>(
@@ -202,19 +202,19 @@ fn duration_to_millis(duration: Duration) -> Result<u32, Error> {
     Ok(millis as u32)
 }
 
-pub(crate) fn build_ack_control_payload(last_recv_seq: u64) -> Vec<u8> {
-    let mut buf = vec![0u8; CONTROL_ACK_FRAME_LEN];
+pub(crate) fn build_ack_control_payload(last_recv_seq: u64) -> [u8; CONTROL_ACK_FRAME_LEN] {
+    let mut buf = [0u8; CONTROL_ACK_FRAME_LEN];
     buf[0] = CONTROL_TYPE_ACK;
     buf[1..9].copy_from_slice(&last_recv_seq.to_be_bytes());
     buf
 }
 
-pub(crate) fn build_ping_control_payload() -> Vec<u8> {
-    vec![CONTROL_TYPE_PING]
+pub(crate) fn build_ping_control_payload() -> [u8; CONTROL_PING_LEN] {
+    [CONTROL_TYPE_PING]
 }
 
-pub(crate) fn build_close_control_payload() -> Vec<u8> {
-    vec![CONTROL_TYPE_CLOSE]
+pub(crate) fn build_close_control_payload() -> [u8; CONTROL_CLOSE_LEN] {
+    [CONTROL_TYPE_CLOSE]
 }
 
 pub(crate) fn parse_control_payload(payload: &[u8]) -> Result<(u8, u64), Error> {

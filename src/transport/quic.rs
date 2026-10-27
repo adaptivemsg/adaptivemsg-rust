@@ -23,7 +23,8 @@ pub async fn connect(
         .await
         .map_err(to_io_err)?;
     let (send, recv) = conn.open_bi().await.map_err(to_io_err)?;
-    let mut pending = ConnectionInner::new_pending_from_split(recv, send, registry, None, None);
+    let mut pending =
+        ConnectionInner::new_pending_from_parts(super::parts(recv, send), registry, None, None);
     let (reader, writer) = pending.io_mut();
     let config = handshake_client(reader, writer, codecs, max_frame, PROTOCOL_VERSION_V2).await?;
     pending.start_with_config(config, None, 0).map(Connection::new_owned)
@@ -41,7 +42,8 @@ pub async fn accept(
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no incoming connection"))?;
     let conn = incoming.await.map_err(to_io_err)?;
     let (send, recv) = conn.accept_bi().await.map_err(to_io_err)?;
-    let mut pending = ConnectionInner::new_pending_from_split(recv, send, registry, None, None);
+    let mut pending =
+        ConnectionInner::new_pending_from_parts(super::parts(recv, send), registry, None, None);
     let (reader, writer) = pending.io_mut();
     let config = handshake_server(reader, writer, codecs, max_frame, false).await?;
     pending.start_with_config(config, None, 0).map(Connection::new_owned)

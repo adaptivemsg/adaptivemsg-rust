@@ -176,8 +176,8 @@ async fn start_heartbeat_blackhole_server(
             .expect("read first attach request");
         assert_eq!(first_req.mode, ATTACH_MODE_NEW);
 
-        let connection_id = new_recovery_token().expect("new connection id token");
-        let resume_secret = new_recovery_token().expect("new resume secret token");
+        let connection_id = new_recovery_token();
+        let resume_secret = new_recovery_token();
         let first_resp = AttachResponse {
             status: ATTACH_STATUS_OK,
             connection_id,

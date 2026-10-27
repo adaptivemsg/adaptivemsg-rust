@@ -17,7 +17,8 @@ where
     L: std::ops::Deref<Target = TcpListener>,
 {
     let (stream, peer_addr) = listener.accept().await?;
-    stream.set_nodelay(true)?;
+    // Fails only if the peer is already gone, which the handshake reports.
+    let _ = stream.set_nodelay(true);
     Ok((stream, Some(peer_addr.to_string())))
 }
 

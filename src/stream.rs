@@ -6,7 +6,11 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::sync::Notify;
 
 use crate::connection::{ConnectionRef, HandlerJob, Owner};
-use crate::debug::{StreamDebugCounters, StreamDebugState};
+use crate::debug::{
+    DebugFailureCode, MessageCounters, StreamDebugCounters, StreamDebugState,
+    FAILURE_STREAM_DECODE, FAILURE_STREAM_ENCODE, FAILURE_STREAM_ENQUEUE,
+    FAILURE_STREAM_PROTOCOL, FAILURE_STREAM_PROTOCOL_REPLY_SEND, FAILURE_STREAM_RECV_TIMEOUT,
+};
 use crate::error::Error;
 use crate::message::{ErrorReply, Message, MessageDecode};
 use crate::type_info::expected_wire_name;
@@ -53,7 +57,6 @@ const RECV_TIMEOUT_NONE: u64 = 0;
 pub struct StreamInner {
     pub(crate) id: u32,
     pub(crate) connection: ConnectionRef,
-    pub(crate) handler_rx: Option<AsyncMutex<mpsc::Receiver<HandlerJob>>>,
     pub(crate) handler_tx: Option<mpsc::Sender<HandlerJob>>,
     pub(crate) inbox_rx: AsyncMutex<mpsc::Receiver<RawMessage>>,
     pub(crate) inbox_tx: mpsc::Sender<RawMessage>,
@@ -76,13 +79,11 @@ impl StreamInner {
         inbox_rx: mpsc::Receiver<RawMessage>,
         inbox_tx: mpsc::Sender<RawMessage>,
         incoming_tx: mpsc::Sender<Vec<u8>>,
-        handler_rx: Option<AsyncMutex<mpsc::Receiver<HandlerJob>>>,
         handler_tx: Option<mpsc::Sender<HandlerJob>>,
     ) -> Self {
         Self {
             id,
             connection,
-            handler_rx,
             handler_tx,
             inbox_rx: AsyncMutex::new(inbox_rx),
             inbox_tx,
@@ -111,7 +112,6 @@ impl StreamInner {
             inbox_rx,
             inbox_tx,
             incoming_tx,
-            None,
             None,
         );
         stream.closed.store(true, Ordering::Release);
@@ -154,6 +154,10 @@ impl StreamInner {
     /// its copy. Only the opener sends FIN, so a stream opened by the peer is
     /// removed locally, as is stream 0, whose lifetime follows the connection;
     /// frames the peer still sends on such a stream are dropped.
+    ///
+    /// `close` does not wait: a task on the connection's runtime queues the
+    /// FIN, so `close` can be called from any thread, including one outside
+    /// the runtime.
     pub fn close(self: &Arc<Self>) {
         if !self.connection.opened_stream(self.id) {
             if let Some(stream_ctx) = self.connection.remove_peer_stream(self.id) {
@@ -165,7 +169,7 @@ impl StreamInner {
             return;
         }
         let stream = Arc::clone(self);
-        tokio::spawn(async move {
+        self.connection.spawn(async move {
             stream.send_fin().await;
             if let Some(stream_ctx) = stream.connection.remove_stream(stream.id) {
                 stream.connection.notify_close(&stream_ctx);
@@ -180,7 +184,10 @@ impl StreamInner {
             flags: crate::frame::FRAME_FLAG_FIN,
             payload: Vec::new(),
         };
-        let _ = self.connection.enqueue_frame(frame).await;
+        if let Err(err) = self.connection.enqueue_frame(frame).await {
+            self.debug
+                .note_failure(FAILURE_STREAM_ENQUEUE, format!("fin enqueue failed: {err}"));
+        }
     }
 
     /// Queue the peer's FIN as an empty payload behind the frames already
@@ -190,10 +197,13 @@ impl StreamInner {
         let _ = self.incoming_tx.send(Vec::new()).await;
     }
 
-    pub(crate) fn close_channels(&self) {
-        if !self.closed.swap(true, Ordering::AcqRel) {
-            self.closed_notify.notify_waiters();
+    /// Marks the stream closed; returns false if it already was.
+    pub(crate) fn close_channels(&self) -> bool {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return false;
         }
+        self.closed_notify.notify_waiters();
+        true
     }
 
     pub(crate) async fn wait_closed(&self) {
@@ -237,11 +247,7 @@ impl StreamInner {
     /// wire name does not match `T`, or [`Error::Codec`] on decode failure.
     pub async fn recv<T: MessageDecode + 'static>(&self) -> Result<T, Error> {
         let raw = self.recv_raw().await?;
-        let result = decode_raw_as::<T>(raw);
-        if let Err(err) = result.as_ref() {
-            self.protocol_error_for(err).await;
-        }
-        result
+        self.decode_reply(raw).await
     }
 
     /// Send a request and wait for a response of type `TResp`.
@@ -268,17 +274,26 @@ impl StreamInner {
         if raw.wire == error_reply_wire_name() {
             match decode_raw_as::<ErrorReply>(raw) {
                 Ok(reply) => {
+                    self.count(|c| &c.remote_errors);
                     let (code, message) = reply.into_parts();
                     return Err(Error::Remote { code, message });
                 }
                 Err(err) => {
+                    self.note_decode_error(&err);
                     self.protocol_error("codec_error", err.to_string()).await;
                     return Err(err);
                 }
             }
         }
-        let result = decode_raw_as::<TResp>(raw);
+        self.decode_reply(raw).await
+    }
+
+    /// Decodes a received message; a failure is answered with a protocol
+    /// error, which closes the stream.
+    async fn decode_reply<T: MessageDecode + 'static>(&self, raw: RawMessage) -> Result<T, Error> {
+        let result = decode_raw_as::<T>(raw);
         if let Err(err) = result.as_ref() {
+            self.note_decode_error(err);
             self.protocol_error_for(err).await;
         }
         result
@@ -301,19 +316,39 @@ impl StreamInner {
         if self.fin_started.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
-        let payload = self.connection.encode_message(msg.as_ref())?;
+        let payload = match self.connection.encode_message(msg.as_ref()) {
+            Ok(payload) => payload,
+            Err(err) => {
+                self.note_failure(FAILURE_STREAM_ENCODE, format!("encode failed: {err}"));
+                return Err(err);
+            }
+        };
         let frame = crate::connection::OutboundFrame::Plain {
             stream_id: self.id,
             flags: 0,
             payload,
         };
-        self.connection.enqueue_frame(frame).await?;
-        self.debug.data_messages_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Err(err) = self.connection.enqueue_frame(frame).await {
+            self.note_failure(FAILURE_STREAM_ENQUEUE, format!("enqueue failed: {err}"));
+            return Err(err);
+        }
+        self.count(|c| &c.data_messages_sent);
         Ok(())
     }
 
+    /// Queues a received message for `recv`. The stream owns the receiver, so
+    /// the send alone would wait for room in the inbox of a closed stream
+    /// forever, and the reader with it.
     pub(crate) async fn inbox_q(&self, msg: RawMessage) -> Result<(), Error> {
-        self.inbox_tx.send(msg).await.map_err(|_| Error::Closed)
+        tokio::select! {
+            biased;
+            _ = self.wait_closed() => Err(Error::Closed),
+            result = self.inbox_tx.send(msg) => {
+                result.map_err(|_| Error::Closed)?;
+                self.count(|c| &c.data_messages_received);
+                Ok(())
+            }
+        }
     }
 
     pub(crate) async fn handler_q(
@@ -321,23 +356,36 @@ impl StreamInner {
         handler: Arc<dyn crate::registry::Handler>,
         msg: Box<dyn crate::message::Message>,
     ) -> Result<(), Error> {
-        match self.handler_tx.as_ref() {
-            Some(tx) => tx.send((handler, msg)).await.map_err(|_| Error::Closed),
-            None => Err(Error::Closed),
+        let Some(tx) = self.handler_tx.as_ref() else {
+            return Err(Error::Closed);
+        };
+        tokio::select! {
+            biased;
+            _ = self.wait_closed() => Err(Error::Closed),
+            result = tx.send((handler, msg)) => {
+                result.map_err(|_| Error::Closed)?;
+                self.count(|c| &c.data_messages_received);
+                Ok(())
+            }
         }
     }
 
-    pub(crate) async fn recv_handler_job(&self) -> Result<HandlerJob, Error> {
-        let Some(handler_rx) = self.handler_rx.as_ref() else {
-            return Err(Error::Closed);
-        };
-        let mut handler_rx = handler_rx.lock().await;
-        // Jobs queued before the stream closed still run.
-        tokio::select! {
-            biased;
-            job = handler_rx.recv() => job.ok_or(Error::Closed),
-            _ = self.wait_closed() => Err(Error::Closed),
-        }
+    /// Adds one to a message counter of the stream and to the same counter of
+    /// its connection.
+    pub(crate) fn count(&self, counter: impl Fn(&MessageCounters) -> &AtomicU64) {
+        counter(&self.debug.messages).fetch_add(1, Ordering::Relaxed);
+        counter(&self.connection.debug.messages).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Notes a failure on the stream and on its connection.
+    pub(crate) fn note_failure(&self, code: DebugFailureCode, reason: String) {
+        self.connection.debug.note_failure(code, reason.clone());
+        self.debug.note_failure(code, reason);
+    }
+
+    pub(crate) fn note_decode_error(&self, err: &Error) {
+        self.count(|c| &c.decode_errors);
+        self.note_failure(FAILURE_STREAM_DECODE, format!("decode failed: {err}"));
     }
 
     #[cfg(test)]
@@ -409,15 +457,38 @@ impl StreamInner {
             msg = inbox.recv() => msg.ok_or(Error::Closed),
             _ = self.connection.wait_closed() => Err(Error::Closed),
             _ = self.wait_closed() => Err(Error::Closed),
-            _ = timeout => Err(Error::RecvTimeout),
+            _ = timeout => {
+                self.debug
+                    .note_failure(FAILURE_STREAM_RECV_TIMEOUT, "recv timeout".to_string());
+                self.connection
+                    .debug
+                    .note_failure(FAILURE_STREAM_RECV_TIMEOUT, "stream recv timeout".to_string());
+                Err(Error::RecvTimeout)
+            }
         }
     }
 
     pub(crate) async fn protocol_error(&self, code: &str, message: String) {
-        self.debug.protocol_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _ = self
+        let reason = if message.is_empty() {
+            code.to_string()
+        } else {
+            format!("{code}: {message}")
+        };
+        self.connection
+            .debug
+            .note_failure(FAILURE_STREAM_PROTOCOL, format!("stream protocol error: {reason}"));
+        self.debug.note_failure(FAILURE_STREAM_PROTOCOL, reason);
+        self.count(|c| &c.protocol_errors);
+        if let Err(err) = self
             .send_boxed(Box::new(ErrorReply::new(code, message)))
-            .await;
+            .await
+        {
+            self.note_failure(
+                FAILURE_STREAM_PROTOCOL_REPLY_SEND,
+                format!("protocol error reply send failed: {err}"),
+            );
+            self.count(|c| &c.protocol_error_reply_send_failure);
+        }
         if !self.connection.opened_stream(self.id) {
             self.connection.remove_peer_stream(self.id);
             return;

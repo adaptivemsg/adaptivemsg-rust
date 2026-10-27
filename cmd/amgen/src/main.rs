@@ -51,7 +51,8 @@ fn run() -> Result<()> {
     }
     let rendered = render_go(&package_name, &messages);
     write_output(&output, rendered)?;
-    if let Some(go_mod) = default_go_mod_path(&input_abs) {
+    // An existing go.mod may carry requirements and settings of its own.
+    if let Some(go_mod) = default_go_mod_path(&input_abs).filter(|path| !path.exists()) {
         let module = default_go_module(&go_mod)?;
         let rendered_mod = render_go_mod(&module);
         write_output(&go_mod, rendered_mod)?;
@@ -201,10 +202,6 @@ fn repo_root_for_input(input: &Path) -> Option<PathBuf> {
 }
 
 fn default_go_module(go_mod: &Path) -> Result<String> {
-    // Respect existing go.mod module name.
-    if let Some(module) = parse_existing_go_mod(go_mod) {
-        return Ok(module);
-    }
     // Try to derive from .git/config origin URL.
     if let Some(module) = module_from_git_config(go_mod) {
         return Ok(module);
@@ -225,21 +222,6 @@ fn default_go_module(go_mod: &Path) -> Result<String> {
         }
     }
     bail!("cannot infer module name for go.mod")
-}
-
-/// Read an existing go.mod and return its module name.
-fn parse_existing_go_mod(go_mod: &Path) -> Option<String> {
-    let content = fs::read_to_string(go_mod).ok()?;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(module) = trimmed.strip_prefix("module ") {
-            let module = module.trim();
-            if !module.is_empty() {
-                return Some(module.to_string());
-            }
-        }
-    }
-    None
 }
 
 /// Parse `[remote "origin"]` url from `.git/config` and convert to a Go module path.
@@ -372,9 +354,14 @@ fn parse_fields(fields: &Fields) -> Result<Vec<FieldDef>> {
     for field in &named.named {
         let ident = field.ident.as_ref().context("unnamed field")?;
         let rust_name = ident.to_string();
-        let tag = serde_tag(&field.attrs)?.unwrap_or_else(|| rust_name.clone());
+        let serde = serde_field_attrs(&field.attrs)?;
+        let tag = serde.rename.unwrap_or_else(|| rust_name.clone());
         let go_name = to_go_field_name(&rust_name)?;
-        let go_type = go_type(&field.ty)?;
+        let go_type = if serde.with.as_deref().is_some_and(is_serde_bytes_path) {
+            serde_bytes_go_type(&field.ty)?
+        } else {
+            go_type(&field.ty)?
+        };
         out.push(FieldDef {
             name: go_name,
             ty: go_type,
@@ -384,19 +371,30 @@ fn parse_fields(fields: &Fields) -> Result<Vec<FieldDef>> {
     Ok(out)
 }
 
-fn serde_tag(attrs: &[Attribute]) -> Result<Option<String>> {
-    let mut rename: Option<String> = None;
+#[derive(Default)]
+struct SerdeFieldAttrs {
+    rename: Option<String>,
+    with: Option<String>,
+}
+
+fn serde_field_attrs(attrs: &[Attribute]) -> Result<SerdeFieldAttrs> {
+    let mut out = SerdeFieldAttrs::default();
     for attr in attrs {
         if !attr.path().is_ident("serde") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("rename") {
-                if rename.is_some() {
+                if out.rename.is_some() {
                     return Err(meta.error("duplicate serde(rename)"));
                 }
                 let lit: LitStr = meta.value()?.parse()?;
-                rename = Some(lit.value());
+                out.rename = Some(lit.value());
+                return Ok(());
+            }
+            if meta.path.is_ident("with") {
+                let lit: LitStr = meta.value()?.parse()?;
+                out.with = Some(lit.value());
                 return Ok(());
             }
             if meta.path.is_ident("rename_all") {
@@ -405,13 +403,66 @@ fn serde_tag(attrs: &[Attribute]) -> Result<Option<String>> {
             if meta.path.is_ident("skip")
                 || meta.path.is_ident("skip_serializing")
                 || meta.path.is_ident("skip_deserializing")
+                || meta.path.is_ident("skip_serializing_if")
             {
                 return Err(meta.error("serde(skip) is not supported for amgen-rs"));
+            }
+            // Other options do not change the Go type, but their value must
+            // be consumed for parsing to continue.
+            if meta.input.peek(syn::Token![=]) {
+                meta.value()?.parse::<Expr>()?;
             }
             Ok(())
         })?;
     }
-    Ok(rename)
+    Ok(out)
+}
+
+fn is_serde_bytes_path(path: &str) -> bool {
+    path == "serde_bytes" || path.ends_with("::serde_bytes")
+}
+
+/// Go type of a field marked `#[serde(with = "serde_bytes")]`, which is
+/// msgpack bin like Go's `[]byte`. Go has no separate None for a byte slice:
+/// None is nil.
+fn serde_bytes_go_type(ty: &Type) -> Result<String> {
+    let inner = option_inner(ty).unwrap_or(ty);
+    if is_byte_vec(inner) || is_named(inner, "ByteBuf") {
+        return Ok("[]byte".to_string());
+    }
+    bail!("serde_bytes fields must be Vec<u8>, ByteBuf, or an Option of either")
+}
+
+fn option_inner(ty: &Type) -> Option<&Type> {
+    let Type::Path(path) = ty else { return None };
+    let segment = path.path.segments.last()?;
+    if segment.ident != "Option" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    match args.args.first()? {
+        GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    }
+}
+
+fn is_byte_vec(ty: &Type) -> bool {
+    let Type::Path(path) = ty else { return false };
+    let Some(segment) = path.path.segments.last() else {
+        return false;
+    };
+    segment.ident == "Vec" && single_generic_type(segment).is_ok_and(|inner| is_named(&inner, "u8"))
+}
+
+fn is_named(ty: &Type, name: &str) -> bool {
+    match ty {
+        Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            segment.ident == name && matches!(segment.arguments, PathArguments::None)
+        }),
+        _ => false,
+    }
 }
 
 fn to_go_field_name(name: &str) -> Result<String> {
@@ -512,9 +563,17 @@ fn go_type(ty: &Type) -> Result<String> {
                 }
                 "Vec" => {
                     let inner = single_generic_type(segment)?;
+                    if is_named(&inner, "u8") {
+                        bail!(
+                            "Vec<u8> is encoded as an array of integers, which Go's []byte \
+                             cannot decode; mark the field #[serde(with = \"serde_bytes\")], \
+                             or use serde_bytes::ByteBuf inside other types"
+                        )
+                    }
                     let inner_go = go_type(&inner)?;
                     Ok(format!("[]{inner_go}"))
                 }
+                "ByteBuf" => Ok("[]byte".to_string()),
                 "BTreeMap" | "HashMap" => {
                     let (key, value) = two_generic_types(segment)?;
                     let key_go = go_type(&key)?;
@@ -659,4 +718,61 @@ fn write_output(path: &Path, contents: String) -> Result<()> {
     }
     fs::write(path, contents).with_context(|| format!("write output {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fields_of(src: &str) -> Result<Vec<FieldDef>> {
+        let item: syn::ItemStruct = syn::parse_str(src).expect("parse struct");
+        parse_fields(&item.fields)
+    }
+
+    /// serde encodes `Vec<u8>` as an integer array, while Go encodes `[]byte`
+    /// as msgpack bin and cannot decode the array.
+    #[test]
+    fn byte_fields_need_serde_bytes() {
+        let fields = fields_of(
+            "struct Blob {
+                #[serde(with = \"am::__private::serde_bytes\")]
+                data: Vec<u8>,
+                #[serde(with = \"serde_bytes\")]
+                maybe: Option<Vec<u8>>,
+                chunks: Vec<am::__private::serde_bytes::ByteBuf>,
+            }",
+        )
+        .expect("parse fields");
+        let types: Vec<&str> = fields.iter().map(|field| field.ty.as_str()).collect();
+        assert_eq!(types, ["[]byte", "[]byte", "[][]byte"]);
+
+        let err = fields_of("struct Blob { data: Vec<u8> }")
+            .err()
+            .expect("plain Vec<u8> must be rejected");
+        assert!(err.to_string().contains("serde_bytes"), "{err}");
+    }
+
+    #[test]
+    fn serde_options_with_values() {
+        let fields = fields_of(
+            "struct Blob {
+                #[serde(default = \"empty\", rename = \"raw\", with = \"serde_bytes\")]
+                data: Vec<u8>,
+            }",
+        )
+        .expect("parse fields");
+        assert_eq!(fields[0].tag, "raw");
+        assert_eq!(fields[0].ty, "[]byte");
+
+        // A skipped field shortens the compact array that Go decodes by position.
+        let err = fields_of(
+            "struct Blob {
+                #[serde(skip_serializing_if = \"Option::is_none\")]
+                note: Option<String>,
+            }",
+        )
+        .err()
+        .expect("skip_serializing_if must be rejected");
+        assert!(err.to_string().contains("skip"), "{err}");
+    }
 }

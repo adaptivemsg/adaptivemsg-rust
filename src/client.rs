@@ -38,6 +38,7 @@ pub struct Client {
     connect_timeout: Option<Duration>,
     recv_timeout: Option<Duration>,
     max_frame: u32,
+    stream_queue_size: usize,
     codecs: Vec<CodecID>,
     registry: Registry,
     recovery: ClientRecoveryOptions,
@@ -52,6 +53,7 @@ impl Default for Client {
             connect_timeout: None,
             recv_timeout: None,
             max_frame: DEFAULT_MAX_FRAME,
+            stream_queue_size: 0,
             codecs: vec![CodecPostcard, CodecMsgpackCompact, CodecMsgpackMap],
             registry: Registry::from_inventory(),
             recovery: ClientRecoveryOptions::default(),
@@ -105,6 +107,18 @@ impl Client {
     /// is 16 MiB.
     pub fn with_max_frame(mut self, max_frame: u32) -> Self {
         self.max_frame = max_frame;
+        self
+    }
+
+    /// Set how many received messages each stream buffers: messages waiting
+    /// for `recv` or for a handler, and frames waiting to be decoded.
+    ///
+    /// When a stream's buffer is full, the connection stops reading until
+    /// the stream catches up, which holds up its other streams too. A smaller
+    /// buffer saves memory on connections with many streams but reaches that
+    /// point sooner. The default is 1024; 0 keeps the default.
+    pub fn with_stream_queue_size(mut self, size: usize) -> Self {
+        self.stream_queue_size = size;
         self
     }
 
@@ -200,6 +214,9 @@ impl Client {
         if let Some(timeout) = self.recv_timeout {
             pending.connection().set_default_recv_timeout(timeout);
         }
+        pending
+            .connection()
+            .set_stream_queue_size(self.stream_queue_size);
         let (reader, writer) = pending.io_mut();
         let config = before(
             deadline,
@@ -239,7 +256,7 @@ impl Client {
         let addr_string = addr.to_string();
         let connector: ResumeConnector = std::sync::Arc::new(move || {
             let addr = addr_string.clone();
-            Box::pin(async move { dial_transport(&addr).await })
+            Box::pin(async move { crate::transport::dial(&addr).await })
         });
         let recovery = RecoveryState::new_client(
             normalized,
@@ -321,75 +338,8 @@ async fn dial_pending(
     addr: &str,
     registry: Registry,
 ) -> Result<crate::connection::PendingConnection, Error> {
-    if let Some(stripped) = addr.strip_prefix("uds://") {
-        return Ok(crate::connection::ConnectionInner::new_pending(
-            crate::transport::uds::dial(stripped).await?,
-            registry,
-            None,
-            None,
-        ));
-    }
-    if let Some(stripped) = addr.strip_prefix("unix://") {
-        return Ok(crate::connection::ConnectionInner::new_pending(
-            crate::transport::uds::dial(stripped).await?,
-            registry,
-            None,
-            None,
-        ));
-    }
-    if let Some(stripped) = addr.strip_prefix("tcp://") {
-        return Ok(crate::connection::ConnectionInner::new_pending(
-            crate::transport::tcp::dial(stripped).await?,
-            registry,
-            None,
-            None,
-        ));
-    }
-    Ok(crate::connection::ConnectionInner::new_pending(
-        crate::transport::tcp::dial(addr).await?,
-        registry,
-        None,
-        None,
+    let parts = crate::transport::dial(addr).await?;
+    Ok(crate::connection::ConnectionInner::new_pending_from_parts(
+        parts, registry, None, None,
     ))
-}
-
-async fn dial_transport(addr: &str) -> Result<crate::connection::TransportParts, Error> {
-    if let Some(stripped) = addr.strip_prefix("uds://") {
-        let stream = crate::transport::uds::dial(stripped).await?;
-        return Ok(crate::connection::ConnectionInner::new_pending(
-            stream,
-            Registry::from_inventory(),
-            None,
-            None,
-        )
-        .into_transport_parts());
-    }
-    if let Some(stripped) = addr.strip_prefix("unix://") {
-        let stream = crate::transport::uds::dial(stripped).await?;
-        return Ok(crate::connection::ConnectionInner::new_pending(
-            stream,
-            Registry::from_inventory(),
-            None,
-            None,
-        )
-        .into_transport_parts());
-    }
-    if let Some(stripped) = addr.strip_prefix("tcp://") {
-        let stream = crate::transport::tcp::dial(stripped).await?;
-        return Ok(crate::connection::ConnectionInner::new_pending(
-            stream,
-            Registry::from_inventory(),
-            None,
-            None,
-        )
-        .into_transport_parts());
-    }
-    let stream = crate::transport::tcp::dial(addr).await?;
-    Ok(crate::connection::ConnectionInner::new_pending(
-        stream,
-        Registry::from_inventory(),
-        None,
-        None,
-    )
-    .into_transport_parts())
 }

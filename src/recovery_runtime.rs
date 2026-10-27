@@ -1,25 +1,34 @@
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::Sleep;
 use tracing::{debug, warn};
 
+use crate::debug::{
+    DebugFailureCode, FAILURE_RECOVERY_ACK_WRITE, FAILURE_RECOVERY_CONTROL, FAILURE_RECOVERY_DATA,
+    FAILURE_RECOVERY_LIVE_WRITE, FAILURE_RECOVERY_PING_WRITE, FAILURE_RECOVERY_READ,
+    FAILURE_RECOVERY_RESUME_WRITE,
+};
 use crate::error::Error;
 use crate::protocol::{handshake_client, PROTOCOL_VERSION_V3};
-use crate::recovery::RecoveryRole;
+use crate::recovery::{RecoveryRole, RecoveryState};
 use crate::recovery_protocol::{
     build_ack_control_payload, build_close_control_payload, build_ping_control_payload,
-    parse_control_payload, AttachRequest, CONTROL_STREAM_ID, CONTROL_TYPE_ACK,
-    CONTROL_TYPE_CLOSE, CONTROL_TYPE_PING,
+    parse_control_payload, AttachRequest, CONTROL_STREAM_ID, CONTROL_TYPE_ACK, CONTROL_TYPE_CLOSE,
+    CONTROL_TYPE_PING,
 };
 
 use super::{
-    read_frame, write_frame, write_frame_no_flush, ConnectionRef, ConnectionInner, InboundFrame,
+    read_frame, write_frame_counted, ConnConfig, ConnectionInner, ConnectionRef, InboundFrame,
     OutboundFrame, TransportParts, TransportReader, TransportWriter, WriterCommand,
 };
-use std::sync::Arc;
-use crate::replay::FrameRecord;
+use crate::replay::{FrameRecord, Staged};
 
 impl ConnectionInner {
     pub(crate) fn attach_transport_parts(
@@ -27,13 +36,10 @@ impl ConnectionInner {
         parts: TransportParts,
         peer_last_recv_seq: u64,
     ) {
-        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.closed.load(Ordering::Relaxed) {
             return;
         }
-        let gen = self
-            .transport_gen
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            + 1;
+        let gen = self.transport_gen.fetch_add(1, Ordering::AcqRel) + 1;
         if let Some((_, handle)) = self.current_reader_abort.lock().unwrap().take() {
             handle.abort();
         }
@@ -42,365 +48,43 @@ impl ConnectionInner {
             writer: parts.writer,
             resume_seq: peer_last_recv_seq,
         });
-        if let Some(recovery) = self.recovery() {
-            recovery.on_attached();
-        }
+        self.transport_attached.store(true, Ordering::Release);
         self.signal_send();
         let reader_task = if self.is_recovery_enabled() {
             self.spawn_recovery_reader(gen, parts.reader)
         } else {
-            self.spawn_plain_reader(gen, parts.reader)
+            self.spawn_plain_reader(parts.reader)
         };
         *self.current_reader_abort.lock().unwrap() = Some((gen, reader_task.abort_handle()));
-        self.debug.transport_attaches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.debug
+            .transport_attaches
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn spawn_recovery_writer(
         self: &ConnectionRef,
-        mut writer_cmd_rx: mpsc::UnboundedReceiver<WriterCommand>,
-        mut outbound_rx: mpsc::Receiver<OutboundFrame>,
+        writer_cmd_rx: mpsc::UnboundedReceiver<WriterCommand>,
+        outbound_rx: mpsc::Receiver<OutboundFrame>,
     ) -> JoinHandle<()> {
         let connection = self.clone();
         tokio::spawn(async move {
-            let recovery = match connection.recovery() {
-                Some(recovery) => recovery.clone(),
-                None => return,
+            let Some(recovery) = connection.recovery().cloned() else {
+                return;
             };
-            let mut writer: Option<TransportWriter> = None;
-            let mut current_gen = 0;
-            let mut last_sent_seq = 0;
-            // A frame that does not fit in the replay buffer yet. While it is
-            // held no other frame is taken, so its sender, and the senders
-            // queued behind it, wait until an ACK frees room.
-            let mut held: Option<OutboundFrame> = None;
-
-            let stage_live = |frame: OutboundFrame,
-                              held: &mut Option<OutboundFrame>|
-             -> Option<Arc<FrameRecord>> {
-                let len = match &frame {
-                    OutboundFrame::Plain { payload, .. }
-                    | OutboundFrame::Recovery { payload, .. } => payload.len(),
-                    OutboundFrame::Close { .. } => return None,
-                };
-                if let (false, true) = recovery.replay.fits(len) {
-                    *held = Some(frame);
-                    return None;
-                }
-                let (stream_id, flags, payload, queued_tx) = match frame {
-                    OutboundFrame::Plain {
-                        stream_id,
-                        flags,
-                        payload,
-                    } => (stream_id, flags, payload, None),
-                    OutboundFrame::Recovery {
-                        stream_id,
-                        flags,
-                        payload,
-                        queued_tx,
-                    } => (stream_id, flags, payload, Some(queued_tx)),
-                    OutboundFrame::Close { .. } => return None,
-                };
-                let seq = connection.next_outbound_seq();
-                match recovery.replay.add(stream_id, seq, flags, payload) {
-                    Ok(record) => {
-                        if let Some(queued_tx) = queued_tx {
-                            let _ = queued_tx.send(Ok(()));
-                        }
-                        Some(record)
-                    }
-                    Err(err) => {
-                        // Give the unused sequence number back: the peer closes
-                        // the connection when a number is skipped. Only this
-                        // task takes numbers.
-                        connection
-                            .next_send_seq
-                            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                        if let Some(queued_tx) = queued_tx {
-                            let _ = queued_tx.send(Err(err));
-                        }
-                        None
-                    }
-                }
-            };
-
-            // Passes a data frame through. For the close marker it writes CLOSE
-            // after the frames already written, shuts down the transport and
-            // stops, so the peer releases the connection instead of keeping it
-            // for a reconnect.
-            macro_rules! live_or_finish {
-                ($frame:expr) => {{
-                    match $frame {
-                        OutboundFrame::Close { written } => {
-                            let mut ok = false;
-                            if let Some(w) = writer.as_mut() {
-                                let payload = build_close_control_payload();
-                                ok = write_frame(connection.config(), w, CONTROL_STREAM_ID, 0, 0, &payload)
-                                    .await
-                                    .is_ok()
-                                    && w.shutdown().await.is_ok();
-                            }
-                            let _ = written.send(ok);
-                            return;
-                        }
-                        frame => frame,
-                    }
-                }};
+            RecoveryWriter {
+                connection,
+                recovery,
+                writer_cmd_rx,
+                outbound_rx,
+                writer: None,
+                gen: 0,
+                last_sent_seq: 0,
+                resume: VecDeque::new(),
+                held: None,
+                dirty: false,
             }
-
-            // Write a live frame; returns true if writer was lost.
-            macro_rules! write_live {
-                ($frame:expr) => {{
-                    let frame = $frame;
-                    if frame.seq > last_sent_seq {
-                        let result = {
-                            let w = writer.as_mut().expect("writer missing");
-                            write_frame(connection.config(), w, frame.stream_id, frame.seq, frame.flags, &frame.payload).await
-                        };
-                        if let Err(err) = result {
-                            connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_LIVE_WRITE, err.to_string());
-                            warn!("recovery live write failed: {err}");
-                            connection.detach_transport(current_gen, true);
-                            writer = None;
-                        } else {
-                            connection.debug.frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            connection.debug.bytes_written.fetch_add(frame.payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                            last_sent_seq = frame.seq;
-                        }
-                    }
-                }};
-            }
-
-            loop {
-                if connection.closed.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                if writer.is_none() {
-                    // A pending Attach goes first, so that a close marker
-                    // queued right after connecting still gets written.
-                    tokio::select! {
-                        biased;
-                        _ = connection.closed_notify.notified() => return,
-                        cmd = writer_cmd_rx.recv() => match cmd {
-                            Some(WriterCommand::Attach { gen, writer: next_writer, resume_seq }) => {
-                                current_gen = gen;
-                                last_sent_seq = resume_seq;
-                                recovery.prepare_resume(resume_seq);
-                                writer = Some(next_writer);
-                            }
-                            Some(WriterCommand::Detach { .. }) => {}
-                            None => return,
-                        },
-                        maybe_frame = outbound_rx.recv(), if held.is_none() => match maybe_frame {
-                            Some(frame) => {
-                                let _ = stage_live(live_or_finish!(frame), &mut held);
-                            }
-                            None => return,
-                        },
-                        // The close marker is queued behind the held frame,
-                        // and nothing can be written while detached: stop, so
-                        // close does not wait for it.
-                        _ = connection.send_notify.notified(), if held.is_some() => {
-                            if connection.closing.load(std::sync::atomic::Ordering::Acquire) {
-                                return;
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                while let Ok(cmd) = writer_cmd_rx.try_recv() {
-                    match cmd {
-                        WriterCommand::Attach {
-                            gen,
-                            writer: next_writer,
-                            resume_seq,
-                        } => {
-                            current_gen = gen;
-                            last_sent_seq = resume_seq;
-                            recovery.prepare_resume(resume_seq);
-                            writer = Some(next_writer);
-                        }
-                        WriterCommand::Detach { gen } if gen == current_gen => writer = None,
-                        WriterCommand::Detach { .. } => {}
-                    }
-                }
-                if writer.is_none() {
-                    continue;
-                }
-
-                if let Some(ack_seq) = recovery.take_pending_ack() {
-                    let ack_payload = build_ack_control_payload(ack_seq);
-                    let writer_ref = writer.as_mut().expect("writer missing");
-                    // Buffer ACK frame (no flush yet)
-                    let result = write_frame_no_flush(
-                        connection.config(),
-                        writer_ref,
-                        CONTROL_STREAM_ID,
-                        0,
-                        0,
-                        &ack_payload,
-                    )
-                    .await;
-                    if let Err(err) = result {
-                        connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_ACK_WRITE, err.to_string());
-                        warn!("recovery ack write failed: {err}");
-                        connection.detach_transport(current_gen, true);
-                        writer = None;
-                        continue;
-                    }
-                    connection.debug.control_frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // Batch: also write one pending live frame before flushing.
-                    let next = if held.is_none() {
-                        outbound_rx.try_recv().ok()
-                    } else {
-                        None
-                    };
-                    if let Some(frame) = next {
-                        if let Some(frame) = stage_live(live_or_finish!(frame), &mut held) {
-                            if frame.seq > last_sent_seq {
-                                let writer_ref = writer.as_mut().expect("writer missing");
-                                let result = write_frame_no_flush(
-                                    connection.config(),
-                                    writer_ref,
-                                    frame.stream_id,
-                                    frame.seq,
-                                    frame.flags,
-                                    &frame.payload,
-                                )
-                                .await;
-                                if let Err(err) = result {
-                                    connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_LIVE_WRITE, err.to_string());
-                                    warn!("recovery live write failed: {err}");
-                                    connection.detach_transport(current_gen, true);
-                                    writer = None;
-                                    continue;
-                                }
-                                connection.debug.frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                connection.debug.bytes_written.fetch_add(frame.payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                                last_sent_seq = frame.seq;
-                            }
-                        }
-                    }
-                    // Single flush for ACK + optional data
-                    if let Err(err) = writer.as_mut().expect("writer missing").flush().await {
-                        warn!("recovery flush failed: {err}");
-                        connection.detach_transport(current_gen, true);
-                        writer = None;
-                    }
-                    continue;
-                }
-
-                if recovery
-                    .resume_active
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    if let Some(frame) = recovery.take_resume_frame() {
-                        if frame.seq <= last_sent_seq
-                            || frame.seq <= recovery.replay.last_acked_seq()
-                        {
-                            continue;
-                        }
-                        let result = {
-                            let writer_ref = writer.as_mut().expect("writer missing");
-                            write_frame(
-                                connection.config(),
-                                writer_ref,
-                                frame.stream_id,
-                                frame.seq,
-                                frame.flags,
-                                &frame.payload,
-                            )
-                            .await
-                        };
-                        if let Err(err) = result {
-                            connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_RESUME_WRITE, err.to_string());
-                            warn!("recovery resume write failed: {err}");
-                            connection.detach_transport(current_gen, true);
-                            writer = None;
-                        } else {
-                            connection.debug.frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            last_sent_seq = frame.seq;
-                        }
-                        continue;
-                    }
-                }
-
-                let next = held.take().or_else(|| outbound_rx.try_recv().ok());
-                if let Some(frame) = next {
-                    if let Some(frame) = stage_live(live_or_finish!(frame), &mut held) {
-                        write_live!(frame);
-                    }
-                    if held.is_none() {
-                        continue;
-                    }
-                }
-
-                let ack_wait = recovery.next_ack_wait();
-                let heartbeat_wait = recovery.heartbeat_interval();
-                let (wait, heartbeat_tick) = min_wait(ack_wait, heartbeat_wait);
-
-                if wait.is_zero() {
-                    tokio::select! {
-                        _ = connection.closed_notify.notified() => return,
-                        _ = connection.send_notify.notified() => {},
-                        cmd = writer_cmd_rx.recv() => match cmd {
-                            Some(WriterCommand::Attach { gen, writer: next_writer, resume_seq }) => {
-                                current_gen = gen;
-                                last_sent_seq = resume_seq;
-                                recovery.prepare_resume(resume_seq);
-                                writer = Some(next_writer);
-                            }
-                            Some(WriterCommand::Detach { gen }) if gen == current_gen => writer = None,
-                            _ => {}
-                        },
-                        Some(frame) = outbound_rx.recv(), if held.is_none() => {
-                            if let Some(frame) = stage_live(live_or_finish!(frame), &mut held) {
-                                write_live!(frame);
-                            }
-                        },
-                    }
-                    continue;
-                }
-
-                let sleep = tokio::time::sleep(wait);
-                tokio::pin!(sleep);
-                tokio::select! {
-                    _ = connection.closed_notify.notified() => return,
-                    _ = connection.send_notify.notified() => {},
-                    cmd = writer_cmd_rx.recv() => match cmd {
-                        Some(WriterCommand::Attach { gen, writer: next_writer, resume_seq }) => {
-                            current_gen = gen;
-                            last_sent_seq = resume_seq;
-                            recovery.prepare_resume(resume_seq);
-                            writer = Some(next_writer);
-                        }
-                        Some(WriterCommand::Detach { gen }) if gen == current_gen => writer = None,
-                        _ => {}
-                    },
-                    Some(frame) = outbound_rx.recv(), if held.is_none() => {
-                        if let Some(frame) = stage_live(live_or_finish!(frame), &mut held) {
-                            write_live!(frame);
-                        }
-                    },
-                    _ = &mut sleep => {
-                        if heartbeat_tick {
-                            let payload = build_ping_control_payload();
-                            let result = {
-                                let w = writer.as_mut().expect("writer missing");
-                                write_frame(connection.config(), w, CONTROL_STREAM_ID, 0, 0, &payload).await
-                            };
-                            if let Err(err) = result {
-                                connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_PING_WRITE, err.to_string());
-                                warn!("recovery ping write failed: {err}");
-                                connection.detach_transport(current_gen, true);
-                                writer = None;
-                            } else {
-                                connection.debug.control_frames_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-            }
+            .run()
+            .await;
         })
     }
 
@@ -411,105 +95,109 @@ impl ConnectionInner {
     ) -> JoinHandle<()> {
         let connection = self.clone();
         tokio::spawn(async move {
-            let recovery = match connection.recovery() {
-                Some(recovery) => recovery.clone(),
-                None => return,
+            let Some(recovery) = connection.recovery().cloned() else {
+                return;
             };
+            let timeout = recovery.heartbeat_timeout();
+            let deadline = tokio::time::sleep(timeout);
+            tokio::pin!(deadline);
+            // Only this task advances the last received sequence number.
+            let mut last_recv_seq = recovery.last_received();
             loop {
-                let timeout = recovery.heartbeat_timeout();
-                let frame: Result<Option<InboundFrame>, Error> = if timeout.is_zero() {
-                    read_frame(connection.config(), &mut reader).await
-                } else {
-                    match tokio::time::timeout(
-                        timeout,
-                        read_frame(connection.config(), &mut reader),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(Error::RecvTimeout),
-                    }
-                };
-                match frame {
-                    Ok(Some((stream_id, seq, flags, payload))) => {
-                        connection.debug.frames_read.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        connection.debug.bytes_read.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        recovery.touch_activity();
-                        if stream_id == CONTROL_STREAM_ID {
-                            connection.debug.control_frames_read.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            match connection.handle_control_frame(&payload) {
-                                Ok(false) => continue,
-                                Ok(true) => {
-                                    connection.close_by_peer().await;
-                                    return;
-                                }
-                                Err(err) => {
-                                    connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_CONTROL, err.to_string());
-                                    warn!("recovery control frame failed: {err}");
-                                    connection.mark_closed();
-                                    return;
-                                }
-                            }
-                        }
-                        if let Err(err) = connection
-                            .handle_recovery_data_frame(stream_id, seq, flags, payload)
-                            .await
-                        {
-                            connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_DATA, err.to_string());
-                            warn!("recovery data frame failed: {err}");
-                            connection.mark_closed();
-                            return;
-                        }
-                    }
-                    // Resuming would replay the same frame, so a malformed frame is terminal.
+                let read =
+                    read_frame_within(connection.config(), &mut reader, timeout, deadline.as_mut());
+                let (stream_id, seq, flags, payload) = match read.await {
+                    Ok(Some(frame)) => frame,
+                    // Resuming would replay the same frame, so a malformed
+                    // frame is terminal.
                     Err(
                         err @ (Error::InvalidMessage(_)
                         | Error::UnsupportedFrameVersion(_)
                         | Error::FrameTooLarge(_)),
                     ) => {
-                        connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_DATA, err.to_string());
-                        warn!("recovery frame rejected: {err}");
-                        connection.mark_closed();
-                        return;
+                        return connection.fail(
+                            FAILURE_RECOVERY_DATA,
+                            "recovery frame rejected",
+                            &err,
+                        )
                     }
                     // close sent CLOSE and waits for the peer to close its side.
-                    _ if connection.closing.load(std::sync::atomic::Ordering::Acquire) => {
-                        connection.mark_closed();
-                        return;
+                    _ if connection.closing.load(Ordering::Acquire) => {
+                        return connection.mark_closed()
                     }
                     Ok(None) => {
                         debug!("recovery reader ended: peer closed the transport");
-                        connection.detach_transport(gen, false);
-                        return;
+                        return connection.detach_transport(gen, false);
                     }
                     Err(err) => {
-                        connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_READ, err.to_string());
+                        connection
+                            .debug
+                            .note_failure(FAILURE_RECOVERY_READ, err.to_string());
                         debug!("recovery reader ended: {err}");
-                        connection.detach_transport(gen, false);
-                        return;
+                        return connection.detach_transport(gen, false);
+                    }
+                };
+                let wire_bytes = connection.config().header_len + payload.len();
+                connection.debug.note_frame_read(stream_id, wire_bytes);
+                if stream_id == CONTROL_STREAM_ID {
+                    match connection.handle_control_frame(&payload) {
+                        Ok(false) => continue,
+                        Ok(true) => return connection.close_by_peer().await,
+                        Err(err) => {
+                            return connection.fail(
+                                FAILURE_RECOVERY_CONTROL,
+                                "recovery control frame failed",
+                                &err,
+                            )
+                        }
+                    }
+                }
+                let delivered = connection
+                    .handle_recovery_data_frame(
+                        &recovery,
+                        last_recv_seq,
+                        stream_id,
+                        seq,
+                        flags,
+                        payload,
+                    )
+                    .await;
+                match delivered {
+                    Ok(seq) => last_recv_seq = seq,
+                    Err(err) => {
+                        return connection.fail(
+                            FAILURE_RECOVERY_DATA,
+                            "recovery data frame failed",
+                            &err,
+                        )
                     }
                 }
             }
         })
     }
 
+    /// Notes a failure the connection cannot recover from and closes it.
+    fn fail(&self, code: DebugFailureCode, what: &str, err: &Error) {
+        self.debug.note_failure(code, err.to_string());
+        warn!("{what}: {err}");
+        self.mark_closed();
+    }
+
     pub(super) fn detach_transport(&self, gen: u64, abort_reader: bool) {
-        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.closed.load(Ordering::Relaxed) {
             return;
         }
         if self
             .transport_gen
-            .compare_exchange(
-                gen,
-                gen + 1,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
+            .compare_exchange(gen, gen + 1, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return;
         }
-        self.debug.transport_detaches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.transport_attached.store(false, Ordering::Release);
+        self.debug
+            .transport_detaches
+            .fetch_add(1, Ordering::Relaxed);
         if abort_reader {
             if let Some((current_gen, handle)) = self.current_reader_abort.lock().unwrap().take() {
                 if current_gen == gen {
@@ -538,11 +226,8 @@ impl ConnectionInner {
         let connection = self.shared();
         tokio::spawn(async move {
             tokio::time::sleep(ttl).await;
-            if !connection.closed.load(std::sync::atomic::Ordering::Relaxed)
-                && connection
-                    .transport_gen
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    == detached_gen
+            if !connection.closed.load(Ordering::Relaxed)
+                && connection.transport_gen.load(Ordering::Acquire) == detached_gen
             {
                 connection.mark_closed();
             }
@@ -558,12 +243,7 @@ impl ConnectionInner {
         }
         if recovery
             .reconnect_active
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return;
@@ -574,38 +254,77 @@ impl ConnectionInner {
                 Some(recovery) => recovery.clone(),
                 None => return,
             };
-            let mut backoff = recovery.reconnect_min_backoff;
-            let max_backoff = recovery.reconnect_max_backoff.max(backoff);
             loop {
-                if connection.closed.load(std::sync::atomic::Ordering::Relaxed) {
+                connection.reconnect_until_attached(&recovery).await;
+                recovery.reconnect_active.store(false, Ordering::Release);
+                // A detach while the flag was set started no loop of its own.
+                if connection.is_closed()
+                    || connection.transport_attached.load(Ordering::Acquire)
+                    || recovery
+                        .reconnect_active
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                {
                     break;
                 }
-                connection.debug.reconnect_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                match connection.resume_client_transport().await {
-                    Ok(()) => {
-                        connection.debug.reconnect_successes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        break;
+            }
+        });
+    }
+
+    /// Retries the resume, backing off between attempts, until a transport is
+    /// attached, the resume fails for good, or the connection closes.
+    async fn reconnect_until_attached(
+        self: &ConnectionRef,
+        recovery: &crate::recovery::RecoveryState,
+    ) {
+        let mut backoff = recovery.reconnect_min_backoff;
+        let max_backoff = recovery.reconnect_max_backoff.max(backoff);
+        loop {
+            if self.is_closed() {
+                return;
+            }
+            self.debug
+                .reconnect_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            match self.resume_client_transport().await {
+                Ok(()) => {
+                    self.debug
+                        .reconnect_successes
+                        .fetch_add(1, Ordering::Relaxed);
+                    #[cfg(test)]
+                    if let Some(hook) = self.reconnected_hook.lock().unwrap().take() {
+                        hook(self);
                     }
-                    Err(err) => {
-                        connection.debug.reconnect_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        warn!("resume failed: {err}");
-                        if matches!(
-                            err,
-                            Error::ResumeRejected(_) | Error::UnsupportedFrameVersion(_)
-                        ) {
-                            connection.debug.note_failure(crate::debug::FAILURE_RECOVERY_RECONNECT_TERMINAL, err.to_string());
-                            connection.mark_closed();
-                            break;
-                        }
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(max_backoff);
+                    return;
+                }
+                Err(err) => {
+                    self.debug.note_failure(
+                        crate::debug::FAILURE_RECOVERY_RESUME,
+                        format!("resume failed: {err}"),
+                    );
+                    self.debug
+                        .reconnect_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!("resume failed: {err}");
+                    if matches!(
+                        err,
+                        Error::ResumeRejected(_) | Error::UnsupportedFrameVersion(_)
+                    ) {
+                        self.debug.note_failure(
+                            crate::debug::FAILURE_RECOVERY_RECONNECT_TERMINAL,
+                            format!("reconnect terminal failure: {err}"),
+                        );
+                        self.mark_closed();
+                        return;
                     }
+                    tokio::select! {
+                        _ = self.wait_closed() => return,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(max_backoff);
                 }
             }
-            recovery
-                .reconnect_active
-                .store(false, std::sync::atomic::Ordering::Release);
-        });
+        }
     }
 
     pub(crate) async fn resume_client_transport(&self) -> Result<(), Error> {
@@ -674,40 +393,364 @@ impl ConnectionInner {
         }
     }
 
+    /// Delivers a data frame that follows `last_recv_seq`, the last one
+    /// received, and returns the new last received sequence number.
     pub(crate) async fn handle_recovery_data_frame(
-        &self,
+        self: &ConnectionRef,
+        recovery: &crate::recovery::RecoveryState,
+        last_recv_seq: u64,
         stream_id: u32,
         seq: u64,
         flags: u8,
         payload: Vec<u8>,
-    ) -> Result<(), Error> {
-        let Some(recovery) = self.recovery() else {
-            return Err(Error::Closed);
-        };
+    ) -> Result<u64, Error> {
         if seq == 0 {
             return Err(Error::InvalidMessage(
                 "recovery data frame missing seq".to_string(),
             ));
         }
-        let last_recv_seq = recovery.last_received();
         if seq <= last_recv_seq {
             if recovery.note_received(seq) {
                 self.signal_send();
             }
-            return Ok(());
+            return Ok(last_recv_seq);
         }
         if seq != last_recv_seq + 1 {
             return Err(Error::InvalidMessage(
                 "recovery frame sequence gap".to_string(),
             ));
         }
-        self.shared()
-            .accept_frame(stream_id, flags, payload)
-            .await?;
+        self.accept_frame(stream_id, flags, payload).await?;
         if recovery.note_received(seq) {
             self.signal_send();
         }
+        Ok(seq)
+    }
+}
+
+/// Reads the next frame, which must arrive within `timeout` of starting to
+/// read it. `deadline` is re-armed only when it fires, rather than for every
+/// frame.
+async fn read_frame_within(
+    config: &ConnConfig,
+    reader: &mut TransportReader,
+    timeout: Duration,
+    mut deadline: Pin<&mut Sleep>,
+) -> Result<Option<InboundFrame>, Error> {
+    let read_started = tokio::time::Instant::now();
+    let read = read_frame(config, reader);
+    tokio::pin!(read);
+    loop {
+        tokio::select! {
+            biased;
+            frame = &mut read => return frame,
+            _ = &mut deadline, if !timeout.is_zero() => {
+                let expires = read_started + timeout;
+                if tokio::time::Instant::now() >= expires {
+                    return Err(Error::RecvTimeout);
+                }
+                deadline.as_mut().reset(expires);
+            }
+        }
+    }
+}
+
+/// Ends the writer task: the connection is closed.
+struct Done;
+
+/// The state of the v3 writer task.
+struct RecoveryWriter {
+    connection: ConnectionRef,
+    recovery: Arc<RecoveryState>,
+    writer_cmd_rx: mpsc::UnboundedReceiver<WriterCommand>,
+    outbound_rx: mpsc::Receiver<OutboundFrame>,
+    /// The transport being written to, if one is attached.
+    writer: Option<TransportWriter>,
+    gen: u64,
+    last_sent_seq: u64,
+    /// The frames left to replay after the last attach.
+    resume: VecDeque<Arc<FrameRecord>>,
+    /// A frame that does not fit in the replay buffer yet. While it is held
+    /// no other frame is taken, so its sender, and the senders queued behind
+    /// it, wait until an ACK frees room.
+    held: Option<OutboundFrame>,
+    /// Whether frames were written since the last flush.
+    dirty: bool,
+}
+
+impl RecoveryWriter {
+    async fn run(mut self) {
+        while self.step().await.is_ok() {}
+    }
+
+    /// Waits for a transport, or writes what is ready and waits for more.
+    async fn step(&mut self) -> Result<(), Done> {
+        if self.connection.closed.load(Ordering::Relaxed) {
+            return Err(Done);
+        }
+        if self.writer.is_none() {
+            return self.wait_detached().await;
+        }
+        while let Ok(cmd) = self.writer_cmd_rx.try_recv() {
+            self.apply(cmd);
+        }
+        if self.writer.is_some() && !self.write_next().await? {
+            self.flush_and_wait().await?;
+        }
         Ok(())
+    }
+
+    /// Waits while no transport is attached. Frames sent meanwhile are staged,
+    /// and the resume replays them.
+    async fn wait_detached(&mut self) -> Result<(), Done> {
+        // A pending Attach goes first, so that a close marker queued right
+        // after connecting still gets written.
+        tokio::select! {
+            biased;
+            _ = self.connection.closed_notify.notified() => return Err(Done),
+            cmd = self.writer_cmd_rx.recv() => self.apply(cmd.ok_or(Done)?),
+            frame = self.outbound_rx.recv(), if self.held.is_none() => {
+                let frame = self.finish_on_close(frame.ok_or(Done)?).await?;
+                self.stage(frame);
+            }
+            // The close marker is queued behind the held frame, and nothing
+            // can be written while detached: stop, so close does not wait for
+            // it.
+            _ = self.connection.send_notify.notified(), if self.held.is_some() => {
+                if self.connection.closing.load(Ordering::Acquire) {
+                    return Err(Done);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the next frame that is ready: a pending ACK first, then the
+    /// frames to replay, which go before live frames because live frames take
+    /// later sequence numbers. Returns whether there may be more to write.
+    async fn write_next(&mut self) -> Result<bool, Done> {
+        if let Some(ack_seq) = self.recovery.take_pending_ack() {
+            let payload = build_ack_control_payload(ack_seq);
+            self.write(
+                CONTROL_STREAM_ID,
+                0,
+                0,
+                &payload,
+                FAILURE_RECOVERY_ACK_WRITE,
+                "ack",
+            )
+            .await;
+            return Ok(true);
+        }
+        if let Some(frame) = self.resume.pop_front() {
+            self.recovery
+                .resume_depth
+                .store(self.resume.len(), Ordering::Relaxed);
+            if frame.seq > self.last_sent_seq && frame.seq > self.recovery.replay.last_acked_seq() {
+                self.write_record(&frame, FAILURE_RECOVERY_RESUME_WRITE, "resume")
+                    .await;
+            }
+            return Ok(true);
+        }
+        let Some(frame) = self
+            .held
+            .take()
+            .or_else(|| self.outbound_rx.try_recv().ok())
+        else {
+            return Ok(false);
+        };
+        self.write_live(frame).await?;
+        // A held frame leaves nothing to write until an ACK frees room.
+        Ok(self.held.is_none())
+    }
+
+    /// Flushes the frames written so far, then waits for something to do: a
+    /// new frame, a signal that a frame or an ACK is ready, a transport
+    /// change, the ACK delay, or the heartbeat interval.
+    async fn flush_and_wait(&mut self) -> Result<(), Done> {
+        if self.dirty {
+            self.dirty = false;
+            let writer = self.writer.as_mut().expect("writer missing");
+            if let Err(err) = writer.flush().await {
+                self.connection
+                    .debug
+                    .note_failure(FAILURE_RECOVERY_LIVE_WRITE, err.to_string());
+                warn!("recovery flush failed: {err}");
+                self.detach();
+                return Ok(());
+            }
+        }
+        let (wait, heartbeat_tick) = min_wait(
+            self.recovery.next_ack_wait(),
+            self.recovery.heartbeat_interval(),
+        );
+        tokio::select! {
+            _ = self.connection.closed_notify.notified() => return Err(Done),
+            _ = self.connection.send_notify.notified() => {}
+            cmd = self.writer_cmd_rx.recv() => self.apply(cmd.ok_or(Done)?),
+            Some(frame) = self.outbound_rx.recv(), if self.held.is_none() => {
+                self.write_live(frame).await?;
+            }
+            _ = tokio::time::sleep(wait), if !wait.is_zero() => {
+                if heartbeat_tick {
+                    let payload = build_ping_control_payload();
+                    self.write(CONTROL_STREAM_ID, 0, 0, &payload, FAILURE_RECOVERY_PING_WRITE, "ping")
+                        .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Attaches a new transport or detaches the current one.
+    fn apply(&mut self, cmd: WriterCommand) {
+        match cmd {
+            WriterCommand::Attach {
+                gen,
+                writer,
+                resume_seq,
+            } => {
+                self.gen = gen;
+                // The peer cannot have received more than was sent.
+                let sent = self.connection.next_send_seq.load(Ordering::Acquire);
+                self.last_sent_seq = resume_seq.min(sent);
+                self.resume = self.recovery.prepare_resume(self.last_sent_seq);
+                self.writer = Some(writer);
+                self.dirty = false;
+            }
+            WriterCommand::Detach { gen } if gen == self.gen => self.writer = None,
+            WriterCommand::Detach { .. } => {}
+        }
+    }
+
+    /// Passes a data frame through. For the close marker it writes CLOSE after
+    /// the frames already written, shuts down the transport and stops the
+    /// writer, so the peer releases the connection instead of keeping it for a
+    /// reconnect.
+    async fn finish_on_close(&mut self, frame: OutboundFrame) -> Result<OutboundFrame, Done> {
+        let written = match frame {
+            OutboundFrame::Close { written } => written,
+            frame => return Ok(frame),
+        };
+        let mut ok = false;
+        if let Some(writer) = self.writer.as_mut() {
+            let payload = build_close_control_payload();
+            // shutdown flushes, then sends FIN.
+            ok = write_frame_counted(&self.connection, writer, CONTROL_STREAM_ID, 0, 0, &payload)
+                .await
+                .is_ok()
+                && writer.shutdown().await.is_ok();
+        }
+        let _ = written.send(ok);
+        Err(Done)
+    }
+
+    /// Stages a new frame and writes it, unless the peer has it.
+    async fn write_live(&mut self, frame: OutboundFrame) -> Result<(), Done> {
+        let frame = self.finish_on_close(frame).await?;
+        if let Some(record) = self.stage(frame) {
+            if record.seq > self.last_sent_seq {
+                self.write_record(&record, FAILURE_RECOVERY_LIVE_WRITE, "live")
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps a new frame in the replay buffer under the next sequence number
+    /// and tells its sender the outcome. Returns the kept record, or `None`
+    /// if the frame is held or failed.
+    fn stage(&mut self, frame: OutboundFrame) -> Option<Arc<FrameRecord>> {
+        let (stream_id, flags, payload, queued_tx) = match frame {
+            OutboundFrame::Plain {
+                stream_id,
+                flags,
+                payload,
+            } => (stream_id, flags, payload, None),
+            OutboundFrame::Recovery {
+                stream_id,
+                flags,
+                payload,
+                queued_tx,
+            } => (stream_id, flags, payload, Some(queued_tx)),
+            OutboundFrame::Close { .. } => return None,
+        };
+        // The number is taken only once the frame is kept: the peer closes the
+        // connection when a number is skipped. Only this task takes numbers.
+        let seq = self.connection.next_send_seq.load(Ordering::Acquire) + 1;
+        match self.recovery.replay.stage(stream_id, seq, flags, payload) {
+            Ok(Staged::Kept(record)) => {
+                self.connection.next_send_seq.store(seq, Ordering::Release);
+                if let Some(queued_tx) = queued_tx {
+                    let _ = queued_tx.send(Ok(()));
+                }
+                Some(record)
+            }
+            Ok(Staged::Full(payload)) => {
+                self.held = Some(match queued_tx {
+                    Some(queued_tx) => OutboundFrame::Recovery {
+                        stream_id,
+                        flags,
+                        payload,
+                        queued_tx,
+                    },
+                    None => OutboundFrame::Plain {
+                        stream_id,
+                        flags,
+                        payload,
+                    },
+                });
+                None
+            }
+            Err(err) => {
+                if let Some(queued_tx) = queued_tx {
+                    let _ = queued_tx.send(Err(err));
+                }
+                None
+            }
+        }
+    }
+
+    /// Writes a kept frame and records it as sent.
+    async fn write_record(&mut self, frame: &FrameRecord, failure: DebugFailureCode, kind: &str) {
+        let (stream_id, seq, flags) = (frame.stream_id, frame.seq, frame.flags);
+        if self
+            .write(stream_id, seq, flags, &frame.payload, failure, kind)
+            .await
+        {
+            self.last_sent_seq = seq;
+        }
+    }
+
+    /// Buffers a frame and reports whether that worked. On failure it
+    /// detaches the transport.
+    async fn write(
+        &mut self,
+        stream_id: u32,
+        seq: u64,
+        flags: u8,
+        payload: &[u8],
+        failure: DebugFailureCode,
+        kind: &str,
+    ) -> bool {
+        let writer = self.writer.as_mut().expect("writer missing");
+        match write_frame_counted(&self.connection, writer, stream_id, seq, flags, payload).await {
+            Ok(()) => {
+                self.dirty = true;
+                true
+            }
+            Err(err) => {
+                self.connection.debug.note_failure(failure, err.to_string());
+                warn!("recovery {kind} write failed: {err}");
+                self.detach();
+                false
+            }
+        }
+    }
+
+    fn detach(&mut self) {
+        self.connection.detach_transport(self.gen, true);
+        self.writer = None;
     }
 }
 
@@ -719,4 +762,149 @@ fn min_wait(ack_wait: Duration, heartbeat_wait: Duration) -> (Duration, bool) {
         return (heartbeat_wait, true);
     }
     (ack_wait, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use tokio::io::DuplexStream;
+    use tokio::sync::oneshot;
+
+    use super::*;
+    use crate::codec_msgpack::CodecMsgpackCompact;
+    use crate::connection::PendingConnection;
+    use crate::frame::FRAME_HEADER_LEN_V3;
+    use crate::protocol::{HandshakeConfig, DEFAULT_MAX_FRAME};
+    use crate::recovery::{RecoveryState, ServerRecoveryOptions};
+    use crate::recovery_protocol::RECOVERY_TOKEN_LEN;
+    use crate::registry::Registry;
+    use crate::replay::must_stage;
+
+    /// A v3 connection over an in-memory pipe, set up but not started, with
+    /// the peer end for the test to read what the writer sends.
+    fn recovery_pipe(
+        max_replay_bytes: i64,
+    ) -> (PendingConnection, Arc<RecoveryState>, DuplexStream) {
+        let (local, peer) = tokio::io::duplex(1 << 20);
+        let pending = ConnectionInner::new_pending(local, Registry::new(), None, None);
+        let recovery = RecoveryState::new_server(
+            ServerRecoveryOptions {
+                enable: true,
+                detached_ttl: Duration::from_secs(60),
+                max_replay_bytes,
+                ack_every: 1,
+                ack_delay: Duration::from_millis(1),
+                heartbeat_interval: Duration::from_secs(3600),
+                heartbeat_timeout: Duration::from_secs(7200),
+            },
+            [1; RECOVERY_TOKEN_LEN],
+            [2; RECOVERY_TOKEN_LEN],
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+        );
+        (pending, recovery, peer)
+    }
+
+    fn v3_config() -> HandshakeConfig {
+        HandshakeConfig {
+            version: PROTOCOL_VERSION_V3,
+            codec_id: CodecMsgpackCompact,
+            max_frame: DEFAULT_MAX_FRAME,
+        }
+    }
+
+    fn live_frame(payload: Vec<u8>) -> (OutboundFrame, oneshot::Receiver<Result<(), Error>>) {
+        let (queued_tx, queued_rx) = oneshot::channel();
+        let frame = OutboundFrame::Recovery {
+            stream_id: 1,
+            flags: 0,
+            payload,
+            queued_tx,
+        };
+        (frame, queued_rx)
+    }
+
+    /// Returns the stream ID and sequence number of the next frame the
+    /// connection writes.
+    async fn next_frame(connection: &ConnectionRef, peer: &mut DuplexStream) -> (u32, u64) {
+        let frame = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_frame(connection.config(), peer),
+        )
+        .await
+        .expect("timed out waiting for a frame")
+        .expect("read frame")
+        .expect("transport closed");
+        (frame.0, frame.1)
+    }
+
+    /// A live frame must not overtake the frames waiting to be replayed. The
+    /// ACK due at resume used to carry a live frame ahead of them, and the
+    /// peer then closed the connection on the sequence gap.
+    #[tokio::test]
+    async fn resume_replays_before_live_frame() {
+        let (pending, recovery, mut peer) = recovery_pipe(1 << 20);
+        for seq in 1..=5u64 {
+            must_stage(&recovery.replay, seq, vec![seq as u8]);
+        }
+        pending
+            .connection()
+            .next_send_seq
+            .store(5, Ordering::Relaxed);
+        recovery.note_received(1);
+        let (frame, queued) = live_frame(vec![6]);
+        assert!(pending.connection().outbound_tx.try_send(frame).is_ok());
+
+        let connection = pending
+            .start_with_config(v3_config(), Some(recovery), 0)
+            .expect("start");
+        let mut controls = 0;
+        let mut want = 1;
+        while want <= 6 {
+            let (stream_id, seq) = next_frame(&connection, &mut peer).await;
+            if stream_id == CONTROL_STREAM_ID {
+                controls += 1;
+                continue;
+            }
+            assert_eq!(
+                seq, want,
+                "data frame {seq} arrived while {want} was expected"
+            );
+            want += 1;
+        }
+        assert_eq!(controls, 1, "want the one ACK");
+        queued.await.expect("queued result").expect("live frame");
+        connection.close_now();
+    }
+
+    /// The peer's last received sequence number, exchanged at attach,
+    /// acknowledges the frames up to it. The ACK the peer sent for them may
+    /// have been lost with the old transport, and a send waiting for room in
+    /// the replay buffer then waited forever.
+    #[tokio::test]
+    async fn attach_acknowledges_frames_the_peer_has() {
+        const PAYLOAD_LEN: usize = 30;
+        let frame_size = (FRAME_HEADER_LEN_V3 + PAYLOAD_LEN) as i64;
+        let (pending, recovery, mut peer) = recovery_pipe(2 * frame_size + 10);
+        for seq in 1..=2u64 {
+            must_stage(&recovery.replay, seq, vec![0; PAYLOAD_LEN]);
+        }
+        pending
+            .connection()
+            .next_send_seq
+            .store(2, Ordering::Relaxed);
+        let (frame, queued) = live_frame(vec![0; PAYLOAD_LEN]);
+        assert!(pending.connection().outbound_tx.try_send(frame).is_ok());
+        let replay = Arc::clone(&recovery.replay);
+
+        let connection = pending
+            .start_with_config(v3_config(), Some(recovery), 2)
+            .expect("start");
+        let (stream_id, seq) = next_frame(&connection, &mut peer).await;
+        assert_ne!(stream_id, CONTROL_STREAM_ID, "want a data frame");
+        assert_eq!(seq, 3);
+        queued.await.expect("queued result").expect("held frame");
+        assert_eq!(replay.queued_count(), 1);
+        connection.close_now();
+    }
 }

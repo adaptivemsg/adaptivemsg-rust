@@ -5,7 +5,7 @@ Minimal async message library over multiplexed streams, with optional server-sid
 
 - Transport: TCP / UDS / QUIC (feature)
 - Framing: v2 handshake + versioned header + length-prefixed payload
-- Codec: MessagePack map/compact, postcard (Rust-only), pluggable codecs (compact-first for shared codecs)
+- Codec: MessagePack map/compact, postcard (Rust-only); default preference: postcard, compact, map, so a Go peer selects compact. Unlike Go, Rust does not yet support codecs defined outside the crate.
 - Data model: serde
 - Dispatch: registry-driven handlers
 - Logs: tracing
@@ -80,7 +80,20 @@ recovery, messages awaiting acknowledgement are kept in a replay buffer of
 together. `send` keeps working while the transport is down: the message
 waits in the buffer and is sent after the reconnect. While the buffer is
 full, `send` waits; only a message larger than the whole buffer fails, with
-`Error::FrameTooLarge`.
+`Error::FrameTooLarge`. The server closes an accepted connection that has not
+completed the handshake (and, with recovery, the attach) within 2 minutes;
+`Server::with_handshake_timeout` changes the limit, and `Duration::ZERO`
+disables it.
+
+`Server::serve_with_shutdown(addr, signal)` serves until `signal` completes,
+then stops accepting, drops connections still in the handshake, and closes the
+established ones as `close()` does, running their `on_disconnect`. A failed
+accept, such as `EMFILE` when the process is out of file descriptors, does not
+end `serve`; it waits briefly and accepts again. Each stream buffers up to 1024
+received messages (`with_stream_queue_size` on the client or server changes
+it); when a stream's buffer is full the connection stops reading, which holds
+up its other streams too. `Stream::close` and `new_stream` can be called from
+any thread, including one outside the tokio runtime.
 
 For a one-shot connection:
 

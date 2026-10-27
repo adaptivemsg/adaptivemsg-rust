@@ -121,7 +121,6 @@ Local errors (defined in `error.rs`):
 - `Error::UnsupportedCodec`
 - `Error::UnsupportedFrameVersion`
 - `Error::NoCommonCodec`
-- `Error::NoCommonVersion`
 - `Error::TooManyCodecs`
 - `Error::RecvTimeout`
 - `Error::ConcurrentRecv`
@@ -406,20 +405,21 @@ Connection transport state includes:
 
 Replay-related state:
 - `next_send_seq: AtomicU64`
-- `ReplayBuffer` — frame retention keyed by sequence
-- `live_tx/rx: mpsc::unbounded_channel` — new frames queued during detach
-- resume deque populated on reconnect
+- `ReplayBuffer` — frames kept by sequence until the peer acknowledges them;
+  its last acknowledged sequence is reported as `last_acked_seq`
+- live frames wait in `outbound_rx` while no transport is attached
+- the recovery writer keeps the frames to resend after a reconnect in a local
+  deque; `resume_depth: AtomicUsize` mirrors its length for diagnostics
 
 `RecoveryState` includes:
 - `connection_id: RecoveryToken` (`[u8; 16]`)
 - `resume_secret: RecoveryToken`
 - negotiated timing/batching (`ack_delay`, `ack_every`, heartbeat values)
-- `last_recv_seq: AtomicU64`
-- `last_acked_seq: AtomicU64`
-- `ack_pending: AtomicU32`
-- `ack_due: AtomicBool`
+- `last_recv_seq`, `last_ack_sent`, `ack_pending` under one mutex; the reader
+  keeps its own copy of `last_recv_seq` for the per-frame check
+- `ack_due: AtomicBool` and `ack_due_at` so the writer checks for a due ACK
+  without taking the mutex
 - atomic mirrors for heartbeat/read-deadline hot path
-- detached expiry timer
 - client reconnect guards/parameters
 
 Server detached table:
@@ -565,9 +565,9 @@ Recovery micro-benchmarks (`recovery_runtime_bench_test.rs`):
 - `recovery_protocol.rs`: attach/resume wire protocol, control frames (ACK, PING, CLOSE)
 - `recovery_runtime.rs`: recovery reader/writer task implementations
 - `replay.rs`: unacknowledged frame retention and replay
-- `frame_queue.rs`: thread-safe frame deque for replay/resume queues
 - `type_info.rs`: cached type metadata (wire names)
 - `error.rs`: error types (thiserror enum)
+- `transport/mod.rs`: address parsing (`Endpoint`), dialing, buffered reader/writer split
 - `transport/tcp.rs`: TCP dial/listen/accept
 - `transport/uds.rs`: UDS dial/listen/accept (+ abstract sockets on Linux)
 - `transport/quic.rs`: QUIC transport (optional feature)

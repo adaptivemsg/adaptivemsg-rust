@@ -109,7 +109,7 @@ where
     {
         if codec_count > 0 {
             let mut discarded = vec![0u8; codec_count];
-            let _ = reader.read_exact(&mut discarded).await;
+            reader.read_exact(&mut discarded).await?;
         }
         let _ = write_handshake_reply(writer, 0, reply_version, CodecID(0), 0).await;
         return Err(Error::UnsupportedFrameVersion(version));
@@ -120,7 +120,7 @@ where
     }
     if codec_count > MAX_CODEC_COUNT {
         let mut discarded = vec![0u8; codec_count];
-        let _ = reader.read_exact(&mut discarded).await;
+        reader.read_exact(&mut discarded).await?;
         let _ = write_handshake_reply(writer, 0, version, CodecID(0), 0).await;
         return Err(Error::TooManyCodecs(codec_count));
     }

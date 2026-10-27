@@ -42,6 +42,9 @@ pub trait DecodeTarget {
 }
 
 /// Codec implementation used for message encode/decode.
+///
+/// The methods name `Envelope` and `DecodeTarget`, which are not exported, so
+/// only this crate can implement the trait.
 pub trait CodecImpl: Send + Sync + 'static {
     /// Unique non-zero ID used during handshake.
     fn id(&self) -> CodecID;
@@ -51,6 +54,11 @@ pub trait CodecImpl: Send + Sync + 'static {
     fn encode(&self, msg: &dyn Message) -> Result<Vec<u8>, Error>;
     /// Decode a payload into a wire name and opaque body.
     fn decode_envelope(&self, payload: &[u8]) -> Result<Envelope, Error>;
-    /// Decode the opaque body into a concrete message via `DecodeTarget`.
-    fn decode_into(&self, body: &dyn Any, target: &mut dyn DecodeTarget) -> Result<(), Error>;
+    /// Decode the opaque body, which `decode_envelope` produced, into a
+    /// concrete message via `DecodeTarget`.
+    fn decode_into(
+        &self,
+        body: Box<dyn Any + Send + Sync>,
+        target: &mut dyn DecodeTarget,
+    ) -> Result<(), Error>;
 }

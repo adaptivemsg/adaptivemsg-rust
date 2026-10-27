@@ -52,11 +52,15 @@ impl CodecImpl for MsgpackMapCodec {
         decode_map_envelope(payload)
     }
 
-    fn decode_into(&self, body: &dyn Any, target: &mut dyn DecodeTarget) -> Result<(), Error> {
+    fn decode_into(
+        &self,
+        body: Box<dyn Any + Send + Sync>,
+        target: &mut dyn DecodeTarget,
+    ) -> Result<(), Error> {
         let value = body
-            .downcast_ref::<Value>()
-            .ok_or_else(|| Error::Codec("map body must be rmpv value".to_string()))?;
-        target.decode_map(value.clone())
+            .downcast::<Value>()
+            .map_err(|_| Error::Codec("map body must be rmpv value".to_string()))?;
+        target.decode_map(*value)
     }
 }
 
@@ -77,11 +81,15 @@ impl CodecImpl for MsgpackCompactCodec {
         decode_compact_envelope(payload)
     }
 
-    fn decode_into(&self, body: &dyn Any, target: &mut dyn DecodeTarget) -> Result<(), Error> {
+    fn decode_into(
+        &self,
+        body: Box<dyn Any + Send + Sync>,
+        target: &mut dyn DecodeTarget,
+    ) -> Result<(), Error> {
         let values = body
-            .downcast_ref::<Vec<Value>>()
-            .ok_or_else(|| Error::Codec("compact body must be value array".to_string()))?;
-        target.decode_compact(values.clone())
+            .downcast::<Vec<Value>>()
+            .map_err(|_| Error::Codec("compact body must be value array".to_string()))?;
+        target.decode_compact(*values)
     }
 }
 
@@ -107,7 +115,7 @@ fn decode_map_envelope(payload: &[u8]) -> Result<Envelope, Error> {
 fn decode_compact_envelope(payload: &[u8]) -> Result<Envelope, Error> {
     let mut cursor = Cursor::new(payload);
     let value = rmpv::decode::read_value(&mut cursor)?;
-    let values = match value {
+    let mut values = match value {
         Value::Array(values) if !values.is_empty() => values,
         _ => {
             return Err(Error::Codec(
@@ -115,11 +123,9 @@ fn decode_compact_envelope(payload: &[u8]) -> Result<Envelope, Error> {
             ))
         }
     };
-    let mut iter = values.into_iter();
-    let name_value = iter.next().unwrap();
-    let name = match &name_value {
-        Value::String(s) => s
-            .as_str()
+    let wire = match values.remove(0) {
+        Value::String(name) => name
+            .into_str()
             .ok_or_else(|| Error::Codec("compact message name must be utf-8".to_string()))?,
         _ => {
             return Err(Error::Codec(
@@ -127,9 +133,8 @@ fn decode_compact_envelope(payload: &[u8]) -> Result<Envelope, Error> {
             ))
         }
     };
-    let values = iter.collect::<Vec<_>>();
     Ok(Envelope {
-        wire: name.to_string(),
+        wire,
         body: Box::new(values),
     })
 }
@@ -231,7 +236,8 @@ mod tests {
         };
         let raw = crate::raw_message::RawMessage {
             wire,
-            codec: CODEC_MSGPACK_COMPACT,
+            codec: crate::codec_registry::codec_by_id(CODEC_MSGPACK_COMPACT)
+                .expect("compact registered"),
             body: Box::new(items),
         };
         let decoded: CompactCustom = crate::raw_message::decode_raw_as(raw).expect("decode_raw_as");

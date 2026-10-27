@@ -115,8 +115,8 @@ impl Registry {
         Arc::make_mut(&mut self.messages).insert(wire_name, factory);
     }
 
-    pub(crate) fn message(&self, wire_name: &str) -> Option<Arc<dyn MessageFactory>> {
-        self.messages.get(wire_name).cloned()
+    pub(crate) fn message(&self, wire_name: &str) -> Option<&dyn MessageFactory> {
+        self.messages.get(wire_name).map(|factory| factory.as_ref())
     }
 }
 
@@ -133,11 +133,13 @@ where
         msg: Box<dyn Message>,
         stream_ctx: StreamContext,
     ) -> HandlerResult<Option<Box<dyn Message>>> {
-        let expected = T::wire_name_static().to_string();
-        let got = msg.wire_name().to_string();
         match msg.downcast::<T>() {
             Ok(val) => val.handle(stream_ctx).await,
-            Err(_) => Err(Error::TypeMismatch { expected, got }.into()),
+            Err(msg) => Err(Error::TypeMismatch {
+                expected: T::wire_name_static().to_string(),
+                got: msg.wire_name().to_string(),
+            }
+            .into()),
         }
     }
 }

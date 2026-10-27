@@ -3,9 +3,9 @@
 //! Matches the Go runtime's `debug.go` surface: per-connection and per-stream
 //! atomic counters, last-failure tracking, and snapshot structs for inspection.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 // ---------------------------------------------------------------------------
 // Failure codes — shared vocabulary with Go runtime
@@ -44,111 +44,109 @@ pub const FAILURE_RECOVERY_PING_WRITE: DebugFailureCode = "recovery.ping_write";
 // Internal atomic counters (per-connection)
 // ---------------------------------------------------------------------------
 
-pub(crate) struct ConnectionDebugCounters {
-    pub streams_opened: AtomicU64,
-    pub streams_closed: AtomicU64,
+/// Frame counters for one direction. Each direction is updated by its own
+/// task, so each gets its own cache line.
+#[derive(Default)]
+#[repr(align(64))]
+struct FrameCounters {
+    frames: AtomicU64,
+    bytes: AtomicU64,
+    control_frames: AtomicU64,
+}
+
+impl FrameCounters {
+    fn note(&self, stream_id: u32, wire_bytes: usize) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(wire_bytes as u64, Ordering::Relaxed);
+        if stream_id == crate::recovery_protocol::CONTROL_STREAM_ID {
+            self.control_frames.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Message counters kept for each stream and, for all of its streams
+/// together, for the connection.
+#[derive(Default)]
+pub(crate) struct MessageCounters {
     pub data_messages_sent: AtomicU64,
     pub data_messages_received: AtomicU64,
-    pub frames_written: AtomicU64,
-    pub frames_read: AtomicU64,
-    pub bytes_written: AtomicU64,
-    pub bytes_read: AtomicU64,
-    pub control_frames_written: AtomicU64,
-    pub control_frames_read: AtomicU64,
     pub protocol_errors: AtomicU64,
     pub protocol_error_reply_send_failure: AtomicU64,
     pub remote_errors: AtomicU64,
     pub decode_errors: AtomicU64,
     pub handler_calls: AtomicU64,
     pub handler_errors: AtomicU64,
+}
+
+fn load(counter: &AtomicU64) -> u64 {
+    counter.load(Ordering::Relaxed)
+}
+
+#[derive(Default)]
+pub(crate) struct ConnectionDebugCounters {
+    written: FrameCounters,
+    read: FrameCounters,
+    pub streams_opened: AtomicU64,
+    pub streams_closed: AtomicU64,
+    pub messages: MessageCounters,
     pub reconnect_attempts: AtomicU64,
     pub reconnect_successes: AtomicU64,
     pub reconnect_failures: AtomicU64,
     pub transport_attaches: AtomicU64,
     pub transport_detaches: AtomicU64,
-    last_failure_code: Mutex<&'static str>,
-    last_failure_reason: Mutex<String>,
-    last_failure_nanos: AtomicI64,
+    failure: FailureTracker,
 }
 
 impl ConnectionDebugCounters {
     pub(crate) fn new() -> Self {
-        Self {
-            streams_opened: AtomicU64::new(0),
-            streams_closed: AtomicU64::new(0),
-            data_messages_sent: AtomicU64::new(0),
-            data_messages_received: AtomicU64::new(0),
-            frames_written: AtomicU64::new(0),
-            frames_read: AtomicU64::new(0),
-            bytes_written: AtomicU64::new(0),
-            bytes_read: AtomicU64::new(0),
-            control_frames_written: AtomicU64::new(0),
-            control_frames_read: AtomicU64::new(0),
-            protocol_errors: AtomicU64::new(0),
-            protocol_error_reply_send_failure: AtomicU64::new(0),
-            remote_errors: AtomicU64::new(0),
-            decode_errors: AtomicU64::new(0),
-            handler_calls: AtomicU64::new(0),
-            handler_errors: AtomicU64::new(0),
-            reconnect_attempts: AtomicU64::new(0),
-            reconnect_successes: AtomicU64::new(0),
-            reconnect_failures: AtomicU64::new(0),
-            transport_attaches: AtomicU64::new(0),
-            transport_detaches: AtomicU64::new(0),
-            last_failure_code: Mutex::new(""),
-            last_failure_reason: Mutex::new(String::new()),
-            last_failure_nanos: AtomicI64::new(0),
-        }
+        Self::default()
     }
 
     pub(crate) fn note_failure(&self, code: DebugFailureCode, reason: String) {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as i64;
-        *self.last_failure_code.lock().unwrap() = code;
-        *self.last_failure_reason.lock().unwrap() = reason;
-        self.last_failure_nanos.store(nanos, Ordering::Relaxed);
+        self.failure.note(code, reason);
+    }
+
+    /// Counts a frame written to the transport; `wire_bytes` includes the
+    /// header.
+    pub(crate) fn note_frame_written(&self, stream_id: u32, wire_bytes: usize) {
+        self.written.note(stream_id, wire_bytes);
+    }
+
+    /// Counts a frame read from the transport; `wire_bytes` includes the
+    /// header.
+    pub(crate) fn note_frame_read(&self, stream_id: u32, wire_bytes: usize) {
+        self.read.note(stream_id, wire_bytes);
     }
 
     pub(crate) fn snapshot(&self) -> ConnectionCounters {
+        let messages = &self.messages;
         ConnectionCounters {
-            streams_opened: self.streams_opened.load(Ordering::Relaxed),
-            streams_closed: self.streams_closed.load(Ordering::Relaxed),
-            data_messages_sent: self.data_messages_sent.load(Ordering::Relaxed),
-            data_messages_received: self.data_messages_received.load(Ordering::Relaxed),
-            frames_written: self.frames_written.load(Ordering::Relaxed),
-            frames_read: self.frames_read.load(Ordering::Relaxed),
-            bytes_written: self.bytes_written.load(Ordering::Relaxed),
-            bytes_read: self.bytes_read.load(Ordering::Relaxed),
-            control_frames_written: self.control_frames_written.load(Ordering::Relaxed),
-            control_frames_read: self.control_frames_read.load(Ordering::Relaxed),
-            protocol_errors: self.protocol_errors.load(Ordering::Relaxed),
-            protocol_error_reply_send_failure: self
-                .protocol_error_reply_send_failure
-                .load(Ordering::Relaxed),
-            remote_errors: self.remote_errors.load(Ordering::Relaxed),
-            decode_errors: self.decode_errors.load(Ordering::Relaxed),
-            handler_calls: self.handler_calls.load(Ordering::Relaxed),
-            handler_errors: self.handler_errors.load(Ordering::Relaxed),
-            reconnect_attempts: self.reconnect_attempts.load(Ordering::Relaxed),
-            reconnect_successes: self.reconnect_successes.load(Ordering::Relaxed),
-            reconnect_failures: self.reconnect_failures.load(Ordering::Relaxed),
-            transport_attaches: self.transport_attaches.load(Ordering::Relaxed),
-            transport_detaches: self.transport_detaches.load(Ordering::Relaxed),
+            streams_opened: load(&self.streams_opened),
+            streams_closed: load(&self.streams_closed),
+            data_messages_sent: load(&messages.data_messages_sent),
+            data_messages_received: load(&messages.data_messages_received),
+            frames_written: load(&self.written.frames),
+            frames_read: load(&self.read.frames),
+            bytes_written: load(&self.written.bytes),
+            bytes_read: load(&self.read.bytes),
+            control_frames_written: load(&self.written.control_frames),
+            control_frames_read: load(&self.read.control_frames),
+            protocol_errors: load(&messages.protocol_errors),
+            protocol_error_reply_send_failure: load(&messages.protocol_error_reply_send_failure),
+            remote_errors: load(&messages.remote_errors),
+            decode_errors: load(&messages.decode_errors),
+            handler_calls: load(&messages.handler_calls),
+            handler_errors: load(&messages.handler_errors),
+            reconnect_attempts: load(&self.reconnect_attempts),
+            reconnect_successes: load(&self.reconnect_successes),
+            reconnect_failures: load(&self.reconnect_failures),
+            transport_attaches: load(&self.transport_attaches),
+            transport_detaches: load(&self.transport_detaches),
         }
     }
 
     fn last_failure(&self) -> (String, String, Option<SystemTime>) {
-        let code = self.last_failure_code.lock().unwrap().to_string();
-        let reason = self.last_failure_reason.lock().unwrap().clone();
-        let nanos = self.last_failure_nanos.load(Ordering::Relaxed);
-        let time = if nanos > 0 {
-            Some(UNIX_EPOCH + Duration::from_nanos(nanos as u64))
-        } else {
-            None
-        };
-        (code, reason, time)
+        self.failure.last()
     }
 }
 
@@ -156,83 +154,92 @@ impl ConnectionDebugCounters {
 // Internal atomic counters (per-stream)
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 pub(crate) struct StreamDebugCounters {
-    pub data_messages_sent: AtomicU64,
-    pub data_messages_received: AtomicU64,
-    pub protocol_errors: AtomicU64,
-    pub protocol_error_reply_send_failure: AtomicU64,
-    pub remote_errors: AtomicU64,
-    pub decode_errors: AtomicU64,
-    pub handler_calls: AtomicU64,
-    pub handler_errors: AtomicU64,
-    last_failure_code: Mutex<&'static str>,
-    last_failure_reason: Mutex<String>,
-    last_failure_nanos: AtomicI64,
+    pub messages: MessageCounters,
+    failure: FailureTracker,
 }
 
 impl StreamDebugCounters {
     pub(crate) fn new() -> Self {
-        Self {
-            data_messages_sent: AtomicU64::new(0),
-            data_messages_received: AtomicU64::new(0),
-            protocol_errors: AtomicU64::new(0),
-            protocol_error_reply_send_failure: AtomicU64::new(0),
-            remote_errors: AtomicU64::new(0),
-            decode_errors: AtomicU64::new(0),
-            handler_calls: AtomicU64::new(0),
-            handler_errors: AtomicU64::new(0),
-            last_failure_code: Mutex::new(""),
-            last_failure_reason: Mutex::new(String::new()),
-            last_failure_nanos: AtomicI64::new(0),
-        }
+        Self::default()
     }
 
     pub(crate) fn note_failure(&self, code: DebugFailureCode, reason: String) {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as i64;
-        *self.last_failure_code.lock().unwrap() = code;
-        *self.last_failure_reason.lock().unwrap() = reason;
-        self.last_failure_nanos.store(nanos, Ordering::Relaxed);
+        self.failure.note(code, reason);
     }
 
     pub(crate) fn snapshot(&self) -> StreamCounters {
+        let messages = &self.messages;
         StreamCounters {
-            data_messages_sent: self.data_messages_sent.load(Ordering::Relaxed),
-            data_messages_received: self.data_messages_received.load(Ordering::Relaxed),
-            protocol_errors: self.protocol_errors.load(Ordering::Relaxed),
-            protocol_error_reply_send_failure: self
-                .protocol_error_reply_send_failure
-                .load(Ordering::Relaxed),
-            remote_errors: self.remote_errors.load(Ordering::Relaxed),
-            decode_errors: self.decode_errors.load(Ordering::Relaxed),
-            handler_calls: self.handler_calls.load(Ordering::Relaxed),
-            handler_errors: self.handler_errors.load(Ordering::Relaxed),
+            data_messages_sent: load(&messages.data_messages_sent),
+            data_messages_received: load(&messages.data_messages_received),
+            protocol_errors: load(&messages.protocol_errors),
+            protocol_error_reply_send_failure: load(&messages.protocol_error_reply_send_failure),
+            remote_errors: load(&messages.remote_errors),
+            decode_errors: load(&messages.decode_errors),
+            handler_calls: load(&messages.handler_calls),
+            handler_errors: load(&messages.handler_errors),
         }
     }
 
     fn last_failure(&self) -> (String, String, Option<SystemTime>) {
-        let code = self.last_failure_code.lock().unwrap().to_string();
-        let reason = self.last_failure_reason.lock().unwrap().clone();
-        let nanos = self.last_failure_nanos.load(Ordering::Relaxed);
-        let time = if nanos > 0 {
-            Some(UNIX_EPOCH + Duration::from_nanos(nanos as u64))
-        } else {
-            None
-        };
-        (code, reason, time)
+        self.failure.last()
     }
 
     /// Copy this stream's last failure to the connection counters so it
     /// survives stream removal.
     pub(crate) fn promote_failure_to(&self, conn: &ConnectionDebugCounters) {
-        let code = *self.last_failure_code.lock().unwrap();
-        if code.is_empty() {
+        let last = self.failure.last.lock().unwrap();
+        if let Some(record) = last.as_ref().filter(|record| !record.code.is_empty()) {
+            conn.note_failure(record.code, record.reason.clone());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Last failure
+// ---------------------------------------------------------------------------
+
+struct FailureRecord {
+    code: DebugFailureCode,
+    reason: String,
+    at: SystemTime,
+}
+
+/// Keeps the last failure. Its code, reason and time are replaced together,
+/// so a snapshot never mixes two failures.
+#[derive(Default)]
+struct FailureTracker {
+    last: Mutex<Option<FailureRecord>>,
+}
+
+impl FailureTracker {
+    fn note(&self, code: DebugFailureCode, reason: String) {
+        if code.is_empty() && reason.is_empty() {
             return;
         }
-        let reason = self.last_failure_reason.lock().unwrap().clone();
-        conn.note_failure(code, reason);
+        let mut last = self.last.lock().unwrap();
+        let code = match last.as_ref() {
+            Some(prev) if code.is_empty() => prev.code,
+            _ => code,
+        };
+        *last = Some(FailureRecord {
+            code,
+            reason,
+            at: SystemTime::now(),
+        });
+    }
+
+    fn last(&self) -> (String, String, Option<SystemTime>) {
+        match self.last.lock().unwrap().as_ref() {
+            Some(record) => (
+                record.code.to_string(),
+                record.reason.clone(),
+                Some(record.at),
+            ),
+            None => (String::new(), String::new(), None),
+        }
     }
 }
 
@@ -348,7 +355,7 @@ pub struct RecoveryDebugState {
     pub reconnect_active: bool,
     /// Highest sequence number received from the peer.
     pub last_recv_seq: u64,
-    /// Highest sequence number acknowledged to the peer.
+    /// Highest sequence number of ours that the peer has acknowledged.
     pub last_acked_seq: u64,
     /// Number of received frames not yet acknowledged.
     pub ack_pending: u32,

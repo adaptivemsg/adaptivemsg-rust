@@ -1,17 +1,15 @@
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Notify;
-
 use crate::connection::ConnectionRef;
 use crate::error::Error;
-use crate::frame_queue::FrameDeque;
 use crate::protocol::DEFAULT_MAX_FRAME;
 use crate::recovery_protocol::RecoveryToken;
-use crate::replay::ReplayBuffer;
+use crate::replay::{FrameRecord, ReplayBuffer};
 
 pub type ResumeFuture =
     Pin<Box<dyn Future<Output = Result<crate::connection::TransportParts, Error>> + Send>>;
@@ -89,8 +87,6 @@ struct RecoveryStateFields {
     last_recv_seq: u64,
     last_ack_sent: u64,
     ack_pending: u32,
-    ack_due: bool,
-    ack_due_at: Option<Instant>,
 }
 
 pub(crate) struct RecoveryState {
@@ -98,7 +94,8 @@ pub(crate) struct RecoveryState {
     pub connection_id: RecoveryToken,
     pub resume_secret: RecoveryToken,
     pub replay: Arc<ReplayBuffer>,
-    pub resume_queue: Arc<FrameDeque>,
+    /// How many frames the writer has left to replay.
+    pub resume_depth: AtomicUsize,
     pub reconnect_min_backoff: Duration,
     pub reconnect_max_backoff: Duration,
     /// Limit for each client reconnect attempt, from the client's connect
@@ -106,16 +103,18 @@ pub(crate) struct RecoveryState {
     pub reconnect_timeout: Option<Duration>,
     pub detached_ttl: Duration,
     pub reconnect_active: AtomicBool,
-    pub resume_active: AtomicBool,
     pub ack_every: AtomicU32,
-    ack_due_flag: AtomicBool,
+    // ack_due and ack_due_at change under `fields`; the writer reads them
+    // without it to skip the lock while no ACK is due. ack_due_at is in
+    // nanoseconds since `epoch`, zero while no ACK is scheduled.
+    ack_due: AtomicBool,
+    ack_due_at: AtomicU64,
+    epoch: Instant,
     pub ack_delay_nanos: AtomicI64,
     pub heartbeat_interval_nanos: AtomicI64,
     pub heartbeat_timeout_nanos: AtomicI64,
-    pub last_activity_nanos: AtomicU64,
     pub resume_connector: Option<ResumeConnector>,
     pub registry: Option<RecoveryRegistry>,
-    pub expire_notify: Notify,
     fields: Mutex<RecoveryStateFields>,
 }
 
@@ -247,29 +246,26 @@ impl RecoveryState {
                 crate::protocol::PROTOCOL_VERSION_V3,
                 normalized.max_replay_bytes,
             )),
-            resume_queue: Arc::new(FrameDeque::new()),
+            resume_depth: AtomicUsize::new(0),
             reconnect_min_backoff: normalized.reconnect_min_backoff,
             reconnect_max_backoff: normalized.reconnect_max_backoff,
             reconnect_timeout,
             detached_ttl: Duration::ZERO,
             reconnect_active: AtomicBool::new(false),
-            resume_active: AtomicBool::new(false),
             ack_every: AtomicU32::new(neg.ack_every),
-            ack_due_flag: AtomicBool::new(false),
+            ack_due: AtomicBool::new(false),
+            ack_due_at: AtomicU64::new(0),
+            epoch: Instant::now(),
             ack_delay_nanos: AtomicI64::new(neg.ack_delay.as_nanos() as i64),
             heartbeat_interval_nanos: AtomicI64::new(neg.heartbeat_interval.as_nanos() as i64),
             heartbeat_timeout_nanos: AtomicI64::new(neg.heartbeat_timeout.as_nanos() as i64),
-            last_activity_nanos: AtomicU64::new(now_nanos()),
             resume_connector: Some(resume_connector),
             registry: None,
-            expire_notify: Notify::new(),
             fields: Mutex::new(RecoveryStateFields {
                 shared: neg,
                 last_recv_seq: 0,
                 last_ack_sent: 0,
                 ack_pending: 0,
-                ack_due: false,
-                ack_due_at: None,
             }),
         })
     }
@@ -290,31 +286,28 @@ impl RecoveryState {
                 crate::protocol::PROTOCOL_VERSION_V3,
                 normalized.max_replay_bytes,
             )),
-            resume_queue: Arc::new(FrameDeque::new()),
+            resume_depth: AtomicUsize::new(0),
             reconnect_min_backoff: Duration::ZERO,
             reconnect_max_backoff: Duration::ZERO,
             reconnect_timeout: None,
             detached_ttl: normalized.detached_ttl,
             reconnect_active: AtomicBool::new(false),
-            resume_active: AtomicBool::new(false),
             ack_every: AtomicU32::new(negotiated.ack_every),
-            ack_due_flag: AtomicBool::new(false),
+            ack_due: AtomicBool::new(false),
+            ack_due_at: AtomicU64::new(0),
+            epoch: Instant::now(),
             ack_delay_nanos: AtomicI64::new(negotiated.ack_delay.as_nanos() as i64),
             heartbeat_interval_nanos: AtomicI64::new(
                 negotiated.heartbeat_interval.as_nanos() as i64
             ),
             heartbeat_timeout_nanos: AtomicI64::new(negotiated.heartbeat_timeout.as_nanos() as i64),
-            last_activity_nanos: AtomicU64::new(now_nanos()),
             resume_connector: None,
             registry: Some(registry),
-            expire_notify: Notify::new(),
             fields: Mutex::new(RecoveryStateFields {
                 shared: negotiated,
                 last_recv_seq: 0,
                 last_ack_sent: 0,
                 ack_pending: 0,
-                ack_due: false,
-                ack_due_at: None,
             }),
         })
     }
@@ -351,98 +344,86 @@ impl RecoveryState {
         );
     }
 
-    pub(crate) fn prepare_resume(&self, last_seq: u64) {
+    /// Returns the frames after `last_seq`, the last one the peer received,
+    /// for the writer to replay. That also acknowledges the frames up to
+    /// `last_seq`: the ACK the peer sent for them may have been lost with the
+    /// old transport.
+    pub(crate) fn prepare_resume(&self, last_seq: u64) -> VecDeque<Arc<FrameRecord>> {
+        self.replay.ack(last_seq);
         let frames = self.replay.snapshot_from(last_seq);
-        let has_frames = !frames.is_empty();
-        self.resume_queue.reset(frames);
-        self.resume_active.store(has_frames, Ordering::Release);
+        self.resume_depth.store(frames.len(), Ordering::Relaxed);
+        frames
     }
 
-    pub(crate) fn take_resume_frame(&self) -> Option<Arc<crate::replay::FrameRecord>> {
-        let frame = self.resume_queue.pop();
-        if frame.is_none() {
-            self.resume_active.store(false, Ordering::Release);
-        }
-        frame
+    fn elapsed_nanos(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64
     }
 
+    /// Notes a received data frame and reports whether the writer should be
+    /// woken for an ACK.
     pub(crate) fn note_received(&self, seq: u64) -> bool {
         let mut fields = self.fields.lock().unwrap();
         if seq <= fields.last_recv_seq {
             if fields.last_ack_sent < fields.last_recv_seq {
-                fields.ack_due = true;
-                self.ack_due_flag.store(true, Ordering::Release);
+                self.ack_due.store(true, Ordering::Release);
             }
             return true;
         }
         fields.last_recv_seq = seq;
         fields.ack_pending += 1;
         let ack_every = self.ack_every.load(Ordering::Relaxed);
-        if ack_every <= 1 || fields.ack_pending >= ack_every {
-            fields.ack_due = true;
-            self.ack_due_flag.store(true, Ordering::Release);
-            fields.ack_due_at = None;
+        let ack_delay = self.ack_delay_nanos.load(Ordering::Relaxed).max(0) as u64;
+        if ack_every <= 1 || fields.ack_pending >= ack_every || ack_delay == 0 {
+            self.ack_due.store(true, Ordering::Release);
+            self.ack_due_at.store(0, Ordering::Release);
             return true;
         }
-        let ack_delay =
-            Duration::from_nanos(self.ack_delay_nanos.load(Ordering::Relaxed).max(0) as u64);
-        if ack_delay.is_zero() {
-            fields.ack_due = true;
-            self.ack_due_flag.store(true, Ordering::Release);
-            fields.ack_due_at = None;
-            return true;
-        }
-        if fields.ack_due_at.is_none() {
-            fields.ack_due_at = Some(Instant::now() + ack_delay);
+        if self.ack_due_at.load(Ordering::Acquire) == 0 {
+            self.ack_due_at
+                .store(self.elapsed_nanos() + ack_delay, Ordering::Release);
             return true;
         }
         false
     }
 
     pub(crate) fn next_ack_wait(&self) -> Duration {
-        if self.ack_due_flag.load(Ordering::Acquire) {
+        if self.ack_due.load(Ordering::Acquire) {
             return Duration::ZERO;
         }
-        let fields = self.fields.lock().unwrap();
-        match fields.ack_due_at {
-            Some(when) if when > Instant::now() => when.saturating_duration_since(Instant::now()),
-            Some(_) => Duration::ZERO,
-            None => Duration::ZERO,
+        match self.ack_due_at.load(Ordering::Acquire) {
+            0 => Duration::ZERO,
+            due_at => Duration::from_nanos(due_at.saturating_sub(self.elapsed_nanos())),
         }
+    }
+
+    /// Whether an ACK is due now, judged without the lock.
+    fn ack_may_be_due(&self) -> bool {
+        if self.ack_due.load(Ordering::Acquire) {
+            return true;
+        }
+        let due_at = self.ack_due_at.load(Ordering::Acquire);
+        due_at != 0 && self.elapsed_nanos() >= due_at
     }
 
     pub(crate) fn take_pending_ack(&self) -> Option<u64> {
-        // Fast path: no ack due
-        if !self.ack_due_flag.load(Ordering::Acquire) {
-            // Still need to check ack_due_at timer (only when ack_every > 1)
-            if self.ack_every.load(Ordering::Relaxed) <= 1 {
-                return None;
-            }
+        if !self.ack_may_be_due() {
+            return None;
         }
         let mut fields = self.fields.lock().unwrap();
-        if !fields.ack_due {
-            if let Some(due_at) = fields.ack_due_at {
-                if due_at <= Instant::now() && fields.last_ack_sent < fields.last_recv_seq {
-                    fields.ack_due = true;
-                    self.ack_due_flag.store(true, Ordering::Release);
-                }
-            }
+        if fields.last_ack_sent >= fields.last_recv_seq {
+            self.ack_due.store(false, Ordering::Release);
+            self.ack_due_at.store(0, Ordering::Release);
+            return None;
         }
-        if fields.ack_due && fields.last_ack_sent < fields.last_recv_seq {
-            let seq = fields.last_recv_seq;
-            fields.last_ack_sent = seq;
-            fields.ack_pending = 0;
-            fields.ack_due = false;
-            self.ack_due_flag.store(false, Ordering::Release);
-            fields.ack_due_at = None;
-            return Some(seq);
+        if !self.ack_may_be_due() {
+            return None;
         }
-        None
-    }
-
-    pub(crate) fn on_attached(&self) {
-        self.touch_activity();
-        self.expire_notify.notify_waiters();
+        let seq = fields.last_recv_seq;
+        fields.last_ack_sent = seq;
+        fields.ack_pending = 0;
+        self.ack_due.store(false, Ordering::Release);
+        self.ack_due_at.store(0, Ordering::Release);
+        Some(seq)
     }
 
     pub(crate) fn on_closed(&self, connection: &ConnectionRef) {
@@ -454,12 +435,6 @@ impl RecoveryState {
                 }
             }
         }
-        self.expire_notify.notify_waiters();
-    }
-
-    pub(crate) fn touch_activity(&self) {
-        self.last_activity_nanos
-            .store(now_nanos(), Ordering::Relaxed);
     }
 
     pub(crate) fn heartbeat_interval(&self) -> Duration {
@@ -474,7 +449,12 @@ impl RecoveryState {
         self.detached_ttl
     }
 
-    pub(crate) fn debug_state(&self, transport_gen: u64) -> crate::debug::RecoveryDebugState {
+    pub(crate) fn debug_state(
+        &self,
+        transport_gen: u64,
+        transport_attached: bool,
+        live_queue_depth: usize,
+    ) -> crate::debug::RecoveryDebugState {
         let fields = self.fields.lock().unwrap();
         let role = match self.role {
             RecoveryRole::Client => "client",
@@ -483,13 +463,13 @@ impl RecoveryState {
         crate::debug::RecoveryDebugState {
             role: role.to_string(),
             connection_id: self.connection_id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-            transport_attached: transport_gen > 0,
+            transport_attached,
             transport_gen,
             reconnect_active: self.reconnect_active.load(Ordering::Relaxed),
             last_recv_seq: fields.last_recv_seq,
-            last_acked_seq: fields.last_ack_sent,
+            last_acked_seq: self.replay.last_acked_seq(),
             ack_pending: fields.ack_pending,
-            ack_due: fields.ack_due,
+            ack_due: self.ack_due.load(Ordering::Relaxed),
             ack_every: self.ack_every.load(Ordering::Relaxed),
             ack_delay: Duration::from_nanos(
                 self.ack_delay_nanos.load(Ordering::Relaxed).max(0) as u64
@@ -498,15 +478,8 @@ impl RecoveryState {
             heartbeat_timeout: self.heartbeat_timeout(),
             replay_queued: self.replay.queued_count(),
             replay_bytes: self.replay.used_bytes(),
-            live_queue_depth: 0, // live_rx is taken; cannot inspect depth
-            resume_queue_depth: self.resume_queue.len(),
+            live_queue_depth,
+            resume_queue_depth: self.resume_depth.load(Ordering::Relaxed),
         }
     }
-}
-
-fn now_nanos() -> u64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    now.as_nanos().min(u64::MAX as u128) as u64
 }
