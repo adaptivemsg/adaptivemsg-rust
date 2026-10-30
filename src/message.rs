@@ -1,10 +1,14 @@
 use std::any::Any;
 
+#[cfg(feature = "tokio")]
 use async_trait::async_trait;
 use rmpv::Value;
 
+#[cfg(feature = "tokio")]
 use crate::context::StreamContext;
-use crate::error::{Error, Result};
+use crate::error::Error;
+#[cfg(feature = "tokio")]
+use crate::error::Result;
 
 /// Application message that can be encoded and decoded by codecs.
 ///
@@ -127,6 +131,7 @@ impl ErrorReply {
     }
 }
 
+#[cfg(feature = "tokio")]
 #[async_trait]
 /// Server-side handler for a message type.
 ///

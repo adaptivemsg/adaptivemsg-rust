@@ -1,3 +1,4 @@
+#[cfg(feature = "tokio")]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::codec::CodecID;
@@ -20,51 +21,42 @@ pub struct HandshakeConfig {
     pub max_frame: u32,
 }
 
-pub async fn handshake_client<R, W>(
-    reader: &mut R,
-    writer: &mut W,
+/// The client's handshake request: the header followed by the codec list.
+pub(crate) fn client_hello(
     codecs: &[CodecID],
     max_frame: u32,
     version: u8,
-) -> Result<HandshakeConfig, Error>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
+) -> Result<Vec<u8>, Error> {
     validate_codec_list(codecs)?;
     if !is_supported_protocol_version(version) {
         return Err(Error::UnsupportedFrameVersion(version));
     }
+    let mut request = Vec::with_capacity(HANDSHAKE_HEADER_LEN + codecs.len());
+    request.extend_from_slice(&HANDSHAKE_MAGIC);
+    request.push(version);
+    request.push(codecs.len() as u8);
+    request.extend_from_slice(&[0; 4]);
+    request.extend_from_slice(&max_frame.to_be_bytes());
+    request.extend(codecs.iter().map(|codec| codec.0));
+    Ok(request)
+}
 
-    let mut request = [0u8; HANDSHAKE_HEADER_LEN];
-    request[0..2].copy_from_slice(&HANDSHAKE_MAGIC);
-    request[2] = version;
-    request[3] = codecs.len() as u8;
-    request[4] = 0;
-    request[5] = 0;
-    request[6] = 0;
-    request[7] = 0;
-    request[8..12].copy_from_slice(&max_frame.to_be_bytes());
-    writer.write_all(&request).await?;
-
-    let mut list = vec![0u8; codecs.len()];
-    for (idx, codec_id) in codecs.iter().enumerate() {
-        list[idx] = codec_id.0;
-    }
-    writer.write_all(&list).await?;
-    writer.flush().await?;
-
-    let mut response = [0u8; HANDSHAKE_HEADER_LEN];
-    reader.read_exact(&mut response).await?;
+/// Checks the server's reply to a [`client_hello`] that offered `codecs` for
+/// `version`.
+pub(crate) fn parse_server_hello(
+    response: &[u8; HANDSHAKE_HEADER_LEN],
+    codecs: &[CodecID],
+    version: u8,
+) -> Result<HandshakeConfig, Error> {
     if response[0..2] != HANDSHAKE_MAGIC {
         return Err(Error::BadHandshakeMagic);
     }
     let accept = response[2];
-    let version = response[3];
+    let reply_version = response[3];
     let selected = CodecID(response[4]);
     let server_max = u32::from_be_bytes([response[8], response[9], response[10], response[11]]);
-    if version != request[2] {
-        return Err(Error::UnsupportedFrameVersion(version));
+    if reply_version != version {
+        return Err(Error::UnsupportedFrameVersion(reply_version));
     }
     if accept == 0 {
         return Err(Error::NoCommonCodec);
@@ -76,12 +68,33 @@ where
         return Err(Error::UnsupportedCodec(selected.0));
     }
     Ok(HandshakeConfig {
-        version,
+        version: reply_version,
         codec_id: selected,
         max_frame: server_max,
     })
 }
 
+#[cfg(feature = "tokio")]
+pub async fn handshake_client<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    codecs: &[CodecID],
+    max_frame: u32,
+    version: u8,
+) -> Result<HandshakeConfig, Error>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let request = client_hello(codecs, max_frame, version)?;
+    writer.write_all(&request).await?;
+    writer.flush().await?;
+    let mut response = [0u8; HANDSHAKE_HEADER_LEN];
+    reader.read_exact(&mut response).await?;
+    parse_server_hello(&response, codecs, version)
+}
+
+#[cfg(feature = "tokio")]
 pub async fn handshake_server<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -190,6 +203,7 @@ fn negotiate_max_frame(client_max: u32, server_max: u32) -> u32 {
     }
 }
 
+#[cfg(feature = "tokio")]
 async fn write_handshake_reply<W>(
     writer: &mut W,
     accept: u8,
@@ -232,8 +246,11 @@ fn select_codec(client_codecs: &[u8], supported: &[CodecID]) -> Option<CodecID> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec_msgpack::{CodecMsgpackCompact, CodecMsgpackMap};
+    use crate::codec_msgpack::CodecMsgpackCompact;
+    #[cfg(feature = "tokio")]
+    use crate::codec_msgpack::CodecMsgpackMap;
 
+    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn handshake_v2_success() {
         let (client_r, server_w) = tokio::io::duplex(1024);
@@ -257,6 +274,7 @@ mod tests {
         assert_eq!(server_cfg.max_frame, 1024);
     }
 
+    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn handshake_no_common_codec() {
         let (client_r, server_w) = tokio::io::duplex(1024);
@@ -277,6 +295,7 @@ mod tests {
         assert!(matches!(client_result, Err(Error::NoCommonCodec)));
     }
 
+    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn handshake_v3_success() {
         let (client_r, server_w) = tokio::io::duplex(1024);
@@ -298,6 +317,7 @@ mod tests {
         assert_eq!(server_cfg.version, PROTOCOL_VERSION_V3);
     }
 
+    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn handshake_v3_rejected_by_legacy_server() {
         let (client_r, server_w) = tokio::io::duplex(1024);

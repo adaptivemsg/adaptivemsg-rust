@@ -75,6 +75,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "adaptivemsg-hello-client-blocking"
+version = "0.1.0"
+dependencies = [
+ "adaptivemsg",
+ "adaptivemsg-hello-server",
+ "anyhow",
+ "clap",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "adaptivemsg-hello-server"
 version = "0.1.0"
 dependencies = [

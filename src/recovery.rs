@@ -1,19 +1,26 @@
 use std::collections::VecDeque;
+#[cfg(feature = "tokio")]
 use std::future::Future;
+#[cfg(feature = "tokio")]
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "tokio")]
 use crate::connection::ConnectionRef;
+#[cfg(feature = "tokio")]
 use crate::error::Error;
 use crate::protocol::DEFAULT_MAX_FRAME;
 use crate::recovery_protocol::RecoveryToken;
 use crate::replay::{FrameRecord, ReplayBuffer};
 
+#[cfg(feature = "tokio")]
 pub type ResumeFuture =
     Pin<Box<dyn Future<Output = Result<crate::connection::TransportParts, Error>> + Send>>;
+#[cfg(feature = "tokio")]
 pub type ResumeConnector = Arc<dyn Fn() -> ResumeFuture + Send + Sync>;
+#[cfg(feature = "tokio")]
 pub type RecoveryRegistry = Arc<Mutex<std::collections::HashMap<RecoveryToken, ConnectionRef>>>;
 
 /// Client-side recovery configuration for automatic reconnect and replay.
@@ -32,7 +39,7 @@ pub struct ClientRecoveryOptions {
     /// reached, sends wait for the peer to acknowledge earlier ones. Default:
     /// 32 MiB, twice the default max frame, so that a frame of the largest
     /// size fits while another is still unacknowledged. Raise it together
-    /// with [`Client::with_max_frame`](crate::Client::with_max_frame).
+    /// with the client's `with_max_frame`.
     pub max_replay_bytes: i64,
 }
 
@@ -113,7 +120,9 @@ pub(crate) struct RecoveryState {
     pub ack_delay_nanos: AtomicI64,
     pub heartbeat_interval_nanos: AtomicI64,
     pub heartbeat_timeout_nanos: AtomicI64,
+    #[cfg(feature = "tokio")]
     pub resume_connector: Option<ResumeConnector>,
+    #[cfg(feature = "tokio")]
     pub registry: Option<RecoveryRegistry>,
     fields: Mutex<RecoveryStateFields>,
 }
@@ -228,6 +237,7 @@ impl NegotiatedRecoveryOptions {
 }
 
 impl RecoveryState {
+    #[cfg(feature = "tokio")]
     pub(crate) fn new_client(
         opts: ClientRecoveryOptions,
         negotiated: NegotiatedRecoveryOptions,
@@ -236,9 +246,30 @@ impl RecoveryState {
         resume_connector: ResumeConnector,
         reconnect_timeout: Option<Duration>,
     ) -> Arc<Self> {
+        Arc::new(Self {
+            resume_connector: Some(resume_connector),
+            ..Self::client(
+                opts,
+                negotiated,
+                connection_id,
+                resume_secret,
+                reconnect_timeout,
+            )
+        })
+    }
+
+    /// The client side of a recovery connection, without the async client's
+    /// way to reconnect.
+    pub(crate) fn client(
+        opts: ClientRecoveryOptions,
+        negotiated: NegotiatedRecoveryOptions,
+        connection_id: RecoveryToken,
+        resume_secret: RecoveryToken,
+        reconnect_timeout: Option<Duration>,
+    ) -> Self {
         let normalized = opts.normalized();
         let neg = negotiated.normalized();
-        Arc::new(Self {
+        Self {
             role: RecoveryRole::Client,
             connection_id,
             resume_secret,
@@ -259,7 +290,9 @@ impl RecoveryState {
             ack_delay_nanos: AtomicI64::new(neg.ack_delay.as_nanos() as i64),
             heartbeat_interval_nanos: AtomicI64::new(neg.heartbeat_interval.as_nanos() as i64),
             heartbeat_timeout_nanos: AtomicI64::new(neg.heartbeat_timeout.as_nanos() as i64),
-            resume_connector: Some(resume_connector),
+            #[cfg(feature = "tokio")]
+            resume_connector: None,
+            #[cfg(feature = "tokio")]
             registry: None,
             fields: Mutex::new(RecoveryStateFields {
                 shared: neg,
@@ -267,9 +300,10 @@ impl RecoveryState {
                 last_ack_sent: 0,
                 ack_pending: 0,
             }),
-        })
+        }
     }
 
+    #[cfg(feature = "tokio")]
     pub(crate) fn new_server(
         opts: ServerRecoveryOptions,
         connection_id: RecoveryToken,
@@ -426,6 +460,7 @@ impl RecoveryState {
         Some(seq)
     }
 
+    #[cfg(feature = "tokio")]
     pub(crate) fn on_closed(&self, connection: &ConnectionRef) {
         if let Some(registry) = &self.registry {
             let mut registry = registry.lock().unwrap();

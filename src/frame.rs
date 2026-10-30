@@ -5,6 +5,9 @@ use crate::protocol::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
 pub const FRAME_HEADER_LEN_V2: usize = 10;
 pub const FRAME_HEADER_LEN_V3: usize = 18;
 
+/// Reserved stream for v3 control frames (ACK, PING, CLOSE).
+pub(crate) const CONTROL_STREAM_ID: u32 = u32::MAX;
+
 /// Frame header flag bits. Each bit is an independent property.
 ///
 /// - bit 0 `FIN`: last frame for a non-zero stream, sent only by the side

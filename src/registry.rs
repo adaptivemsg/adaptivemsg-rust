@@ -1,13 +1,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(feature = "tokio")]
 use async_trait::async_trait;
 use rmpv::Value;
 
+#[cfg(feature = "tokio")]
 use crate::context::StreamContext;
-use crate::error::{Error, Result as HandlerResult};
-use crate::message::{Message, MessageDecode, MessageHandler};
+use crate::error::Error;
+#[cfg(feature = "tokio")]
+use crate::error::Result as HandlerResult;
+use crate::message::{Message, MessageDecode};
+#[cfg(feature = "tokio")]
+use crate::message::MessageHandler;
 
+#[cfg(feature = "tokio")]
 #[async_trait]
 pub(crate) trait Handler: Send + Sync + 'static {
     async fn handle(
@@ -31,6 +38,7 @@ pub(crate) trait MessageFactory: Send + Sync + 'static {
 /// [`Registry::from_inventory`] to create one with all registered types.
 #[derive(Default, Clone)]
 pub struct Registry {
+    #[cfg(feature = "tokio")]
     handlers: Arc<HashMap<&'static str, Arc<dyn Handler>>>,
     messages: Arc<HashMap<&'static str, Arc<dyn MessageFactory>>>,
 }
@@ -87,6 +95,7 @@ impl Registry {
     }
 
     /// Register a message handler type.
+    #[cfg(feature = "tokio")]
     pub fn register<T>(&mut self)
     where
         T: MessageHandler + 'static,
@@ -96,10 +105,12 @@ impl Registry {
         Arc::make_mut(&mut self.handlers).insert(wire_name, handler);
     }
 
+    #[cfg(feature = "tokio")]
     pub(crate) fn handler(&self, wire_name: &str) -> Option<Arc<dyn Handler>> {
         self.handlers.get(wire_name).cloned()
     }
 
+    #[cfg(feature = "tokio")]
     pub(crate) fn has_handlers(&self) -> bool {
         !self.handlers.is_empty()
     }
@@ -120,9 +131,11 @@ impl Registry {
     }
 }
 
+#[cfg(feature = "tokio")]
 struct KnownHandler<T>(std::marker::PhantomData<T>);
 struct KnownMessage<T>(std::marker::PhantomData<T>);
 
+#[cfg(feature = "tokio")]
 #[async_trait]
 impl<T> Handler for KnownHandler<T>
 where
@@ -175,12 +188,14 @@ mod tests {
         assert!(reg.message("am.message.ErrorReply").is_some());
     }
 
+    #[cfg(feature = "tokio")]
     #[test]
     fn has_handlers_false_for_empty() {
         let reg = Registry::new();
         assert!(!reg.has_handlers());
     }
 
+    #[cfg(feature = "tokio")]
     #[test]
     fn unknown_wire_returns_none() {
         let reg = Registry::from_inventory();

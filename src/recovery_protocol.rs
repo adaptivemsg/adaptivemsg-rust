@@ -1,12 +1,15 @@
 use std::time::Duration;
 
+#[cfg(feature = "tokio")]
 use rand::RngCore;
+#[cfg(feature = "tokio")]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::Error;
 use crate::recovery::NegotiatedRecoveryOptions;
 
-pub(crate) const CONTROL_STREAM_ID: u32 = u32::MAX;
+#[cfg(feature = "tokio")]
+pub(crate) use crate::frame::CONTROL_STREAM_ID;
 
 pub(crate) const CONTROL_TYPE_ACK: u8 = 1;
 pub(crate) const CONTROL_TYPE_PING: u8 = 2;
@@ -46,54 +49,38 @@ pub(crate) struct AttachResponse {
     pub negotiated: NegotiatedRecoveryOptions,
 }
 
+#[cfg(feature = "tokio")]
 pub(crate) fn new_recovery_token() -> RecoveryToken {
     let mut token = [0u8; RECOVERY_TOKEN_LEN];
     rand::thread_rng().fill_bytes(&mut token);
     token
 }
 
-pub(crate) async fn write_attach_request<W>(
-    writer: &mut W,
-    req: &AttachRequest,
-) -> Result<(), Error>
-where
-    W: AsyncWrite + Unpin,
-{
+pub(crate) fn encode_attach_request(req: &AttachRequest) -> [u8; ATTACH_REQUEST_LEN] {
     let mut buf = [0u8; ATTACH_REQUEST_LEN];
     buf[0] = req.mode;
     buf[4..20].copy_from_slice(&req.connection_id);
     buf[20..36].copy_from_slice(&req.resume_secret);
     buf[36..44].copy_from_slice(&req.last_recv_seq.to_be_bytes());
-    writer.write_all(&buf).await?;
-    writer.flush().await?;
-    Ok(())
+    buf
 }
 
-pub(crate) async fn read_attach_request<R>(reader: &mut R) -> Result<AttachRequest, Error>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = [0u8; ATTACH_REQUEST_LEN];
-    reader.read_exact(&mut buf).await?;
+pub(crate) fn decode_attach_request(buf: &[u8; ATTACH_REQUEST_LEN]) -> AttachRequest {
     let mut connection_id = [0u8; RECOVERY_TOKEN_LEN];
     connection_id.copy_from_slice(&buf[4..20]);
     let mut resume_secret = [0u8; RECOVERY_TOKEN_LEN];
     resume_secret.copy_from_slice(&buf[20..36]);
-    Ok(AttachRequest {
+    AttachRequest {
         mode: buf[0],
         connection_id,
         resume_secret,
         last_recv_seq: u64::from_be_bytes(buf[36..44].try_into().unwrap()),
-    })
+    }
 }
 
-pub(crate) async fn write_attach_response<W>(
-    writer: &mut W,
+pub(crate) fn encode_attach_response(
     resp: &AttachResponse,
-) -> Result<(), Error>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<[u8; ATTACH_RESPONSE_LEN], Error> {
     let encoded = encode_negotiated_recovery_options(&resp.negotiated)?;
     let mut buf = [0u8; ATTACH_RESPONSE_LEN];
     buf[0] = resp.status;
@@ -104,17 +91,12 @@ where
     buf[48..52].copy_from_slice(&encoded.ack_delay_ms.to_be_bytes());
     buf[52..56].copy_from_slice(&encoded.heartbeat_interval_ms.to_be_bytes());
     buf[56..60].copy_from_slice(&encoded.heartbeat_timeout_ms.to_be_bytes());
-    writer.write_all(&buf).await?;
-    writer.flush().await?;
-    Ok(())
+    Ok(buf)
 }
 
-pub(crate) async fn read_attach_response<R>(reader: &mut R) -> Result<AttachResponse, Error>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = [0u8; ATTACH_RESPONSE_LEN];
-    reader.read_exact(&mut buf).await?;
+pub(crate) fn decode_attach_response(
+    buf: &[u8; ATTACH_RESPONSE_LEN],
+) -> Result<AttachResponse, Error> {
     let mut connection_id = [0u8; RECOVERY_TOKEN_LEN];
     connection_id.copy_from_slice(&buf[4..20]);
     let mut resume_secret = [0u8; RECOVERY_TOKEN_LEN];
@@ -131,6 +113,52 @@ where
             u32::from_be_bytes(buf[56..60].try_into().unwrap()),
         )?,
     })
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) async fn write_attach_request<W>(
+    writer: &mut W,
+    req: &AttachRequest,
+) -> Result<(), Error>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(&encode_attach_request(req)).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) async fn read_attach_request<R>(reader: &mut R) -> Result<AttachRequest, Error>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = [0u8; ATTACH_REQUEST_LEN];
+    reader.read_exact(&mut buf).await?;
+    Ok(decode_attach_request(&buf))
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) async fn write_attach_response<W>(
+    writer: &mut W,
+    resp: &AttachResponse,
+) -> Result<(), Error>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(&encode_attach_response(resp)?).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) async fn read_attach_response<R>(reader: &mut R) -> Result<AttachResponse, Error>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = [0u8; ATTACH_RESPONSE_LEN];
+    reader.read_exact(&mut buf).await?;
+    decode_attach_response(&buf)
 }
 
 struct EncodedNegotiatedRecoveryOptions {
@@ -259,6 +287,7 @@ pub(crate) fn parse_control_payload(payload: &[u8]) -> Result<(u8, u64), Error> 
 mod tests {
     use super::*;
 
+    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn attach_request_roundtrip() {
         let (mut client, mut server) = tokio::io::duplex(ATTACH_REQUEST_LEN * 2);
@@ -284,6 +313,7 @@ mod tests {
         assert_eq!(read.last_recv_seq, 17);
     }
 
+    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn attach_response_roundtrip() {
         let (mut client, mut server) = tokio::io::duplex(ATTACH_RESPONSE_LEN * 2);
@@ -317,6 +347,7 @@ mod tests {
         assert_eq!(read.negotiated.ack_every, 8);
     }
 
+    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn read_attach_response_rejects_invalid_negotiated_options() {
         let (mut client, mut server) = tokio::io::duplex(ATTACH_RESPONSE_LEN * 2);
@@ -341,6 +372,40 @@ mod tests {
         write.await.expect("writer task");
 
         assert!(matches!(err, Error::InvalidMessage(_)));
+    }
+
+    #[test]
+    fn attach_codec_roundtrip() {
+        let request = AttachRequest {
+            mode: ATTACH_MODE_RESUME,
+            connection_id: [5; RECOVERY_TOKEN_LEN],
+            resume_secret: [6; RECOVERY_TOKEN_LEN],
+            last_recv_seq: 41,
+        };
+        assert_eq!(decode_attach_request(&encode_attach_request(&request)), request);
+
+        let response = AttachResponse {
+            status: ATTACH_STATUS_REJECTED,
+            connection_id: [7; RECOVERY_TOKEN_LEN],
+            resume_secret: [8; RECOVERY_TOKEN_LEN],
+            last_recv_seq: 9,
+            negotiated: NegotiatedRecoveryOptions {
+                ack_every: 3,
+                ack_delay: Duration::from_millis(15),
+                heartbeat_interval: Duration::from_millis(40),
+                heartbeat_timeout: Duration::from_millis(120),
+            },
+        };
+        let decoded =
+            decode_attach_response(&encode_attach_response(&response).expect("encode response"))
+                .expect("decode response");
+        assert_eq!(decoded.status, ATTACH_STATUS_REJECTED);
+        assert_eq!(decoded.connection_id, [7; RECOVERY_TOKEN_LEN]);
+        assert_eq!(decoded.resume_secret, [8; RECOVERY_TOKEN_LEN]);
+        assert_eq!(decoded.last_recv_seq, 9);
+        assert_eq!(decoded.negotiated.ack_every, 3);
+        assert_eq!(decoded.negotiated.ack_delay, Duration::from_millis(15));
+        assert_eq!(decoded.negotiated.heartbeat_timeout, Duration::from_millis(120));
     }
 
     #[test]

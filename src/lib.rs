@@ -45,6 +45,13 @@
 //! For one-shot request/reply without managing a connection, use
 //! [`Client::connect_once`].
 //!
+//! # Blocking client
+//!
+//! The `blocking` feature adds `blocking::Client`, which works on threads
+//! instead of a runtime. With `default-features = false, features = ["tcp",
+//! "uds", "blocking"]` the crate does not depend on tokio; the server, the
+//! async client and handlers need the `tokio` feature, which is on by default.
+//!
 //! # Codecs
 //!
 //! Built-in codecs: [`CodecMsgpackCompact`] (smallest wire size, cross-language),
@@ -64,15 +71,22 @@
     not(any(feature = "tcp", feature = "uds", feature = "quic")),
     allow(dead_code)
 )]
+// The blocking client uses only part of the shared protocol code.
+#![cfg_attr(not(feature = "tokio"), allow(dead_code))]
 
 extern crate self as adaptivemsg;
 
+#[cfg(all(feature = "blocking", any(feature = "tcp", feature = "uds")))]
+pub mod blocking;
+#[cfg(feature = "tokio")]
 mod client;
 mod codec;
 mod codec_msgpack;
 mod codec_postcard;
 mod codec_registry;
+#[cfg(feature = "tokio")]
 mod connection;
+#[cfg(feature = "tokio")]
 mod context;
 pub mod debug;
 mod error;
@@ -84,30 +98,37 @@ mod recovery;
 mod recovery_protocol;
 mod registry;
 mod replay;
+#[cfg(feature = "tokio")]
 mod server;
+#[cfg(feature = "tokio")]
 mod stream;
 mod transport;
 mod type_info;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "blocking", feature = "tokio"))]
+mod blocking_recovery_test;
+#[cfg(all(test, feature = "blocking", feature = "tokio"))]
+mod blocking_test;
+#[cfg(all(test, feature = "tokio"))]
 mod client_test;
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod connection_test;
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod interop_golden_test;
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod protocol_version_bench_test;
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod recovery_integration_test;
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod recovery_runtime_bench_test;
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod regression_test;
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod scaling_bench_test;
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod stream_close_test;
 
+#[cfg(feature = "tokio")]
 pub use crate::client::{Client, OnceConn};
 pub use crate::codec::{CodecID, CodecImpl};
 pub use crate::codec_msgpack::{CodecMsgpackCompact, CodecMsgpackMap};
@@ -115,21 +136,30 @@ pub use crate::codec_postcard::CodecPostcard;
 pub use crate::codec_registry::{
     must_register_codec as MustRegisterCodec, register_codec as RegisterCodec,
 };
+#[cfg(feature = "tokio")]
 pub use crate::connection::{Connection, Netconn};
+#[cfg(feature = "tokio")]
 pub use crate::context::{Context, StreamContext};
 pub use crate::debug::{
     ConnectionCounters, ConnectionDebugState, RecoveryDebugState, StreamCounters, StreamDebugState,
 };
 pub use crate::error::{Error, Result};
-pub use crate::message::{ErrorReply, Message, MessageHandler, OkReply};
-pub use crate::recovery::{ClientRecoveryOptions, ServerRecoveryOptions};
+#[cfg(feature = "tokio")]
+pub use crate::message::MessageHandler;
+pub use crate::message::{ErrorReply, Message, OkReply};
+pub use crate::recovery::ClientRecoveryOptions;
+#[cfg(feature = "tokio")]
+pub use crate::recovery::ServerRecoveryOptions;
 pub use crate::registry::Registry;
+#[cfg(feature = "tokio")]
 pub use crate::server::Server;
+#[cfg(feature = "tokio")]
 pub use crate::stream::Stream;
 /// Connections over a QUIC bidirectional stream.
 #[cfg(feature = "quic")]
 pub use crate::transport::quic;
 
+#[cfg(feature = "tokio")]
 #[doc(hidden)]
 pub use async_trait::async_trait;
 
@@ -148,6 +178,7 @@ pub mod __private {
 /// Define a message type with encode/decode support and a wire name.
 pub use adaptivemsg_macros::message;
 /// Define a server-side handler for a message type.
+#[cfg(feature = "tokio")]
 pub use adaptivemsg_macros::message_handler;
 
 #[doc(hidden)]

@@ -58,7 +58,7 @@ impl FrameCounters {
     fn note(&self, stream_id: u32, wire_bytes: usize) {
         self.frames.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(wire_bytes as u64, Ordering::Relaxed);
-        if stream_id == crate::recovery_protocol::CONTROL_STREAM_ID {
+        if stream_id == crate::frame::CONTROL_STREAM_ID {
             self.control_frames.fetch_add(1, Ordering::Relaxed);
         }
     }

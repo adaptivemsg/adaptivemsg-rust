@@ -4,6 +4,7 @@ Typed Rust messages with server-side handler routing over multiplexed streams (n
 Minimal async message library over multiplexed streams, with optional server-side handlers.
 
 - Transport: TCP / UDS / QUIC (feature)
+- Runtime: tokio for the server and the async client (`tokio` feature, on by default); a blocking client on threads (`blocking` feature), which needs no tokio
 - Framing: v2 handshake + versioned header + length-prefixed payload
 - Codec: MessagePack map/compact, postcard (Rust-only); default preference: postcard, compact, map, so a Go peer selects compact. Unlike Go, Rust does not yet support codecs defined outside the crate.
 - Data model: serde
@@ -110,6 +111,48 @@ reply, and closes the connection. `send_recv` consumes the `OnceConn`, so it
 can be used only once. `with_recv_timeout` limits waiting for the reply;
 without it `send_recv` waits indefinitely. Set `with_connect_timeout` to wait
 for a server that is still starting. One-shot connections never use recovery.
+
+## Blocking client
+
+For programs that do not run tokio, the `blocking` feature adds
+`adaptivemsg::blocking`, a client with the same methods as the async one,
+without `.await`. With `default-features = false` nothing depends on tokio:
+
+```toml
+adaptivemsg = { version = "0.1", default-features = false, features = ["tcp", "uds", "blocking"] }
+```
+
+```rust
+use adaptivemsg::blocking::Client;
+
+let conn = Client::new().connect("uds://@adaptivemsg-hello")?;
+let reply: HelloReply = conn.send_recv(HelloRequest { who: "alice".into() })?;
+
+// One stream per thread for concurrent request-reply.
+std::thread::scope(|s| {
+    s.spawn(|| {
+        let stream = conn.new_stream();
+        let reply = stream.send_recv::<HelloReply>(HelloRequest { who: "bob".into() });
+        stream.close();
+        reply
+    });
+});
+conn.close();
+```
+
+A connection runs one reader thread; `send` writes the frame on the calling
+thread and `recv` decodes on it. `with_recovery` negotiates v3 as the async
+client does: `send` then returns once the frame is in the replay buffer, and a
+writer thread sends it, sends ACKs and heartbeats, and after a transport
+failure reconnects and replays. Timeouts, `connect_once`, `close`, closing on
+drop and `debug_state` behave as in the async client. The blocking client runs
+no handlers: every message from the server, also one whose type has a handler,
+is delivered to `recv`. It does not support QUIC.
+
+`#[message_handler]` needs the `tokio` feature, so a message crate shared by a
+blocking client and a server puts its handlers behind a feature of its own,
+as the `server` feature of `examples/hello/server` does.
+`examples/hello/client-blocking` is the hello client without tokio.
 
 ## Code generation (amgen-rs)
 

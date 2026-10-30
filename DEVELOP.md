@@ -38,6 +38,9 @@ Server:
 1. `Server::new()` builds registry from inventory.
 2. `serve()` accepts sockets, negotiates handshake, spawns tokio tasks per connection.
 
+Blocking client (`blocking` feature): threads instead of tasks; see
+**Blocking Client** below.
+
 Reader task (per connection):
 - Reads frames via `AsyncReadExt` and routes payloads into per-stream `incoming_tx` channels.
 
@@ -147,6 +150,66 @@ Handler errors use `anyhow::Error` (`Result<T> = std::result::Result<T, anyhow::
 - Frames are limited to 16 MiB by default (`DEFAULT_MAX_FRAME`); `send()` rejects a larger payload with `Error::FrameTooLarge` instead of failing the writer.
 - Stream context uses `Arc<dyn Any + Send + Sync>` for type-erased storage.
 - `new_task()` spawns one background tokio task per stream (guarded by `handler_task_active`).
+
+## Blocking Client
+
+`blocking` is a client on `std::net` and threads. It shares the protocol code
+with the async runtime (`frame.rs`, the handshake bytes in `protocol.rs`, the
+attach and control encoding in `recovery_protocol.rs`, `replay.rs`,
+`RecoveryState`, codecs, registry, `debug.rs`) and none of the tokio code, so
+`default-features = false, features = ["tcp", "uds", "blocking"]` builds
+without tokio. The `tokio` feature (default) gates the server, the async
+client, `MessageHandler` and `#[message_handler]`.
+
+### Threads And Data Flow
+
+v2, per connection:
+- Reader thread: reads frames and pushes each payload into its stream's queue
+  (`Mutex<VecDeque>` and `Condvar`). While a queue is full it waits, holding up
+  the other streams, as the async reader does.
+- `recv` pops a payload and decodes it on the calling thread: no channel and no
+  decode task between the reader and the caller.
+- `send` writes and flushes the frame on the calling thread. The write half is
+  in a `WriterCell`, which a sender takes for one frame, so that `close` can
+  give up after 5 seconds on a sender that the peer holds up.
+
+v3 (recovery), per connection:
+- `send` stages the frame in the replay buffer under the next sequence number
+  and returns, also while detached. While the buffer is full it waits for an
+  ACK, holding `send_order`, so no later frame overtakes it.
+- Writer thread (`drive`): writes the pending ACK, then the buffered frames
+  after the last one the transport carried, and flushes; sends PING after a
+  heartbeat interval without writes; writes CLOSE when the connection closes.
+  The replay buffer is the outbound queue, so replayed and new frames go out in
+  sequence order without a separate resume queue. When the transport is lost
+  it reconnects with backoff, resumes, and continues after the peer's last
+  received sequence number.
+- Reader thread per transport, with the heartbeat timeout as the socket's read
+  timeout. It delivers data frames under the `deliver` lock after the sequence
+  check, so the reader of a replaced transport, which may still be finishing a
+  frame, and the new reader deliver each frame once. ACK frees replay room;
+  CLOSE closes the connection.
+- Every attach and detach bumps the transport generation. Detaching shuts the
+  socket down, which ends a read or write still in progress on it; a thread
+  whose generation is stale ends without acting on the error.
+
+### Lifetimes
+
+- `Connection` and `Stream` handles hold an `Owner`; dropping the last one
+  closes the connection on a short-lived thread, as `close` does.
+- `close` in v2 stops sends, shuts down the write side and waits for the peer to
+  close its side, at most 5 seconds. In v3 the writer writes what is staged and
+  CLOSE first; while detached the connection closes at once.
+- `mark_closed` shuts the transport down, which ends the reader, and `close`
+  joins the current reader. The v3 writer ends on its own; it is not joined,
+  because it may be in the middle of a dial.
+
+### Differences From The Async Client
+
+- No handlers on the client: every message goes to `recv`.
+- No QUIC.
+- No cancellation: a call ends with its result or a timeout, so a reply cannot
+  be left behind for the next `recv` by dropping a call midway.
 
 ## Current Design Gaps
 
@@ -526,6 +589,15 @@ Recovery enabled:
 - detached TTL expiry causes permanent close
 - stale transport replaced on successful resume
 
+Blocking client against the async server (`blocking_test.rs`,
+`blocking_recovery_test.rs`, need `--features blocking`):
+- v2: request-reply, concurrent streams, timeouts, server push, close and drop,
+  connect retry, protocol errors, `debug_state`
+- v3: resume after a break, replay of a lost reply, sends across a break
+  delivered once in order, heartbeat timeout on a silent transport (through a
+  proxy), rejected resume, server shutdown, replay buffer backpressure, close
+  while detached, concurrent streams under repeated breaks
+
 ### Benchmarks
 
 Protocol version benchmarks (`protocol_version_bench_test.rs`):
@@ -571,4 +643,7 @@ Recovery micro-benchmarks (`recovery_runtime_bench_test.rs`):
 - `transport/tcp.rs`: TCP dial/listen/accept
 - `transport/uds.rs`: UDS dial/listen/accept (+ abstract sockets on Linux)
 - `transport/quic.rs`: QUIC transport (optional feature)
+- `blocking/mod.rs`: blocking client, connection and streams, v2 transport
+- `blocking/recovery.rs`: blocking v3: staging, writer thread, readers, reconnect
+- `blocking/socket.rs`: blocking transports, dialing, handshake and frame I/O
 - `lib.rs`: module organization and public re-exports

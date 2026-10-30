@@ -1,15 +1,17 @@
+#[cfg(feature = "tokio")]
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
 
+#[cfg(feature = "tokio")]
 use crate::connection::TransportParts;
 use crate::error::Error;
 
 /// Lets one read from the transport take in several small frames.
-const READ_BUFFER_SIZE: usize = 8 << 10;
+pub(crate) const READ_BUFFER_SIZE: usize = 8 << 10;
 
-#[cfg(feature = "tcp")]
+#[cfg(all(feature = "tcp", feature = "tokio"))]
 pub mod tcp;
 
-#[cfg(feature = "uds")]
+#[cfg(all(feature = "uds", feature = "tokio"))]
 pub mod uds;
 
 #[cfg(feature = "quic")]
@@ -43,6 +45,7 @@ impl<'a> Endpoint<'a> {
 }
 
 /// Wraps the two halves of a transport for a connection.
+#[cfg(feature = "tokio")]
 pub(crate) fn parts<R, W>(reader: R, writer: W) -> TransportParts
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -55,6 +58,7 @@ where
 }
 
 /// Dials `addr` and returns the transport halves.
+#[cfg(feature = "tokio")]
 pub(crate) async fn dial(addr: &str) -> Result<TransportParts, Error> {
     match Endpoint::parse(addr) {
         #[cfg(feature = "tcp")]

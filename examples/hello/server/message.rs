@@ -1,7 +1,7 @@
 use adaptivemsg as am;
-#[cfg(not(feature = "client"))]
+#[cfg(feature = "server")]
 use am::{MessageHandler, Result, StreamContext};
-#[cfg(not(feature = "client"))]
+#[cfg(feature = "server")]
 use am::Message;
 
 // The names and fields match the Go hello example, whose package is hello.
@@ -22,7 +22,7 @@ pub struct HelloInternal {
     pub trace_id: String,
 }
 
-#[cfg(not(feature = "client"))]
+#[cfg(feature = "server")]
 #[am::message_handler]
 impl MessageHandler for HelloRequest {
     async fn handle(self: Box<Self>, _stream_ctx: StreamContext) -> Result<Option<Box<dyn Message>>> {

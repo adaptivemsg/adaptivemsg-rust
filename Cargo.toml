@@ -7,13 +7,17 @@ license = "MIT"
 repository = "https://github.com/adaptivemsg/adaptivemsg-rust"
 
 [features]
-default = ["tcp", "uds"]
+default = ["tcp", "uds", "tokio"]
 tcp = []
 uds = []
-quic = ["dep:quinn", "dep:rustls"]
+# Server, async client and handlers.
+tokio = ["dep:tokio", "dep:async-trait", "dep:rand"]
+# Client on std::net and threads; needs no tokio.
+blocking = []
+quic = ["tokio", "dep:quinn", "dep:rustls"]
 
 [dependencies]
-tokio = { version = "1.38", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+tokio = { version = "1.38", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
 rmp-serde = "=1.2.0"
@@ -23,13 +27,16 @@ postcard = { version = "1.0", features = ["use-std"] }
 tracing = "0.1"
 thiserror = "1.0"
 inventory = "0.3"
-async-trait = "0.1"
+async-trait = { version = "0.1", optional = true }
 anyhow = "1.0"
 adaptivemsg-macros = { version = "0.1.0", path = "macros" }
 
 quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23", optional = true }
-rand = "0.8"
+rand = { version = "0.8", optional = true }
+
+[package.metadata.docs.rs]
+features = ["blocking"]
 
 [workspace]
 members = [
@@ -37,6 +44,7 @@ members = [
     "cmd/amgen",
     "examples/hello/server",
     "examples/hello/client",
+    "examples/hello/client-blocking",
     "examples/echo/server",
     "examples/echo/client",
 ]
